@@ -14,7 +14,7 @@ python3 converter.py <config_file_path>
 python3 converter.py ~/Library/Mobile\ Documents/iCloud~com~nssurge~inc/Documents/home.conf
 ```
 
-输出文件在同目录下，文件名加 `-v4` 后缀（如 `home.conf` → `home-v4.conf`）。若输出文件已存在，旧文件会被重命名备份（加时间戳）。
+输出文件在同目录下，文件名加 `-v4` 后缀（如 `home.conf` → `home-v4.conf`）。若输出文件已存在，旧文件会被重命名为 `-deprecated` 后缀（如 `home-v4-deprecated.conf`），每次覆盖。
 
 ## 转换规则
 
@@ -59,7 +59,8 @@ python3 converter.py ~/Library/Mobile\ Documents/iCloud~com~nssurge~inc/Document
 ### 引用文件
 
 - `#!include` 和 `policy-path` 引用的本地文件会被递归转换
-- 引用路径自动更新为 `-v4` 版本
+- 若子文件内容无需转换，不生成 `-v4` 副本，父文件保留原引用路径
+- 引用路径仅在子文件实际产生变化时更新为 `-v4` 版本
 - HTTP/HTTPS URL 不处理
 
 ## 注释标记

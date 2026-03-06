@@ -22,13 +22,13 @@ from converter import (
 
 # --- Helpers ---
 
-def convert(text, base_dir="/tmp", stats=None, processed_files=None):
+def convert(text, base_dir="/tmp", stats=None, processed_files=None, filename=""):
     """Shorthand for convert_content with defaults."""
     if stats is None:
         stats = ConversionStats()
     if processed_files is None:
         processed_files = set()
-    return convert_content(textwrap.dedent(text).strip(), base_dir, stats, processed_files)
+    return convert_content(textwrap.dedent(text).strip(), base_dir, stats, processed_files, filename=filename)
 
 
 # --- T1: Proxy protocol commenting ---
@@ -339,16 +339,17 @@ class TestIncludeDirective:
         main.write_text("[Proxy]\n#!include proxies.conf, extra.dconf\n")
 
         stats = ConversionStats()
-        processed = {str(main)}
+        processed = {str(main): None}
         output = convert_file(str(main), stats, processed)
 
         # Check main output
         main_v4 = tmp_path / "main-v4.conf"
         assert main_v4.exists()
         content = main_v4.read_text()
-        assert "#!include proxies-v4.conf, extra-v4.dconf" in content
+        # proxies.conf needs conversion, extra.dconf does not
+        assert "#!include proxies-v4.conf, extra.dconf" in content
 
-        # Check proxies-v4.conf
+        # Check proxies-v4.conf (has v5+ content)
         proxies_v4 = tmp_path / "proxies-v4.conf"
         assert proxies_v4.exists()
         p_content = proxies_v4.read_text()
@@ -357,27 +358,44 @@ class TestIncludeDirective:
         assert "version=5" not in p_content
         assert "TROJAN-HK = trojan" in p_content
 
-        # Check extra-v4.dconf
-        extra_v4 = tmp_path / "extra-v4.dconf"
-        assert extra_v4.exists()
+        # extra.dconf is pure v4, no -v4 copy created
+        assert not (tmp_path / "extra-v4.dconf").exists()
 
     def test_include_with_nonexistent_file(self, tmp_path):
-        """References to nonexistent files should still update path names."""
+        """References to nonexistent files keep original path."""
         main = tmp_path / "main.conf"
         main.write_text("[Proxy]\n#!include missing.conf\n")
 
         stats = ConversionStats()
-        processed = {str(main)}
-        convert_file(str(main), stats, processed)
+        processed = {str(main): None}
+        result = convert_file(str(main), stats, processed)
 
-        content = (tmp_path / "main-v4.conf").read_text()
-        assert "#!include missing-v4.conf" in content
+        # No changes needed (nonexistent file keeps original reference)
+        assert result is None
 
 
 # --- T10: policy-path local path update (skip HTTP URLs) ---
 
 class TestPolicyPath:
-    def test_local_path_updated(self, tmp_path):
+    def test_local_path_updated_when_changed(self, tmp_path):
+        local_proxies = tmp_path / "local-proxies.conf"
+        local_proxies.write_text("HY2 = hysteria2, 1.2.3.4, 443, password=pwd\n")
+
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy Group]\n"
+            "Proxy = select, policy-path=local-proxies.conf\n"
+        )
+
+        stats = ConversionStats()
+        processed = {str(main): None}
+        convert_file(str(main), stats, processed)
+
+        content = (tmp_path / "main-v4.conf").read_text()
+        assert "policy-path=local-proxies-v4.conf" in content
+        assert (tmp_path / "local-proxies-v4.conf").exists()
+
+    def test_local_path_unchanged_when_no_changes(self, tmp_path):
         local_proxies = tmp_path / "local-proxies.conf"
         local_proxies.write_text("T1 = trojan, 1.2.3.4, 443, password=pwd\n")
 
@@ -388,11 +406,12 @@ class TestPolicyPath:
         )
 
         stats = ConversionStats()
-        processed = {str(main)}
-        convert_file(str(main), stats, processed)
+        processed = {str(main): None}
+        result = convert_file(str(main), stats, processed)
 
-        content = (tmp_path / "main-v4.conf").read_text()
-        assert "policy-path=local-proxies-v4.conf" in content
+        # No changes needed anywhere
+        assert result is None
+        assert not (tmp_path / "local-proxies-v4.conf").exists()
 
     def test_http_url_unchanged(self):
         result = convert("""
@@ -414,11 +433,12 @@ class TestPolicyPath:
         )
 
         stats = ConversionStats()
-        processed = {str(main)}
+        processed = {str(main): None}
         convert_file(str(main), stats, processed)
 
         content = (tmp_path / "main-v4.conf").read_text()
-        assert "policy-path=home-v4.dconf" in content
+        # home.dconf is pure v4, keeps original reference
+        assert "policy-path=home.dconf" in content
         assert "policy-path=https://sub.example.com/surge.conf" in content
 
 
@@ -427,14 +447,14 @@ class TestPolicyPath:
 class TestBackup:
     def test_existing_output_backed_up(self, tmp_path):
         main = tmp_path / "output.conf"
-        main.write_text("[General]\nloglevel = notify\n")
+        main.write_text("[General]\nudp-priority = true\n")
 
         # Create existing output
         existing = tmp_path / "output-v4.conf"
         existing.write_text("old content")
 
         stats = ConversionStats()
-        processed = {str(main)}
+        processed = {str(main): None}
         convert_file(str(main), stats, processed)
 
         # New file should exist
@@ -442,20 +462,123 @@ class TestBackup:
         assert existing.read_text() != "old content"
 
         # Backup file should exist
-        backups = list(tmp_path.glob("output-v4-*.conf"))
-        assert len(backups) == 1
-        assert backups[0].read_text() == "old content"
+        backup = tmp_path / "output-v4-deprecated.conf"
+        assert backup.exists()
+        assert backup.read_text() == "old content"
+
+    def test_deprecated_files_tracked_in_stats(self, tmp_path):
+        """backup_if_exists 产生的文件应记录到 stats.deprecated_files"""
+        main = tmp_path / "output.conf"
+        main.write_text("[General]\nudp-priority = true\n")
+
+        existing = tmp_path / "output-v4.conf"
+        existing.write_text("old content")
+
+        stats = ConversionStats()
+        processed = {str(main): None}
+        convert_file(str(main), stats, processed)
+
+        assert len(stats.deprecated_files) == 1
+        assert str(tmp_path / "output-v4-deprecated.conf") in stats.deprecated_files
 
     def test_no_backup_when_no_conflict(self, tmp_path):
         main = tmp_path / "output.conf"
+        main.write_text("[General]\nudp-priority = true\n")
+
+        stats = ConversionStats()
+        processed = {str(main): None}
+        convert_file(str(main), stats, processed)
+
+        assert not (tmp_path / "output-v4-deprecated.conf").exists()
+
+    def test_backup_overwrites_previous(self, tmp_path):
+        main = tmp_path / "output.conf"
+        main.write_text("[General]\nudp-priority = true\n")
+
+        # First run: create output-v4.conf
+        existing = tmp_path / "output-v4.conf"
+        existing.write_text("first content")
+        convert_file(str(main), ConversionStats(), {str(main): None})
+
+        # Second run: output-v4.conf exists again, backup should overwrite
+        convert_file(str(main), ConversionStats(), {str(main): None})
+
+        backup = tmp_path / "output-v4-deprecated.conf"
+        assert backup.exists()
+        # The deprecated file should contain the converted content from the first run,
+        # not "first content" (which was the first deprecated backup)
+        assert backup.read_text() != "first content"
+        # Only one backup file, no timestamp proliferation
+        backups = list(tmp_path.glob("output-v4-*"))
+        assert len(backups) == 1
+
+
+# --- T11b: Skip unchanged sub-files ---
+
+class TestSkipUnchangedSubfile:
+    def test_pure_v4_subfile_skipped(self, tmp_path):
+        """Sub-file with no v5+ content → no -v4 copy, no output at all."""
+        proxies = tmp_path / "proxies.conf"
+        proxies.write_text("T1 = trojan, 1.2.3.4, 443, password=pwd\n")
+
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy]\n#!include proxies.conf\n")
+
+        stats = ConversionStats()
+        processed = {str(main): None}
+        result = convert_file(str(main), stats, processed)
+
+        # Nothing needs conversion anywhere
+        assert result is None
+        assert not (tmp_path / "proxies-v4.conf").exists()
+        assert not (tmp_path / "main-v4.conf").exists()
+
+    def test_mixed_subfiles(self, tmp_path):
+        """Only sub-files with changes get -v4 copies."""
+        pure_v4 = tmp_path / "pure.conf"
+        pure_v4.write_text("T1 = trojan, 1.2.3.4, 443, password=pwd\n")
+
+        needs_conv = tmp_path / "needs-conv.conf"
+        needs_conv.write_text("HY2 = hysteria2, 1.2.3.4, 443, password=pwd\n")
+
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy]\n#!include pure.conf, needs-conv.conf\n")
+
+        stats = ConversionStats()
+        processed = {str(main): None}
+        convert_file(str(main), stats, processed)
+
+        assert not (tmp_path / "pure-v4.conf").exists()
+        assert (tmp_path / "needs-conv-v4.conf").exists()
+        content = (tmp_path / "main-v4.conf").read_text()
+        assert "#!include pure.conf, needs-conv-v4.conf" in content
+
+    def test_policy_path_subfile_skipped(self, tmp_path):
+        """policy-path sub-file with no changes → keep original reference."""
+        local = tmp_path / "home.dconf"
+        local.write_text("S1 = snell, 1.2.3.4, 8000, psk=x, version=4\n")
+
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy Group]\nProxy = select, policy-path=home.dconf\n")
+
+        stats = ConversionStats()
+        processed = {str(main): None}
+        result = convert_file(str(main), stats, processed)
+
+        assert result is None
+        assert not (tmp_path / "home-v4.dconf").exists()
+
+    def test_main_file_pure_v4_returns_none(self, tmp_path):
+        """Entry file with no v5+ content → no output file, returns None."""
+        main = tmp_path / "main.conf"
         main.write_text("[General]\nloglevel = notify\n")
 
         stats = ConversionStats()
-        processed = {str(main)}
-        convert_file(str(main), stats, processed)
+        processed = {str(main): None}
+        result = convert_file(str(main), stats, processed)
 
-        backups = list(tmp_path.glob("output-v4-*.conf"))
-        assert len(backups) == 0
+        assert result is None
+        assert not (tmp_path / "main-v4.conf").exists()
 
 
 # --- T12: Already-commented lines not double-processed ---
@@ -574,19 +697,73 @@ class TestCommentLine:
 class TestRemoveProxyParams:
     def test_remove_single(self):
         line = "X = ss, 1.2.3.4, 8000, password=pwd, ecn=true"
-        result, count = remove_proxy_params(line, {"ecn"})
+        result, removed = remove_proxy_params(line, {"ecn"})
         assert "ecn" not in result
-        assert count == 1
+        assert removed == ["ecn"]
 
     def test_remove_multiple(self):
         line = 'X = tuic, 1.2.3.4, 443, token=pwd, port-hopping="5000-6000", port-hopping-interval=30, ecn=true'
-        result, count = remove_proxy_params(line, {"port-hopping", "port-hopping-interval", "ecn"})
+        result, removed = remove_proxy_params(line, {"port-hopping", "port-hopping-interval", "ecn"})
         assert "port-hopping" not in result
         assert "ecn" not in result
-        assert count == 3
+        assert len(removed) == 3
 
     def test_no_match(self):
         line = "X = ss, 1.2.3.4, 8000, password=pwd"
-        result, count = remove_proxy_params(line, {"ecn"})
+        result, removed = remove_proxy_params(line, {"ecn"})
         assert result == line
-        assert count == 0
+        assert removed == []
+
+
+# --- T15: Change output ---
+
+class TestChangeOutput:
+    def test_changes_recorded(self):
+        stats = ConversionStats()
+        convert("""
+            [General]
+            udp-priority = true
+
+            [Proxy]
+            HY2 = hysteria2, 1.2.3.4, 443, password=pwd
+            SNELL = snell, 1.2.3.4, 8000, psk=pwd, version=5
+
+            [Proxy Group]
+            Auto = smart, interval=300
+        """, stats=stats, filename="test.conf")
+        assert len(stats.changes) == 4
+        fn, ln, sec, act, det = stats.changes[0]
+        assert fn == "test.conf" and ln == 2 and "udp-priority" in det
+        assert stats.changes[1][4] == "HY2 (hysteria2)"
+        assert stats.changes[2][3] == "version=5 → version=4"
+        assert stats.changes[3][3] == "smart → url-test"
+
+    def test_v5plus_section_recorded(self):
+        stats = ConversionStats()
+        convert("""
+            [Port Forwarding]
+            0.0.0.0:6841 localhost:3306
+        """, stats=stats, filename="test.conf")
+        assert len(stats.changes) == 1
+        fn, ln, sec, act, det = stats.changes[0]
+        assert fn == "test.conf" and act == "注释段" and "[Port Forwarding]" in det
+
+    def test_rule_comment_recorded(self):
+        stats = ConversionStats()
+        convert("""
+            [Rule]
+            HOSTNAME-TYPE,IPv4,Proxy
+        """, stats=stats, filename="test.conf")
+        assert len(stats.changes) == 1
+        fn, ln, sec, act, det = stats.changes[0]
+        assert act == "注释" and "HOSTNAME-TYPE,IPv4,Proxy" in det
+
+    def test_remove_param_recorded(self):
+        stats = ConversionStats()
+        convert("""
+            [Proxy]
+            SNELL1 = snell, 1.2.3.4, 8000, psk=pwd, version=4, ecn=true
+        """, stats=stats, filename="test.conf")
+        assert len(stats.changes) == 1
+        fn, ln, sec, act, det = stats.changes[0]
+        assert act == "移除参数" and "ecn" in det and "SNELL1" in det
