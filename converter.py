@@ -208,6 +208,7 @@ def update_include_line(line, base_dir, processed_files, stats, current_section=
     files_str = m.group(1)
     parts = [p.strip() for p in files_str.split(",")]
     new_parts = []
+    any_changed = False
 
     for part in parts:
         if part.startswith("http://") or part.startswith("https://"):
@@ -225,8 +226,14 @@ def update_include_line(line, base_dir, processed_files, stats, current_section=
         else:
             result = processed_files[abs_path]
 
-        new_parts.append(make_v4_filename(part) if result else part)
+        if result:
+            new_parts.append(make_v4_filename(part))
+            any_changed = True
+        else:
+            new_parts.append(part)
 
+    if not any_changed:
+        return line
     return "#!include " + ", ".join(new_parts)
 
 
@@ -312,7 +319,7 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
 
         # Handle #!include directives (can appear in any section)
         if stripped.startswith("#!include"):
-            result.append(update_include_line(stripped, base_dir, processed_files, stats, current_section))
+            result.append(update_include_line(line, base_dir, processed_files, stats, current_section))
             continue
 
         # Apply section-specific transformations

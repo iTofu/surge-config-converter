@@ -27,7 +27,7 @@ def convert(text, base_dir="/tmp", stats=None, processed_files=None, filename=""
     if stats is None:
         stats = ConversionStats()
     if processed_files is None:
-        processed_files = set()
+        processed_files = {}
     return convert_content(textwrap.dedent(text).strip(), base_dir, stats, processed_files, filename=filename)
 
 
@@ -360,6 +360,21 @@ class TestIncludeDirective:
 
         # extra.dconf is pure v4, no -v4 copy created
         assert not (tmp_path / "extra-v4.dconf").exists()
+
+    def test_include_extra_spaces_no_false_positive(self, tmp_path):
+        """#!include 行有多余空格时不应误判为内容变化"""
+        sub = tmp_path / "sub.conf"
+        sub.write_text("T1 = trojan, 1.2.3.4, 443, password=pwd\n")
+
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy]\n#!include   sub.conf\n")  # 3个空格
+
+        stats = ConversionStats()
+        processed = {str(main): None}
+        result = convert_file(str(main), stats, processed)
+
+        assert result is None
+        assert not (tmp_path / "main-v4.conf").exists()
 
     def test_include_with_nonexistent_file(self, tmp_path):
         """References to nonexistent files keep original path."""
