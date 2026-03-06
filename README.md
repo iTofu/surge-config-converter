@@ -1,6 +1,6 @@
-# Surge Config Converter (v5 → v4)
+# Surge Config Converter (v5+ → v4)
 
-将 Surge v5 配置文件转换为 v4 兼容格式。自动识别并处理 v5 独有的协议、参数和语法，递归处理 `#!include` 和 `policy-path` 引用的子文件。
+将 Surge v5+ 配置文件转换为 v4 兼容格式。自动识别并处理 v5+ 独有的协议、参数和语法，递归处理 `#!include` 和 `policy-path` 引用的子文件。
 
 ## 使用
 
@@ -64,7 +64,7 @@ python3 converter.py ~/Library/Mobile\ Documents/iCloud~com~nssurge~inc/Document
 
 ## 注释标记
 
-被转换工具注释的行以 `# [v5]` 开头，便于与用户原始注释区分。
+被转换工具注释的行以 `# [v5+]` 开头，便于与用户原始注释区分。
 
 ## 测试
 
