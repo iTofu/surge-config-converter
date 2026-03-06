@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Surge v5 → v4 configuration converter."""
+"""Surge v5+ → v4 configuration converter."""
 
 import os
 import re
@@ -9,19 +9,19 @@ from pathlib import Path
 
 
 # Proxy types not supported in Surge v4
-V5_ONLY_PROXY_TYPES = {"hysteria2", "hy2", "anytls", "tuic"}
+V5PLUS_ONLY_PROXY_TYPES = {"hysteria2", "hy2", "anytls", "tuic"}
 
 # Sections that should be entirely commented out in v4
-V5_ONLY_SECTIONS = {"Port Forwarding", "Body Rewrite"}
+V5PLUS_ONLY_SECTIONS = {"Port Forwarding", "Body Rewrite"}
 
 # General parameters not supported in v4
-V5_ONLY_GENERAL_PARAMS = {"udp-priority", "block-quic"}
+V5PLUS_ONLY_GENERAL_PARAMS = {"udp-priority", "block-quic"}
 
 # Rule types not supported in v4
-V5_ONLY_RULE_TYPES = {"HOSTNAME-TYPE", "DOMAIN-WILDCARD"}
+V5PLUS_ONLY_RULE_TYPES = {"HOSTNAME-TYPE", "DOMAIN-WILDCARD"}
 
-# Proxy parameters to remove (v5-only)
-V5_ONLY_PROXY_PARAMS = {"port-hopping", "port-hopping-interval", "ecn"}
+# Proxy parameters to remove (v5+ only)
+V5PLUS_ONLY_PROXY_PARAMS = {"port-hopping", "port-hopping-interval", "ecn"}
 
 
 class ConversionStats:
@@ -60,8 +60,8 @@ def backup_if_exists(filepath):
 
 
 def comment_line(line):
-    """Add # [v5] prefix to a line."""
-    return f"# [v5] {line}"
+    """Add # [v5+] prefix to a line."""
+    return f"# [v5+] {line}"
 
 
 def extract_proxy_type(line):
@@ -99,8 +99,8 @@ def transform_proxy_line(line, stats):
     if not proxy_type:
         return line
 
-    # Comment out v5-only proxy types
-    if proxy_type in V5_ONLY_PROXY_TYPES:
+    # Comment out v5+ only proxy types
+    if proxy_type in V5PLUS_ONLY_PROXY_TYPES:
         stats.lines_commented += 1
         return comment_line(line)
 
@@ -119,8 +119,8 @@ def transform_proxy_line(line, stats):
         modified = new
         stats.params_modified += n
 
-    # Remove v5-only parameters
-    modified, removed = remove_proxy_params(modified, V5_ONLY_PROXY_PARAMS)
+    # Remove v5+ only parameters
+    modified, removed = remove_proxy_params(modified, V5PLUS_ONLY_PROXY_PARAMS)
     stats.params_modified += removed
 
     return modified
@@ -202,7 +202,7 @@ def transform_rule_line(line, stats):
     if stripped.startswith("#"):
         return line
 
-    for rule_type in V5_ONLY_RULE_TYPES:
+    for rule_type in V5PLUS_ONLY_RULE_TYPES:
         if stripped.startswith(rule_type + ","):
             stats.lines_commented += 1
             return comment_line(line)
@@ -216,7 +216,7 @@ def transform_general_line(line, stats):
     if stripped.startswith("#"):
         return line
 
-    for param in V5_ONLY_GENERAL_PARAMS:
+    for param in V5PLUS_ONLY_GENERAL_PARAMS:
         if re.match(rf'^{re.escape(param)}\s*=', stripped):
             stats.lines_commented += 1
             return comment_line(line)
@@ -225,7 +225,7 @@ def transform_general_line(line, stats):
 
 
 def convert_content(content, base_dir, stats, processed_files, default_section=None):
-    """Convert configuration content from v5 to v4 format.
+    """Convert configuration content from v5+ to v4 format.
 
     Args:
         default_section: If set, treat lines before any [Section] header
@@ -237,7 +237,7 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
     lines = content.splitlines()
     result = []
     current_section = default_section
-    in_v5_only_section = False
+    in_v5plus_only_section = False
 
     for line in lines:
         stripped = line.strip()
@@ -246,20 +246,20 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
         section_match = re.match(r'^\[(.+)\]$', stripped)
         if section_match:
             section_name = section_match.group(1)
-            if section_name in V5_ONLY_SECTIONS:
-                in_v5_only_section = True
+            if section_name in V5PLUS_ONLY_SECTIONS:
+                in_v5plus_only_section = True
                 current_section = section_name
                 stats.lines_commented += 1
                 result.append(comment_line(line))
                 continue
             else:
-                in_v5_only_section = False
+                in_v5plus_only_section = False
                 current_section = section_name
                 result.append(line)
                 continue
 
-        # If inside a v5-only section, comment everything
-        if in_v5_only_section:
+        # If inside a v5+ only section, comment everything
+        if in_v5plus_only_section:
             if stripped:  # Don't comment empty lines
                 stats.lines_commented += 1
                 result.append(comment_line(line))
@@ -294,7 +294,7 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
 
 
 def convert_file(input_path, stats=None, processed_files=None, default_section=None):
-    """Convert a single Surge config file from v5 to v4.
+    """Convert a single Surge config file from v5+ to v4.
 
     Args:
         input_path: Path to the input file

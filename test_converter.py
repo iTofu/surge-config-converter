@@ -1,4 +1,4 @@
-"""Tests for Surge v5 → v4 configuration converter."""
+"""Tests for Surge v5+ → v4 configuration converter."""
 
 import os
 import textwrap
@@ -39,28 +39,28 @@ class TestProxyProtocolCommenting:
             [Proxy]
             US-HY2 = hysteria2, 1.2.3.4, 443, password=pwd, download-bandwidth=100
         """)
-        assert "# [v5] US-HY2 = hysteria2" in result
+        assert "# [v5+] US-HY2 = hysteria2" in result
 
     def test_hy2_shorthand_commented(self):
         result = convert("""
             [Proxy]
             US-HY2 = hy2, 1.2.3.4, 443, password=pwd
         """)
-        assert "# [v5] US-HY2 = hy2" in result
+        assert "# [v5+] US-HY2 = hy2" in result
 
     def test_anytls_commented(self):
         result = convert("""
             [Proxy]
             JP-ANYTLS = anytls, 5.6.7.8, 443, password=pwd
         """)
-        assert "# [v5] JP-ANYTLS = anytls" in result
+        assert "# [v5+] JP-ANYTLS = anytls" in result
 
     def test_tuic_commented(self):
         result = convert("""
             [Proxy]
             SG-TUIC = tuic, 9.10.11.12, 443, token=pwd, alpn=h3
         """)
-        assert "# [v5] SG-TUIC = tuic" in result
+        assert "# [v5+] SG-TUIC = tuic" in result
 
     def test_supported_protocols_unchanged(self):
         input_text = textwrap.dedent("""
@@ -75,7 +75,7 @@ class TestProxyProtocolCommenting:
         for line in result.splitlines():
             if line.startswith("["):
                 continue
-            assert not line.startswith("# [v5]"), f"Should not be commented: {line}"
+            assert not line.startswith("# [v5+]"), f"Should not be commented: {line}"
 
     def test_mixed_protocols(self):
         result = convert("""
@@ -87,11 +87,11 @@ class TestProxyProtocolCommenting:
             HK-TROJAN = trojan, 1.2.3.4, 443, password=pwd
         """)
         lines = result.splitlines()
-        assert lines[1].startswith("# [v5]")  # hysteria2
-        assert not lines[2].startswith("# [v5]")  # snell
-        assert lines[3].startswith("# [v5]")  # anytls
-        assert lines[4].startswith("# [v5]")  # tuic
-        assert not lines[5].startswith("# [v5]")  # trojan
+        assert lines[1].startswith("# [v5+]")  # hysteria2
+        assert not lines[2].startswith("# [v5+]")  # snell
+        assert lines[3].startswith("# [v5+]")  # anytls
+        assert lines[4].startswith("# [v5+]")  # tuic
+        assert not lines[5].startswith("# [v5+]")  # trojan
 
 
 # --- T2: Snell version=5 → version=4 ---
@@ -139,7 +139,7 @@ class TestShadowTls:
 
 class TestRemoveV5Params:
     def test_port_hopping_removed_on_supported_proxy(self):
-        """For a v4-supported proxy type, v5-only params should be stripped."""
+        """For a v4-supported proxy type, v5+ only params should be stripped."""
         stats = ConversionStats()
         result = convert("""
             [Proxy]
@@ -157,13 +157,13 @@ class TestRemoveV5Params:
         assert "ecn=" not in result
         assert "SNELL1 = snell" in result
 
-    def test_v5_proxy_with_v5_params_just_commented(self):
-        """v5-only proxy types are fully commented, params don't matter."""
+    def test_v5plus_proxy_with_v5plus_params_just_commented(self):
+        """v5+ only proxy types are fully commented, params don't matter."""
         result = convert("""
             [Proxy]
             HY2 = hysteria2, 1.2.3.4, 443, password=pwd, port-hopping="5000-6000", ecn=true
         """)
-        assert result.splitlines()[1].startswith("# [v5]")
+        assert result.splitlines()[1].startswith("# [v5+]")
 
 
 # --- T5: smart → url-test ---
@@ -194,7 +194,7 @@ class TestSmartToUrlTest:
         assert "smart" not in result
 
 
-# --- T6: v5-only rule types ---
+# --- T6: v5+ only rule types ---
 
 class TestV5OnlyRules:
     def test_hostname_type_commented(self):
@@ -202,14 +202,14 @@ class TestV5OnlyRules:
             [Rule]
             HOSTNAME-TYPE,IPv4,Proxy
         """)
-        assert "# [v5] HOSTNAME-TYPE" in result
+        assert "# [v5+] HOSTNAME-TYPE" in result
 
     def test_domain_wildcard_commented(self):
         result = convert("""
             [Rule]
             DOMAIN-WILDCARD,*.test?.com,Proxy
         """)
-        assert "# [v5] DOMAIN-WILDCARD" in result
+        assert "# [v5+] DOMAIN-WILDCARD" in result
 
     def test_supported_rules_unchanged(self):
         result = convert("""
@@ -221,7 +221,7 @@ class TestV5OnlyRules:
         for line in result.splitlines():
             if line.startswith("["):
                 continue
-            assert not line.startswith("# [v5]")
+            assert not line.startswith("# [v5+]")
 
     def test_mixed_rules(self):
         result = convert("""
@@ -232,13 +232,13 @@ class TestV5OnlyRules:
             GEOIP,CN,DIRECT
         """)
         lines = result.splitlines()
-        assert not lines[1].startswith("# [v5]")  # DOMAIN-SUFFIX
-        assert lines[2].startswith("# [v5]")  # HOSTNAME-TYPE
-        assert lines[3].startswith("# [v5]")  # DOMAIN-WILDCARD
-        assert not lines[4].startswith("# [v5]")  # GEOIP
+        assert not lines[1].startswith("# [v5+]")  # DOMAIN-SUFFIX
+        assert lines[2].startswith("# [v5+]")  # HOSTNAME-TYPE
+        assert lines[3].startswith("# [v5+]")  # DOMAIN-WILDCARD
+        assert not lines[4].startswith("# [v5+]")  # GEOIP
 
 
-# --- T7: [General] v5-only parameters ---
+# --- T7: [General] v5+ only parameters ---
 
 class TestGeneralParams:
     def test_udp_priority_commented(self):
@@ -248,7 +248,7 @@ class TestGeneralParams:
             udp-priority = true
             dns-server = 119.29.29.29
         """)
-        assert "# [v5] udp-priority = true" in result
+        assert "# [v5+] udp-priority = true" in result
         assert "loglevel = notify" in result
         assert "dns-server = 119.29.29.29" in result
 
@@ -257,7 +257,7 @@ class TestGeneralParams:
             [General]
             block-quic = all-proxy
         """)
-        assert "# [v5] block-quic = all-proxy" in result
+        assert "# [v5+] block-quic = all-proxy" in result
 
     def test_supported_params_unchanged(self):
         result = convert("""
@@ -269,7 +269,7 @@ class TestGeneralParams:
         for line in result.splitlines():
             if line.startswith("[") or not line.strip():
                 continue
-            assert not line.startswith("# [v5]")
+            assert not line.startswith("# [v5+]")
 
 
 # --- T8: [Port Forwarding] / [Body Rewrite] full section commenting ---
@@ -290,9 +290,9 @@ class TestV5OnlySections:
         lines = result.splitlines()
         # Find Port Forwarding section
         pf_idx = next(i for i, l in enumerate(lines) if "Port Forwarding" in l)
-        assert lines[pf_idx] == "# [v5] [Port Forwarding]"
-        assert lines[pf_idx + 1].startswith("# [v5]")
-        assert lines[pf_idx + 2].startswith("# [v5]")
+        assert lines[pf_idx] == "# [v5+] [Port Forwarding]"
+        assert lines[pf_idx + 1].startswith("# [v5+]")
+        assert lines[pf_idx + 2].startswith("# [v5+]")
         # MITM section should not be commented
         mitm_idx = next(i for i, l in enumerate(lines) if "MITM" in l)
         assert lines[mitm_idx] == "[MITM]"
@@ -303,10 +303,10 @@ class TestV5OnlySections:
             [Body Rewrite]
             http-response ^https://api.example.com jq '.data'
         """)
-        assert "# [v5] [Body Rewrite]" in result
-        assert "# [v5] http-response" in result
+        assert "# [v5+] [Body Rewrite]" in result
+        assert "# [v5+] http-response" in result
 
-    def test_empty_lines_in_v5_section_preserved(self):
+    def test_empty_lines_in_v5plus_section_preserved(self):
         result = convert("""
             [Port Forwarding]
             line1
@@ -314,10 +314,10 @@ class TestV5OnlySections:
             line2
         """)
         lines = result.splitlines()
-        assert lines[0] == "# [v5] [Port Forwarding]"
-        assert lines[1] == "# [v5] line1"
+        assert lines[0] == "# [v5+] [Port Forwarding]"
+        assert lines[1] == "# [v5+] line1"
         assert lines[2] == ""  # empty line not commented
-        assert lines[3] == "# [v5] line2"
+        assert lines[3] == "# [v5+] line2"
 
 
 # --- T9: #!include path update + recursive conversion ---
@@ -352,7 +352,7 @@ class TestIncludeDirective:
         proxies_v4 = tmp_path / "proxies-v4.conf"
         assert proxies_v4.exists()
         p_content = proxies_v4.read_text()
-        assert "# [v5] HY2-US = hysteria2" in p_content
+        assert "# [v5+] HY2-US = hysteria2" in p_content
         assert "version=4" in p_content
         assert "version=5" not in p_content
         assert "TROJAN-HK = trojan" in p_content
@@ -469,7 +469,7 @@ class TestAlreadyCommented:
         """)
         lines = result.splitlines()
         assert lines[1] == "# HY2-OLD = hysteria2, 1.2.3.4, 443, password=pwd"
-        assert not lines[1].startswith("# [v5]")
+        assert not lines[1].startswith("# [v5+]")
 
     def test_commented_rule_unchanged(self):
         result = convert("""
@@ -478,7 +478,7 @@ class TestAlreadyCommented:
             DOMAIN-SUFFIX,example.com,DIRECT
         """)
         assert "# HOSTNAME-TYPE" in result
-        assert "# [v5]" not in result
+        assert "# [v5+]" not in result
 
 
 # --- T13: No-op for pure v4 config ---
@@ -568,7 +568,7 @@ class TestExtractProxyType:
 
 class TestCommentLine:
     def test_basic(self):
-        assert comment_line("some line") == "# [v5] some line"
+        assert comment_line("some line") == "# [v5+] some line"
 
 
 class TestRemoveProxyParams:
