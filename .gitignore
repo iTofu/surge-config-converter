@@ -1,0 +1,29 @@
+.DS_Store
+
+# vscode
+.vscode
+buildServer.json
+
+# trae
+.trae/rules
+
+# Claude Code
+CLAUDE.local.md
+.claude/*.local.md
+.claude/*.local.json
+
+# Gemini
+.gemini-clipboard/
+
+# Environment variables
+.env.local
+.env.*.local
+
+# xcode-build-server files
+buildServer.json
+.compile
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
