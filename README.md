@@ -24,7 +24,8 @@ python3 converter.py ~/Library/Mobile\ Documents/iCloud~com~nssurge~inc/Document
 |------|------|
 | `hysteria2` / `hy2` | 注释（iOS 5.8.0+） |
 | `anytls` | 注释（iOS 5.17.0+） |
-| `tuic` | 注释（Mac 5.1.1+） |
+| `tuic` | 注释（iOS 5.2.0+） |
+| `trust-tunnel` | 注释（Mac 6.4.4+） |
 | Snell `version=5` | 替换为 `version=4` |
 | `shadow-tls-version=3` | 替换为 `shadow-tls-version=2` |
 | `port-hopping` / `port-hopping-interval` / `ecn` | 移除参数 |

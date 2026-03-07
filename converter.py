@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 # Proxy types not supported in Surge v4
-V5PLUS_ONLY_PROXY_TYPES = {"hysteria2", "hy2", "anytls", "tuic"}
+V5PLUS_ONLY_PROXY_TYPES = {"hysteria2", "hy2", "anytls", "tuic", "trust-tunnel"}
 
 # Sections that should be entirely commented out in v4
 V5PLUS_ONLY_SECTIONS = {"Port Forwarding", "Body Rewrite"}
@@ -421,8 +421,8 @@ def main():
         print(f"\n发现 {len(stats.deprecated_files)} 个 deprecated 备份文件:")
         for f in stats.deprecated_files:
             print(f"  - {f}")
-        answer = input("是否删除这些 deprecated 文件？（默认保留）[y/N] ").strip().lower()
-        if answer == "y":
+        answer = input("是否删除这些 deprecated 文件？（默认删除）[Y/n] ").strip().lower()
+        if answer != "n":
             for f in stats.deprecated_files:
                 os.remove(f)
                 print(f"已删除: {f}")
