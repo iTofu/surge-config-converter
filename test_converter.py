@@ -62,6 +62,13 @@ class TestProxyProtocolCommenting:
         """)
         assert "# [v5+] SG-TUIC = tuic" in result
 
+    def test_trust_tunnel_commented(self):
+        result = convert("""
+            [Proxy]
+            US-TT = trust-tunnel, 1.2.3.4, 443, password=pwd
+        """)
+        assert "# [v5+] US-TT = trust-tunnel" in result
+
     def test_supported_protocols_unchanged(self):
         input_text = textwrap.dedent("""
             [Proxy]
