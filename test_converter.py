@@ -506,26 +506,25 @@ class TestBackup:
 
         assert not (tmp_path / "output-v4-deprecated.conf").exists()
 
-    def test_backup_overwrites_previous(self, tmp_path):
+    def test_second_run_skips_when_content_matches(self, tmp_path):
         main = tmp_path / "output.conf"
         main.write_text("[General]\nudp-priority = true\n")
 
-        # First run: create output-v4.conf
+        # First run: create output-v4.conf from stale content
         existing = tmp_path / "output-v4.conf"
         existing.write_text("first content")
         convert_file(str(main), ConversionStats(), {str(main): None})
 
-        # Second run: output-v4.conf exists again, backup should overwrite
-        convert_file(str(main), ConversionStats(), {str(main): None})
-
+        # First run backed up "first content" to deprecated
         backup = tmp_path / "output-v4-deprecated.conf"
         assert backup.exists()
-        # The deprecated file should contain the converted content from the first run,
-        # not "first content" (which was the first deprecated backup)
-        assert backup.read_text() != "first content"
-        # Only one backup file, no timestamp proliferation
-        backups = list(tmp_path.glob("output-v4-*"))
-        assert len(backups) == 1
+        assert backup.read_text() == "first content"
+
+        # Second run: -v4 content matches, should skip entirely
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert len(stats.files_processed) == 0
+        assert len(stats.deprecated_files) == 0
 
 
 # --- T11b: Skip unchanged sub-files ---
@@ -782,3 +781,60 @@ class TestChangeOutput:
         assert len(stats.changes) == 1
         fn, ln, sec, act, det = stats.changes[0]
         assert act == "移除参数" and "ecn" in det and "SNELL1" in det
+
+
+# --- T16: Skip unchanged -v4 files ---
+
+class TestSkipUnchangedV4:
+    def test_skip_when_v4_content_matches(self, tmp_path):
+        """Second run should skip when -v4 already has correct content."""
+        main = tmp_path / "output.conf"
+        main.write_text("[General]\nudp-priority = true\n")
+
+        # First run: creates output-v4.conf
+        stats1 = ConversionStats()
+        convert_file(str(main), stats1, {str(main): None})
+        v4 = tmp_path / "output-v4.conf"
+        assert v4.exists()
+        first_content = v4.read_text()
+
+        # Second run: should skip, no deprecated file
+        stats2 = ConversionStats()
+        result = convert_file(str(main), stats2, {str(main): None})
+        assert result == str(v4)
+        assert v4.read_text() == first_content
+        assert not (tmp_path / "output-v4-deprecated.conf").exists()
+        assert len(stats2.files_processed) == 0
+        assert len(stats2.deprecated_files) == 0
+
+    def test_overwrite_when_v4_content_differs(self, tmp_path):
+        """Should overwrite when existing -v4 has different content."""
+        main = tmp_path / "output.conf"
+        main.write_text("[General]\nudp-priority = true\n")
+
+        v4 = tmp_path / "output-v4.conf"
+        v4.write_text("stale content")
+
+        stats = ConversionStats()
+        result = convert_file(str(main), stats, {str(main): None})
+        assert result == str(v4)
+        assert v4.read_text() != "stale content"
+        assert (tmp_path / "output-v4-deprecated.conf").exists()
+
+    def test_subfile_skip_preserves_v4_reference(self, tmp_path):
+        """When sub-file -v4 is skipped, parent still references -v4 path."""
+        proxies = tmp_path / "proxies.conf"
+        proxies.write_text("HY2 = hysteria2, 1.2.3.4, 443, password=pwd\n")
+
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy]\n#!include proxies.conf\n")
+
+        # First run
+        convert_file(str(main), ConversionStats(), {str(main): None})
+
+        # Second run
+        stats = ConversionStats()
+        result = convert_file(str(main), stats, {str(main): None})
+        assert result is not None
+        content = (tmp_path / "main-v4.conf").read_text()
+        assert "proxies-v4.conf" in content

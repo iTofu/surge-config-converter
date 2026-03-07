@@ -378,6 +378,15 @@ def convert_file(input_path, stats=None, processed_files=None, default_section=N
         processed_files[input_path] = None
         return None
 
+    # Skip if existing -v4 file already has correct content
+    if os.path.exists(output_path):
+        with open(output_path, "r", encoding="utf-8") as f:
+            existing = f.read()
+        if existing == converted:
+            processed_files[input_path] = output_path
+            print(f"已跳过（内容未变化）: {output_path}")
+            return output_path
+
     # Backup existing output file
     backup = backup_if_exists(output_path)
     if backup:
