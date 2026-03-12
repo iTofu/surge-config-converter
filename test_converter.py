@@ -2,6 +2,7 @@
 
 import os
 import textwrap
+from unittest.mock import patch
 
 import pytest
 
@@ -845,3 +846,28 @@ class TestSkipUnchangedV4:
         assert result is not None
         content = (tmp_path / "main-v4.conf").read_text()
         assert "proxies-v4.conf" in content
+
+
+# --- T17: Deprecated files sent to trash ---
+
+class TestDeprecatedSendToTrash:
+    def test_deprecated_files_sent_to_trash(self, tmp_path, monkeypatch):
+        """main() should call send2trash instead of os.remove for deprecated files."""
+        main_conf = tmp_path / "output.conf"
+        main_conf.write_text("[General]\nudp-priority = true\n")
+
+        # Create stale -v4 so a deprecated backup is generated
+        existing = tmp_path / "output-v4.conf"
+        existing.write_text("old content")
+
+        # Run convert_file to produce deprecated file
+        from converter import main as converter_main
+
+        monkeypatch.setattr("sys.argv", ["converter.py", str(main_conf)])
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+
+        with patch("converter.send2trash") as mock_trash:
+            converter_main()
+            assert mock_trash.call_count == 1
+            trashed = mock_trash.call_args[0][0]
+            assert "deprecated" in trashed
