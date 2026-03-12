@@ -6,6 +6,8 @@ import re
 import sys
 from pathlib import Path
 
+from send2trash import send2trash
+
 
 # Proxy types not supported in Surge v4
 V5PLUS_ONLY_PROXY_TYPES = {"hysteria2", "hy2", "anytls", "tuic", "trust-tunnel"}
@@ -424,8 +426,8 @@ def main():
         answer = input("是否删除这些 deprecated 文件？（默认删除）[Y/n] ").strip().lower()
         if answer != "n":
             for f in stats.deprecated_files:
-                os.remove(f)
-                print(f"已删除: {f}")
+                send2trash(f)
+                print(f"已移至垃圾桶: {f}")
         else:
             print("已保留 deprecated 文件。")
 
