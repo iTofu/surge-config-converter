@@ -3177,3 +3177,70 @@ class TestNonInteractiveStdin:
             converter_main()
         assert mock_trash.call_count == 0
         assert (tmp_path / "v4" / "out-v4-deprecated.conf").exists()
+
+
+# --- T80: unreachable subtree names enter the deletion closure (R2F1) ---
+
+class TestUnreachableSubtreeNames:
+    def test_orphan_subfile_names_cascade_deleted(self, tmp_path):
+        """Names defined only in a sub-file that becomes unreachable (its sole
+        parent is an abandoned managed config) must cascade-delete references
+        in the emitted output."""
+        inner = tmp_path / "inner.dconf"
+        inner.write_text("X = trojan, 1.2.3.4, 443, password=pwd\n")
+        managed = tmp_path / "managed.conf"
+        managed.write_text(
+            "#!MANAGED-CONFIG https://x.com/m.conf interval=3600\n"
+            "[Proxy]\n"
+            "JP = anytls, 5.6.7.8, 443, password=pwd\n"
+            "#!include inner.dconf\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "OK = trojan, 9.9.9.9, 443, password=pwd\n"
+            "#!include managed.conf\n"
+            "\n"
+            "[Proxy Group]\n"
+            "G = select, X, OK\n"
+            "\n"
+            "[Rule]\n"
+            "DOMAIN,foo.com,X\n"
+            "FINAL,G\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert str(managed) in stats.abandoned_files
+        assert not (tmp_path / "v4" / "inner-v4.dconf").exists()
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "G = select, OK" in out
+        assert "# [V5+ cascade] DOMAIN,foo.com,X" in out
+        assert "FINAL,G" in out  # G survives via OK
+
+    def test_shared_subfile_directly_referenced_kept(self, tmp_path):
+        """A sub-file reachable BOTH via an abandoned managed config AND via a
+        direct root include stays live: its names must not be withdrawn."""
+        inner = tmp_path / "inner.dconf"
+        inner.write_text("X = trojan, 1.2.3.4, 443, password=pwd\n")
+        managed = tmp_path / "managed.conf"
+        managed.write_text(
+            "#!MANAGED-CONFIG https://x.com/m.conf interval=3600\n"
+            "[Proxy]\n"
+            "JP = anytls, 5.6.7.8, 443, password=pwd\n"
+            "#!include inner.dconf\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "OK = trojan, 9.9.9.9, 443, password=pwd\n"
+            "#!include managed.conf, inner.dconf\n"
+            "\n"
+            "[Proxy Group]\n"
+            "G = select, X, OK\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "#!include inner.dconf" in out   # kept, managed entry removed
+        assert "G = select, X, OK" in out       # X alive — untouched
+        assert "# [V5+ cascade]" not in out
