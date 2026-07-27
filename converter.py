@@ -293,7 +293,6 @@ class FileState:
     owned_proxies: set = field(default_factory=set)    # proxy names defined in this file
     owned_groups: set = field(default_factory=set)     # group names defined in this file
     deleted_names: set = field(default_factory=set)    # names removed (propagates cascade)
-    child_refs: set = field(default_factory=set)       # abs paths of local #!include / policy-path refs
 
 
 def parse_proxy_group_line(line):
@@ -627,6 +626,7 @@ class Pipeline:
         self.processed_files = processed_files if processed_files is not None else {}
         self.abandoned_files = set()    # absolute paths of managed files we refused
         self.global_deleted = set()     # union of all names deleted anywhere
+        self.reachable = set()          # final root-reachable set, settled by analyze()
 
     def discover(self, input_path, default_section=None):
         """Read a file, apply direct v5+ hits, and recurse into dependencies.
@@ -703,7 +703,7 @@ class Pipeline:
             stripped = line.lstrip()
             if stripped.startswith("#!include"):
                 for entry in parse_include_list(line) or []:
-                    self._discover_ref(state, base_dir, entry, state.sections[i])
+                    self._discover_ref(base_dir, entry, state.sections[i])
             elif state.sections[i] == "Proxy Group" and not stripped.startswith("#"):
                 pgl = parse_proxy_group_line(line)
                 if pgl is None:
@@ -711,19 +711,17 @@ class Pipeline:
                 for key, value in pgl.options:
                     if key == "policy-path":
                         # policy-path always references proxy list files
-                        self._discover_ref(state, base_dir, value, "Proxy")
+                        self._discover_ref(base_dir, value, "Proxy")
 
         return state
 
-    def _discover_ref(self, parent, base_dir, ref, default_section):
+    def _discover_ref(self, base_dir, ref, default_section):
         """Discover one local reference; URLs and missing files are ignored."""
         if ref.startswith("http://") or ref.startswith("https://"):
             return
         abs_path = os.path.normpath(os.path.join(base_dir, ref))
-        if not os.path.isfile(abs_path):
-            return
-        if self.discover(abs_path, default_section=default_section) is not None:
-            parent.child_refs.add(abs_path)
+        if os.path.isfile(abs_path):
+            self.discover(abs_path, default_section=default_section)
 
     def _pending_change(self, state):
         """True if the file's working lines differ from its original content."""
@@ -733,8 +731,8 @@ class Pipeline:
         """Abs paths of local files referenced by live (non-commented)
         #!include / policy-path lines, resolved against the file's directory.
 
-        Recomputed from current lines (not child_refs) so entries already
-        stripped by abandoned-reference cleanup no longer count.
+        Recomputed from current lines each call, so entries already stripped
+        by abandoned-reference cleanup no longer count.
         """
         refs = []
         base_dir = os.path.dirname(state.abs_path)
@@ -752,6 +750,30 @@ class Pipeline:
                     if key == "policy-path" and not value.startswith(("http://", "https://")):
                         refs.append(os.path.normpath(os.path.join(base_dir, value)))
         return refs
+
+    def _compute_reachable(self):
+        """Files reachable from the root through live (non-commented,
+        non-stripped) references of non-abandoned files.
+
+        NOT the same thing as "not abandoned": a normal sub-file whose only
+        parent is an abandoned managed config is unreachable — it won't be
+        emitted, so names it defines don't exist in the output.
+        """
+        reachable = set()
+        root_abs = next(iter(self.files))
+        if self.files[root_abs].is_abandoned:
+            return reachable
+        stack = [root_abs]
+        while stack:
+            cur = stack.pop()
+            if cur in reachable:
+                continue
+            reachable.add(cur)
+            for ref in self._live_local_refs(self.files[cur]):
+                sub = self.files.get(ref)
+                if sub is not None and not sub.is_abandoned:
+                    stack.append(ref)
+        return reachable
 
     def _will_emit(self, abs_path, _visiting=None):
         """Transitive closure: a file will produce a -v4 output iff it is not
@@ -849,6 +871,22 @@ class Pipeline:
                             if other is not state and not other.is_abandoned:
                                 other.deleted_names |= new_deletions
                         changed = True
+
+            # 3b. Withdraw names defined only in unreachable subtrees. A
+            # non-abandoned file whose every path from the root runs through
+            # an abandoned file is never emitted — names it defines don't
+            # exist in the output, so references to them must cascade too.
+            # New withdrawals need another full round (seed + strip + cascade).
+            self.reachable = self._compute_reachable()
+            new_withdrawn = set()
+            for state in self.files.values():
+                if state.is_abandoned or state.abs_path in self.reachable:
+                    continue
+                names = state.owned_proxies | state.owned_groups | state.deleted_names
+                new_withdrawn |= names - self.global_deleted
+            if new_withdrawn:
+                self.global_deleted |= new_withdrawn
+                continue
 
             # 4. If the cascade just dirtied a managed file (directly or via
             # a prospective reference rewrite), its abandonment must be
@@ -1099,21 +1137,11 @@ class Pipeline:
         root_output = None
         root_abs = next(iter(self.files))  # first discovered = root
 
-        # Reachability from the root through non-abandoned files: a sub-file
-        # discovered only via an abandoned managed config has nothing left
-        # referencing it — emitting it would drop an orphan into v4/.
-        reachable = set()
-        if not self.files[root_abs].is_abandoned:
-            stack = [root_abs]
-            while stack:
-                cur = stack.pop()
-                if cur in reachable:
-                    continue
-                reachable.add(cur)
-                for ref in self.files[cur].child_refs:
-                    sub = self.files.get(ref)
-                    if sub is not None and not sub.is_abandoned:
-                        stack.append(ref)
+        # Reachability was settled by analyze() (it can't be recomputed here:
+        # references are already rewritten to -v4 names). A sub-file only
+        # reachable via an abandoned managed config is never emitted — and
+        # analyze() has already withdrawn its names from the namespace.
+        reachable = self.reachable
 
         for abs_path, state in self.files.items():
             output_path = make_v4_filename(abs_path)
