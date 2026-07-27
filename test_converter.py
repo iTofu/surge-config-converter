@@ -908,9 +908,11 @@ class TestDeprecatedSendToTrash:
         existing.write_text("old content")
 
         # Run convert_file to produce deprecated file
+        import types
         from converter import main as converter_main
 
         monkeypatch.setattr("sys.argv", ["converter.py", str(main_conf)])
+        monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: True))
         monkeypatch.setattr("builtins.input", lambda _: "y")
 
         with patch("converter.send2trash") as mock_trash:
@@ -2677,8 +2679,10 @@ class TestDeprecatedPrompt:
         return main_conf
 
     def _run_main(self, monkeypatch, main_conf, answer_fn):
+        import types
         from converter import main as converter_main
         monkeypatch.setattr("sys.argv", ["converter.py", str(main_conf)])
+        monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: True))
         monkeypatch.setattr("builtins.input", answer_fn)
         with patch("converter.send2trash") as mock_trash:
             converter_main()
@@ -3003,3 +3007,173 @@ class TestStatsReconciliation:
         changed_files = {c[0] for c in stats.changes}
         assert "inner.dconf" not in changed_files
         assert "managed.conf" not in changed_files
+
+
+# --- T76: managed file dirtied only by reference rewrite is abandoned (R1F1) ---
+
+class TestManagedRefRewriteAbandon:
+    def test_managed_root_with_changed_sub_abandoned(self, tmp_path):
+        """A managed config whose ONLY change would be an include rewrite
+        (its sub-file needs conversion) must be abandoned, never emitted."""
+        sub = tmp_path / "sub.dconf"
+        sub.write_text("HY = hysteria2, 1.2.3.4, 443, password=pwd\n")
+        managed = tmp_path / "managed.conf"
+        managed.write_text(
+            "#!MANAGED-CONFIG https://x.com/m.conf interval=3600\n"
+            "[Proxy]\n#!include sub.dconf\n"
+        )
+        stats = ConversionStats()
+        result = convert_file(str(managed), stats, {str(managed): None})
+        assert result is None
+        assert str(managed) in stats.abandoned_files
+        assert not (tmp_path / "v4" / "managed-v4.conf").exists()
+        # sub only reachable via the abandoned root → no orphan output
+        assert not (tmp_path / "v4" / "sub-v4.dconf").exists()
+
+    def test_parent_strips_ref_to_transitively_dirty_managed(self, tmp_path):
+        """main → managed (clean itself) → sub (v5+): managed is abandoned,
+        main's include entry for it is cleaned up."""
+        sub = tmp_path / "sub.dconf"
+        sub.write_text("HY = hysteria2, 1.2.3.4, 443, password=pwd\n")
+        managed = tmp_path / "managed.conf"
+        managed.write_text(
+            "#!MANAGED-CONFIG https://x.com/m.conf interval=3600\n"
+            "[Proxy]\n#!include sub.dconf\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\nOK = trojan, 9.9.9.9, 443, password=pwd\n#!include managed.conf\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert str(managed) in stats.abandoned_files
+        assert not (tmp_path / "v4" / "managed-v4.conf").exists()
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] #!include managed.conf" in out
+
+
+# --- T77: every line-level cascade mutation reaches per-file detail (R1F2) ---
+
+class TestCascadeDetailCompleteness:
+    def test_surviving_group_member_removal_recorded(self, tmp_path):
+        sub = tmp_path / "groups.dconf"
+        sub.write_text("[Proxy Group]\nFast = select, JP, HK\n")
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "JP = anytls, 1.2.3.4, 443, password=pwd\n"
+            "HK = trojan, 5.6.7.8, 443, password=pwd\n"
+            "#!include groups.dconf\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert any(
+            c[0] == "groups.dconf" and c[3] == "级联移除成员" and "JP" in c[4]
+            for c in stats.changes
+        )
+
+    def test_include_rewrite_recorded(self, tmp_path):
+        sub = tmp_path / "groups.dconf"
+        sub.write_text("[Proxy Group]\nFast = select, JP, HK\n")
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "JP = anytls, 1.2.3.4, 443, password=pwd\n"
+            "HK = trojan, 5.6.7.8, 443, password=pwd\n"
+            "#!include groups.dconf\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert any(
+            c[0] == "main.conf" and c[3] == "引用改写" and "groups-v4.dconf" in c[4]
+            for c in stats.changes
+        )
+
+    def test_partial_include_strip_recorded(self, tmp_path):
+        sub1 = tmp_path / "sub1.conf"
+        sub1.write_text(
+            "#!MANAGED-CONFIG https://x.com/sub1.conf interval=3600\n"
+            "[Proxy]\nJP = anytls, 1.2.3.4, 443, password=pwd\n"
+        )
+        other = tmp_path / "other.conf"
+        other.write_text("HK = trojan, 5.6.7.8, 443, password=pwd\n")
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy]\n#!include sub1.conf, other.conf\n")
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert any(
+            c[0] == "main.conf" and c[3] == "移除 include 条目" and "sub1.conf" in c[4]
+            for c in stats.changes
+        )
+
+    def test_partial_policy_path_strip_recorded(self, tmp_path):
+        sub = tmp_path / "sub.conf"
+        sub.write_text(
+            "#!MANAGED-CONFIG https://x.com/sub.conf interval=3600\n"
+            "[Proxy]\nJP = anytls, 1.2.3.4, 443, password=pwd\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "#!include sub.conf\n"
+            "[Proxy Group]\n"
+            "G = select, DIRECT, policy-path=sub.conf\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert any(
+            c[0] == "main.conf" and c[3] == "移除 policy-path" and "sub.conf" in c[4]
+            for c in stats.changes
+        )
+
+
+# --- T78: quoted member names never treated as policy-path (R1F3) ---
+
+class TestQuotedMemberNotPolicyPath:
+    def test_quoted_member_containing_policy_path_untouched(self, tmp_path):
+        """A quoted member whose NAME contains 'policy-path=' must not be
+        treated as a reference: no discovery, no rewrite, no output."""
+        nodes = tmp_path / "nodes.conf"
+        nodes.write_text("HY = hysteria2, 1.2.3.4, 443, password=pwd\n")
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy Group]\n"
+            'G = select, "policy-path=nodes.conf, Fast", DIRECT\n'
+        )
+        stats = ConversionStats()
+        result = convert_file(str(main), stats, {str(main): None})
+        assert result is None
+        assert not (tmp_path / "v4").exists()
+
+    def test_real_policy_path_option_still_rewritten(self, tmp_path):
+        nodes = tmp_path / "nodes.conf"
+        nodes.write_text("HY = hysteria2, 1.2.3.4, 443, password=pwd\n")
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy Group]\n"
+            'G = select, "policy-path=decoy.conf, Fast", policy-path=nodes.conf\n'
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "policy-path=nodes-v4.conf" in out
+        assert '"policy-path=decoy.conf, Fast"' in out  # member name intact
+
+
+# --- T79: non-TTY stdin never consents to deletion (R1F4) ---
+
+class TestNonInteractiveStdin:
+    def test_non_tty_blank_line_keeps_files(self, tmp_path, monkeypatch):
+        """A pipe containing a blank line must NOT count as default-confirm."""
+        import types
+        main_conf = tmp_path / "out.conf"
+        main_conf.write_text("[General]\nudp-priority = true\n")
+        (tmp_path / "v4").mkdir()
+        (tmp_path / "v4" / "out-v4.conf").write_text("old content")
+
+        from converter import main as converter_main
+        monkeypatch.setattr("sys.argv", ["converter.py", str(main_conf)])
+        monkeypatch.setattr("sys.stdin", types.SimpleNamespace(isatty=lambda: False))
+        monkeypatch.setattr("builtins.input", lambda _: "")  # blank line in pipe
+        with patch("converter.send2trash") as mock_trash:
+            converter_main()
+        assert mock_trash.call_count == 0
+        assert (tmp_path / "v4" / "out-v4-deprecated.conf").exists()
