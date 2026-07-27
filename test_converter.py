@@ -1,6 +1,5 @@
 """Tests for Surge v5+ → v4 configuration converter."""
 
-import os
 import textwrap
 from unittest.mock import patch
 
@@ -9,7 +8,6 @@ import pytest
 from converter import (
     ConversionStats,
     _split_top_level_commas,
-    backup_if_exists,
     comment_line,
     compute_sections,
     convert_content,
@@ -22,9 +20,6 @@ from converter import (
     parse_proxy_group_line,
     ProxyGroupLine,
     remove_proxy_params,
-    transform_proxy_line,
-    transform_rule_line,
-    transform_general_line,
     unquote,
 )
 
@@ -1749,8 +1744,8 @@ class TestStatsReporting:
         )
         stats = ConversionStats()
         convert_file(str(main), stats, {str(main): None})
-        # Expect at least: JP commented (direct), OnlyV5 cascade, rule cascade
-        assert stats.lines_commented >= 3
+        # Exactly: JP commented (direct), OnlyV5 cascade, rule cascade
+        assert stats.lines_commented == 3
 
     def test_abandoned_files_tracked(self, tmp_path):
         sub = tmp_path / "sub.conf"
@@ -2380,6 +2375,8 @@ class TestCrossFileDirectHitCascade:
         convert_file(str(main), stats, {str(main): None})
         main_out = (tmp_path / "v4" / "main-v4.conf").read_text()
         assert "# [V5+] JP = anytls" in main_out
+        # The parent must reference the -v4 copy of the cascade-modified sub
+        assert "#!include groups-v4.dconf" in main_out
         # The group is in groups-v4.dconf — JP must be removed from it
         sub_out = (tmp_path / "v4" / "groups-v4.dconf").read_text()
         assert "Fast = select, HK" in sub_out
@@ -2420,3 +2417,589 @@ class TestIndentedInclude:
         out = (tmp_path / "v4" / "main-v4.conf").read_text()
         assert "sub-v4.conf" in out
         assert (tmp_path / "v4" / "sub-v4.conf").exists()
+
+
+# --- T53: include-other-group as a member source (N4) ---
+
+class TestIncludeOtherGroup:
+    def test_group_with_include_other_group_survives(self, tmp_path):
+        """A group whose remaining supply is include-other-group=<alive> must not be cascade-commented."""
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "HY = hysteria2, 1.2.3.4, 443, password=pwd\n"
+            "OK = trojan, 5.6.7.8, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "Alive = select, OK\n"
+            "Combo = url-test, HY, include-other-group=Alive\n"
+            "\n"
+            "[Rule]\n"
+            "FINAL,Combo\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "Combo = url-test, include-other-group=Alive" in out
+        assert "# [V5+ cascade] Combo" not in out
+        assert "FINAL,Combo" in out
+        assert "# [V5+ cascade] FINAL,Combo" not in out
+
+    def test_dead_include_other_group_removed_and_group_cascades(self, tmp_path):
+        """include-other-group pointing at a cascade-deleted group is itself dead supply."""
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "HY = hysteria2, 1.2.3.4, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "OnlyV5 = select, HY\n"
+            "Wrap = select, include-other-group=OnlyV5\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] OnlyV5 = select" in out
+        assert "# [V5+ cascade] Wrap = select" in out
+
+    def test_has_effective_members_include_other_group(self):
+        pgl = ProxyGroupLine("G", "select", [], [("include-other-group", "Alive")])
+        assert has_effective_members(pgl, set(), set()) is True
+        assert has_effective_members(pgl, {"Alive"}, set()) is False
+
+
+# --- T54: v5+ rule types inside compound rules (N5) ---
+
+class TestCompoundRuleV5Types:
+    def test_domain_wildcard_inside_and_commented(self):
+        result = convert("""
+            [Rule]
+            AND,((DOMAIN-WILDCARD,*bar*),(DEST-PORT,443)),DIRECT
+        """)
+        assert "# [V5+] AND,((DOMAIN-WILDCARD,*bar*),(DEST-PORT,443)),DIRECT" in result
+
+    def test_hostname_type_inside_or_commented(self):
+        result = convert("""
+            [Rule]
+            OR,((HOSTNAME-TYPE,IPv4),(DOMAIN,a.com)),Proxy
+        """)
+        assert "# [V5+] OR,((HOSTNAME-TYPE,IPv4),(DOMAIN,a.com)),Proxy" in result
+
+    def test_plain_compound_rule_untouched(self):
+        result = convert("""
+            [Rule]
+            AND,((DOMAIN-SUFFIX,example.com),(DEST-PORT,443)),DIRECT
+        """)
+        assert "# [V5+]" not in result
+
+
+# --- T55: trailing blank line serialization (N6) ---
+
+class TestTrailingBlankLine:
+    def test_pure_v4_with_trailing_blank_line_not_converted(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy]\nOK = trojan, 1.2.3.4, 443, password=x\n\n")
+        result = convert_file(str(main), ConversionStats(), {str(main): None})
+        assert result is None
+        assert not (tmp_path / "v4" / "main-v4.conf").exists()
+
+    def test_changed_file_keeps_trailing_blank_line(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy]\nHY = hysteria2, 1.2.3.4, 443, password=x\n\n")
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert out.endswith("\n\n")
+
+
+# --- T56: quoted names containing commas (N11) ---
+
+class TestQuotedCommaNames:
+    def test_parse_group_member_with_comma(self):
+        pgl = parse_proxy_group_line('G = select, "HK, Fast", Direct')
+        assert pgl.members == ['"HK, Fast"', "Direct"]
+
+    def test_roundtrip_quoted_comma_member(self):
+        line = 'G = select, "HK, Fast", DIRECT'
+        assert format_proxy_group_line(parse_proxy_group_line(line)) == line
+
+    def test_rule_policy_with_comma(self):
+        assert extract_rule_policy('DOMAIN,example.com,"HK, Fast"') == '"HK, Fast"'
+
+    def test_cascade_deletes_quoted_comma_member(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            '"HK, Fast" = hysteria2, 1.2.3.4, 443, password=x\n'
+            "OK = trojan, 5.6.7.8, 443, password=x\n"
+            "\n"
+            "[Proxy Group]\n"
+            'G = select, "HK, Fast", OK\n'
+            "\n"
+            "[Rule]\n"
+            'DOMAIN,example.com,"HK, Fast"\n'
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "G = select, OK" in out
+        assert '# [V5+ cascade] DOMAIN,example.com,"HK, Fast"' in out
+
+
+# --- T57: proxy names containing '#' (N12) ---
+
+class TestHashInProxyName:
+    def test_extract_type_with_hash_in_name(self):
+        assert extract_proxy_type("Node #1 = hysteria2, host, 443, password=x") == "hysteria2"
+
+    def test_commented_line_still_returns_none(self):
+        assert extract_proxy_type("# US = hysteria2, 1.2.3.4, 443") is None
+
+    def test_v5_proxy_with_hash_name_commented(self):
+        result = convert("""
+            [Proxy]
+            Node #1 = hysteria2, host, 443, password=x
+        """)
+        assert "# [V5+] Node #1 = hysteria2" in result
+
+
+# --- T58: commented v5+ section headers keep section attribution (K9) ---
+
+class TestCommentedSectionAttribution:
+    def test_compute_sections_recognizes_commented_v5_header(self):
+        lines = ["[Proxy]", "OK = trojan, 1.2.3.4, 443", "# [V5+] [Port Forwarding]", "# [V5+] OK = tcp, 0.0.0.0:8080"]
+        assert compute_sections(lines) == ["Proxy", "Proxy", "Port Forwarding", "Port Forwarding"]
+
+    def test_pf_body_name_collision_does_not_cascade(self, tmp_path):
+        """A [Port Forwarding] body line whose LHS collides with a live proxy name
+        must not poison deleted_names."""
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "OK = trojan, 1.2.3.4, 443, password=x\n"
+            "\n"
+            "[Port Forwarding]\n"
+            "OK = tcp, 0.0.0.0:8080, 1.2.3.4:80\n"
+            "\n"
+            "[Proxy Group]\n"
+            "G = select, OK\n"
+            "\n"
+            "[Rule]\n"
+            "FINAL,G\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "G = select, OK" in out
+        assert "# [V5+ cascade]" not in out
+        assert "FINAL,G" in out
+
+
+# --- T59: extract_rule_policy trailing options coverage (N31) ---
+
+class TestRuleTrailingOptionsCoverage:
+    def test_extended_matching(self):
+        assert extract_rule_policy("DOMAIN,x.com,MyGroup,extended-matching") == "MyGroup"
+
+    def test_pre_matching(self):
+        assert extract_rule_policy("DOMAIN,x.com,MyGroup,pre-matching") == "MyGroup"
+
+
+# --- T60: pre-existing deprecated backup protected (K3) ---
+
+class TestBackupCollision:
+    def test_old_deprecated_backup_trashed_not_overwritten(self, tmp_path):
+        """A kept -deprecated backup must go to trash before the new rename,
+        never be silently overwritten."""
+        main = tmp_path / "out.conf"
+        main.write_text("[General]\nudp-priority = true\n")
+        (tmp_path / "v4").mkdir()
+        old_backup = tmp_path / "v4" / "out-v4-deprecated.conf"
+        old_backup.write_text("precious old backup")
+        stale = tmp_path / "v4" / "out-v4.conf"
+        stale.write_text("stale v4")
+
+        with patch("converter.send2trash") as mock_trash:
+            convert_file(str(main), ConversionStats(), {str(main): None})
+            assert mock_trash.call_count == 1
+            assert mock_trash.call_args[0][0] == str(old_backup)
+        # new backup holds the stale v4 content
+        assert old_backup.read_text() == "stale v4"
+
+
+# --- T61: UTF-8 BOM handling (K4) ---
+
+class TestBomHandling:
+    def test_bom_managed_config_abandoned(self, tmp_path):
+        main = tmp_path / "sub.conf"
+        main.write_bytes(
+            "﻿#!MANAGED-CONFIG https://x.com/a.conf interval=3600\n"
+            "[Proxy]\nJP = anytls, 1.2.3.4, 443, password=pwd\n".encode("utf-8")
+        )
+        stats = ConversionStats()
+        result = convert_file(str(main), stats, {str(main): None})
+        assert result is None
+        assert str(main) in stats.abandoned_files
+        assert not (tmp_path / "v4" / "sub-v4.conf").exists()
+
+    def test_bom_section_header_recognized(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_bytes(
+            "﻿[Proxy]\nHY = hysteria2, 1.2.3.4, 443, password=pwd\n".encode("utf-8")
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+] HY = hysteria2" in out
+        assert "﻿" not in out
+
+
+# --- T62: old-layout stale -v4 detection (N7) ---
+
+class TestOldLayoutStaleV4:
+    def test_old_layout_stale_detected_on_abandon(self, tmp_path):
+        main = tmp_path / "xflash.conf"
+        main.write_text(
+            "#!MANAGED-CONFIG https://x.com/a.conf interval=3600\n"
+            "[Proxy]\nJP = anytls, 1.2.3.4, 443, password=pwd\n"
+        )
+        old_stale = tmp_path / "xflash-v4.conf"  # pre-v4/-subdir layout
+        old_stale.write_text("stale content")
+
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert str(old_stale) in stats.stale_v4_files
+        assert old_stale.exists()  # never auto-deleted
+
+
+# --- T63: deprecated prompt answer handling (N13 / K7 / N28) ---
+
+class TestDeprecatedPrompt:
+    def _setup(self, tmp_path):
+        main_conf = tmp_path / "out.conf"
+        main_conf.write_text("[General]\nudp-priority = true\n")
+        (tmp_path / "v4").mkdir()
+        (tmp_path / "v4" / "out-v4.conf").write_text("old content")
+        return main_conf
+
+    def _run_main(self, monkeypatch, main_conf, answer_fn):
+        from converter import main as converter_main
+        monkeypatch.setattr("sys.argv", ["converter.py", str(main_conf)])
+        monkeypatch.setattr("builtins.input", answer_fn)
+        with patch("converter.send2trash") as mock_trash:
+            converter_main()
+        return mock_trash
+
+    def test_no_keeps_files(self, tmp_path, monkeypatch):
+        """'no' must be treated as keep, not as consent."""
+        main_conf = self._setup(tmp_path)
+        mock_trash = self._run_main(monkeypatch, main_conf, lambda _: "no")
+        assert mock_trash.call_count == 0
+        assert (tmp_path / "v4" / "out-v4-deprecated.conf").exists()
+
+    def test_enter_deletes_by_default(self, tmp_path, monkeypatch):
+        main_conf = self._setup(tmp_path)
+        mock_trash = self._run_main(monkeypatch, main_conf, lambda _: "")
+        assert mock_trash.call_count == 1
+
+    def test_n_keeps_files(self, tmp_path, monkeypatch):
+        main_conf = self._setup(tmp_path)
+        mock_trash = self._run_main(monkeypatch, main_conf, lambda _: "n")
+        assert mock_trash.call_count == 0
+
+    def test_eof_keeps_files_no_crash(self, tmp_path, monkeypatch):
+        """Non-interactive stdin (cron/pipe) must not crash nor delete."""
+        main_conf = self._setup(tmp_path)
+
+        def raise_eof(_):
+            raise EOFError
+
+        mock_trash = self._run_main(monkeypatch, main_conf, raise_eof)
+        assert mock_trash.call_count == 0
+        assert (tmp_path / "v4" / "out-v4-deprecated.conf").exists()
+
+
+# --- T64: unreadable / undecodable input (N14) ---
+
+class TestUnreadableInput:
+    def test_non_utf8_root_clean_error(self, tmp_path, capsys):
+        main = tmp_path / "gbk.conf"
+        main.write_bytes("[General]\n# 中文注释\n".encode("gbk"))
+        with pytest.raises(SystemExit):
+            convert_file(str(main), ConversionStats(), {str(main): None})
+        assert "错误" in capsys.readouterr().err
+
+    def test_unreadable_subfile_keeps_reference(self, tmp_path):
+        sub = tmp_path / "sub.conf"
+        sub.write_bytes("SS = ss, 1.2.3.4, 443, encrypt-method=aes-256-gcm, password=x\n".encode("gbk") + b"\xff\xfe\xff")
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\nHY = hysteria2, 1.2.3.4, 443, password=pwd\n#!include sub.conf\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "#!include sub.conf" in out  # original ref kept, no crash
+
+
+# --- T65: directory input error message (N15) ---
+
+class TestDirectoryInput:
+    def test_directory_reports_not_a_file(self, tmp_path, capsys):
+        with pytest.raises(SystemExit):
+            convert_file(str(tmp_path), ConversionStats(), {})
+        err = capsys.readouterr().err
+        assert "目录" in err
+
+
+# --- T66: cascade-only sub-file references rewritten (K1) ---
+
+class TestCascadeOnlySubfileRefs:
+    def test_include_ref_rewritten_for_cascade_only_change(self, tmp_path):
+        """Sub-file whose ONLY change comes from cascade must still have the
+        parent's #!include rewritten to its -v4 name."""
+        sub = tmp_path / "groups.dconf"
+        sub.write_text("[Proxy Group]\nFast = select, JP, HK\n")
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "JP = anytls, 1.2.3.4, 443, password=pwd\n"
+            "HK = trojan, 5.6.7.8, 443, password=pwd\n"
+            "#!include groups.dconf\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        main_out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "#!include groups-v4.dconf" in main_out
+        assert "#!include groups.dconf" not in main_out
+        assert (tmp_path / "v4" / "groups-v4.dconf").exists()
+
+    def test_policy_path_ref_rewritten_for_cascade_only_change(self, tmp_path):
+        plist = tmp_path / "plist.conf"
+        plist.write_text("[Proxy Group]\nInner = select, JP, DIRECT\n")
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "JP = anytls, 1.2.3.4, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "G = select, DIRECT, policy-path=plist.conf\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        main_out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "policy-path=plist-v4.conf" in main_out
+        assert "policy-path=plist.conf" not in main_out
+        assert (tmp_path / "v4" / "plist-v4.conf").exists()
+
+
+# --- T67: managed file with cascade-only change abandoned (K2) ---
+
+class TestManagedCascadeOnlyAbandon:
+    def test_managed_cascade_only_change_is_abandoned(self, tmp_path):
+        mgroups = tmp_path / "mgroups.conf"
+        mgroups.write_text(
+            "#!MANAGED-CONFIG https://x.com/mgroups.conf interval=3600\n"
+            "[Proxy Group]\nFast = select, JP\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\nJP = anytls, 1.2.3.4, 443, password=pwd\n#!include mgroups.conf\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert str(mgroups) in stats.abandoned_files
+        assert not (tmp_path / "v4" / "mgroups-v4.conf").exists()
+        main_out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        # sole include entry pointed at the abandoned file → line cascade-commented
+        assert "# [V5+ cascade] #!include mgroups.conf" in main_out
+
+
+# --- T68: circular includes both rewritten (K5) ---
+
+class TestCircularInclude:
+    def test_mutual_includes_both_rewritten(self, tmp_path):
+        a = tmp_path / "a.conf"
+        a.write_text("[Proxy]\nJP = anytls, 1.2.3.4, 443, password=pwd\n#!include b.conf\n")
+        b = tmp_path / "b.conf"
+        b.write_text("[Proxy]\nUS = hysteria2, 2.3.4.5, 443, password=pwd\n#!include a.conf\n")
+        convert_file(str(a), ConversionStats(), {str(a): None})
+        a_out = (tmp_path / "v4" / "a-v4.conf").read_text()
+        b_out = (tmp_path / "v4" / "b-v4.conf").read_text()
+        assert "#!include b-v4.conf" in a_out
+        assert "#!include a-v4.conf" in b_out
+
+
+# --- T69: orphan sub-file of abandoned managed config not emitted (N16) ---
+
+class TestOrphanNotEmitted:
+    def test_subfile_reachable_only_via_abandoned_not_emitted(self, tmp_path):
+        inner = tmp_path / "inner.dconf"
+        inner.write_text("HY = hysteria2, 1.2.3.4, 443, password=pwd\n")
+        managed = tmp_path / "managed.conf"
+        managed.write_text(
+            "#!MANAGED-CONFIG https://x.com/managed.conf interval=3600\n"
+            "[Proxy]\nJP = anytls, 1.2.3.4, 443, password=pwd\n"
+            "#!include inner.dconf\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\nOK = trojan, 9.9.9.9, 443, password=pwd\n#!include managed.conf\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert str(managed) in stats.abandoned_files
+        assert not (tmp_path / "v4" / "inner-v4.dconf").exists()
+        assert not (tmp_path / "v4" / "managed-v4.conf").exists()
+
+
+# --- T70: URL include entry with colliding basename survives (N3 / N27) ---
+
+class TestUrlIncludeBasenameCollision:
+    def test_url_entry_survives_abandoned_local_collision(self, tmp_path):
+        sub = tmp_path / "sub.conf"
+        sub.write_text(
+            "#!MANAGED-CONFIG https://x.com/sub.conf interval=3600\n"
+            "[Proxy]\nJP = anytls, 1.2.3.4, 443, password=pwd\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\nHY = hysteria2, 9.9.9.9, 443, password=pwd\n"
+            "#!include https://cdn.example.com/sub.conf, sub.conf\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "#!include https://cdn.example.com/sub.conf" in out
+        assert "# [V5+ cascade] #!include" not in out
+
+
+# --- T71: policy-path tolerant matching (K10) ---
+
+class TestPolicyPathTolerantMatch:
+    def test_space_around_equals_discovered(self, tmp_path):
+        sub = tmp_path / "nodes.conf"
+        sub.write_text("HY = hysteria2, 1.2.3.4, 443, password=pwd\n")
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy Group]\nG = select, policy-path = nodes.conf\n")
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "policy-path=nodes-v4.conf" in out
+        assert (tmp_path / "v4" / "nodes-v4.conf").exists()
+
+    def test_filename_with_space_discovered(self, tmp_path):
+        sub = tmp_path / "my nodes.conf"
+        sub.write_text("HY = hysteria2, 1.2.3.4, 443, password=pwd\n")
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy Group]\nG = select, policy-path=my nodes.conf\n")
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "policy-path=my nodes-v4.conf" in out
+        assert (tmp_path / "v4" / "my nodes-v4.conf").exists()
+
+
+# --- T72: reverse cross-file cascade (N26) ---
+
+class TestReverseCrossFileCascade:
+    def test_subfile_proxy_deleted_cleans_main_group(self, tmp_path):
+        sub = tmp_path / "proxies.dconf"
+        sub.write_text("JP = anytls, 1.2.3.4, 443, password=pwd\n")
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "OK = trojan, 9.9.9.9, 443, password=pwd\n"
+            "#!include proxies.dconf\n"
+            "\n"
+            "[Proxy Group]\n"
+            "G = select, JP, OK\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "G = select, OK" in out
+
+
+# --- T73: include under [Rule] section propagates section (N29) ---
+
+class TestIncludeUnderRuleSection:
+    def test_headerless_rule_subfile_converted(self, tmp_path):
+        sub = tmp_path / "rules.dconf"
+        sub.write_text("HOSTNAME-TYPE,IPv4,Proxy\nDOMAIN-SUFFIX,example.com,DIRECT\n")
+        main = tmp_path / "main.conf"
+        main.write_text("[Rule]\n#!include rules.dconf\n")
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        sub_out = (tmp_path / "v4" / "rules-v4.dconf").read_text()
+        assert "# [V5+] HOSTNAME-TYPE,IPv4,Proxy" in sub_out
+        assert "DOMAIN-SUFFIX,example.com,DIRECT" in sub_out
+
+
+# --- T74: second run idempotent after cascade (N30) ---
+
+class TestCascadeIdempotency:
+    def test_second_run_no_churn(self, tmp_path):
+        sub = tmp_path / "groups.dconf"
+        sub.write_text("[Proxy Group]\nFast = select, JP, HK\n")
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "JP = anytls, 1.2.3.4, 443, password=pwd\n"
+            "HK = trojan, 5.6.7.8, 443, password=pwd\n"
+            "#!include groups.dconf\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        stats2 = ConversionStats()
+        convert_file(str(main), stats2, {str(main): None})
+        assert stats2.files_processed == []
+        assert stats2.deprecated_files == []
+        assert not (tmp_path / "v4" / "main-v4-deprecated.conf").exists()
+        assert not (tmp_path / "v4" / "groups-v4-deprecated.dconf").exists()
+
+
+# --- T75: stats reconciled with emit decisions (K6 / K8 / N18) ---
+
+class TestStatsReconciliation:
+    def test_abandoned_file_edits_purged_from_stats(self, tmp_path):
+        """Edits recorded for a later-abandoned managed file are discarded and
+        must not appear in the summary nor inflate the counters."""
+        sub = tmp_path / "mai.dconf"
+        sub.write_text(
+            "#!MANAGED-CONFIG https://x.com/mai.dconf interval=3600\n"
+            "[Proxy]\n"
+            "N1 = hysteria2, 1.2.3.4, 443, password=pwd\n"
+            "N2 = snell, 5.6.7.8, 443, psk=pwd, version=5\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text("[General]\nudp-priority = true\n\n[Proxy]\n#!include mai.dconf\n")
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        changed_files = {c[0] for c in stats.changes}
+        assert "mai.dconf" not in changed_files
+        # counted: main's udp-priority (1) + cascade-commented include line (1)
+        assert stats.lines_commented == 2
+        assert stats.params_modified == 0
+
+    def test_cascade_edits_recorded_in_changes(self, tmp_path):
+        """Cascade cleanups must appear in the per-file change detail."""
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "JP = anytls, 1.2.3.4, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "OnlyV5 = select, JP\n"
+            "\n"
+            "[Rule]\n"
+            "DOMAIN,foo.com,OnlyV5\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        actions = [(c[3], c[4]) for c in stats.changes]
+        assert ("级联注释", "OnlyV5") in actions
+        assert any(a == "级联注释" and "DOMAIN,foo.com,OnlyV5" in d for a, d in actions)
+
+    def test_orphan_file_edits_purged(self, tmp_path):
+        """Edits for an unreachable (orphan) sub-file are discarded too."""
+        inner = tmp_path / "inner.dconf"
+        inner.write_text("HY = hysteria2, 1.2.3.4, 443, password=pwd\n")
+        managed = tmp_path / "managed.conf"
+        managed.write_text(
+            "#!MANAGED-CONFIG https://x.com/m.conf interval=3600\n"
+            "[Proxy]\nJP = anytls, 1.2.3.4, 443, password=pwd\n"
+            "#!include inner.dconf\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy]\nOK = trojan, 9.9.9.9, 443, password=pwd\n#!include managed.conf\n")
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        changed_files = {c[0] for c in stats.changes}
+        assert "inner.dconf" not in changed_files
+        assert "managed.conf" not in changed_files

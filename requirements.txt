@@ -1,0 +1,4 @@
+send2trash>=1.8
+
+# 测试依赖
+pytest>=7.0

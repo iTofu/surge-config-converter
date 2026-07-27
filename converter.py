@@ -9,7 +9,7 @@ Output layout:
     the source files:
 
         Documents/
-        ├── home.conf              <- source (v5)
+        ├── home.conf              <- source (v5+)
         ├── mai-vps.dconf
         └── v4/
             ├── home-v4.conf       <- converted (v4)
@@ -18,13 +18,16 @@ Output layout:
     Files inside v4/ reference each other using bare filenames (e.g.
     #!include mai-vps-v4.dconf) with no directory prefix. To use them,
     copy everything in v4/ to the top-level config directory on the
-    Surge v4 device.
+    Surge v4 device. Referenced sub-files that needed no conversion get
+    no -v4 copy and keep their original names in the parent — the
+    destination directory must contain those originals too.
 
 Limitation:
     All referenced files (#!include, policy-path) must reside in the
-    same directory as the root config. The v4/ output is a flat
-    directory -- sub-directory paths are stripped, so identically named
-    files in different sub-directories would collide.
+    same directory as the root config. Sub-directory references produce
+    output under <subdir>/v4/ while parents reference bare -v4 names,
+    so those need manual merging; identically named files in different
+    sub-directories would collide.
 """
 
 import os
@@ -48,11 +51,21 @@ V5PLUS_ONLY_GENERAL_PARAMS = {"udp-priority", "block-quic"}
 # Rule types not supported in v4
 V5PLUS_ONLY_RULE_TYPES = {"HOSTNAME-TYPE", "DOMAIN-WILDCARD"}
 
+# v5+ only rule types appearing as parenthesized criteria of AND/OR/NOT rules
+_V5PLUS_NESTED_RULE_RE = re.compile(
+    r'\(\s*(?:' + '|'.join(sorted(V5PLUS_ONLY_RULE_TYPES)) + r')\s*,'
+)
+
 # Proxy parameters to remove (v5+ only)
 V5PLUS_ONLY_PROXY_PARAMS = {"port-hopping", "port-hopping-interval", "ecn"}
 
 # Cascade-cleanup tag prefix: distinguishes follow-on deletions from direct hits.
 CASCADE_TAG = "# [V5+ cascade] "
+
+# policy-path option matcher. Tolerates whitespace around '=' and inside the
+# path (a value runs until the next comma), matching the tolerant structured
+# parser in parse_proxy_group_line.
+POLICY_PATH_RE = re.compile(r'policy-path\s*=\s*([^,]+)')
 
 
 def unquote(name):
@@ -60,6 +73,22 @@ def unquote(name):
     if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
         return name[1:-1]
     return name
+
+
+def _serialize_lines(lines, original):
+    """Join working lines back into file content, restoring the trailing
+    newline iff the original had one.
+
+    splitlines() drops the final newline, so a naive join + endswith check
+    loses one newline for content ending in a blank line ("a\\n\\n" →
+    ["a", ""] → "a\\n"): the join already ends with "\\n" and the naive
+    compensation never fires. Appending unconditionally when the original
+    ended with a newline is correct for every case.
+    """
+    joined = "\n".join(lines)
+    if original.endswith("\n"):
+        joined += "\n"
+    return joined
 
 
 def _preserve_indent(original_line, new_content):
@@ -71,11 +100,16 @@ def _preserve_indent(original_line, new_content):
 
 def compute_sections(lines, default_section=None):
     """Return a list parallel to lines where each entry is the section name
-    the line belongs to (or default_section before any header appears)."""
+    the line belongs to (or default_section before any header appears).
+
+    Also recognizes section headers that the direct-hit pass commented out
+    (e.g. "# [V5+] [Port Forwarding]") so that the commented section body is
+    not attributed to the preceding section.
+    """
     result = []
     current = default_section
     for line in lines:
-        m = re.match(r'^\[(.+)\]$', line.strip())
+        m = re.match(r'^(?:# \[V5\+\] )?\[(.+)\]$', line.strip())
         if m:
             current = m.group(1)
         result.append(current)
@@ -88,6 +122,7 @@ def has_effective_members(pgl, deleted_names, abandoned_basenames):
     Valid sources:
       - an explicit member name not in deleted_names
       - include-all-proxies=1 option
+      - include-other-group=<group> where <group> is not in deleted_names
       - policy-path=<file> where <file> is an HTTP URL, or a local file whose
         basename is NOT in abandoned_basenames
     """
@@ -96,6 +131,8 @@ def has_effective_members(pgl, deleted_names, abandoned_basenames):
             return True
     for key, value in pgl.options:
         if key == "include-all-proxies" and value.strip() in {"1", "true"}:
+            return True
+        if key == "include-other-group" and unquote(value.strip()) not in deleted_names:
             return True
         if key == "policy-path":
             if value.startswith("http://") or value.startswith("https://"):
@@ -119,14 +156,38 @@ def is_managed_config(content):
 
 
 class ConversionStats:
+    """Edit bookkeeping, tracked per file so that edits recorded for a file
+    whose conversion is later discarded (abandoned managed config, orphan)
+    can be purged instead of misleading the final summary."""
+
     def __init__(self):
         self.files_processed = []
-        self.lines_commented = 0
-        self.params_modified = 0
         self.changes = []
         self.deprecated_files = []
         self.abandoned_files = []    # managed configs we refused to convert
         self.stale_v4_files = []     # pre-existing -v4 files for abandoned managed configs
+        self._commented_by_file = {}
+        self._params_by_file = {}
+
+    @property
+    def lines_commented(self):
+        return sum(self._commented_by_file.values())
+
+    @property
+    def params_modified(self):
+        return sum(self._params_by_file.values())
+
+    def count_commented(self, filename, n=1):
+        self._commented_by_file[filename] = self._commented_by_file.get(filename, 0) + n
+
+    def count_params(self, filename, n=1):
+        self._params_by_file[filename] = self._params_by_file.get(filename, 0) + n
+
+    def discard_file(self, filename):
+        """Drop every recorded edit for a file whose conversion was discarded."""
+        self._commented_by_file.pop(filename, None)
+        self._params_by_file.pop(filename, None)
+        self.changes = [c for c in self.changes if c[0] != filename]
 
     def add_change(self, filename, line_num, section, action, detail):
         self.changes.append((filename, line_num, section, action, detail))
@@ -173,10 +234,18 @@ def make_v4_relname(filename):
 
 
 def backup_if_exists(filepath):
-    """If filepath exists, rename it with a -deprecated suffix."""
+    """If filepath exists, rename it with a -deprecated suffix.
+
+    A pre-existing backup at the target name (kept by the user in an earlier
+    run) is moved to the trash first — os.rename would silently overwrite it,
+    destroying the only recoverable copy.
+    """
     if os.path.exists(filepath):
         p = Path(filepath)
         backup = str(p.with_stem(p.stem + "-deprecated"))
+        if os.path.exists(backup):
+            send2trash(backup)
+            print(f"已将旧备份移至垃圾桶: {backup}")
         os.rename(filepath, backup)
         return backup
     return None
@@ -192,8 +261,12 @@ def extract_proxy_type(line):
 
     Format: Name = type, host, port, params...
     Returns the type string (lowercase) or None.
+    Proxy names may contain '#' (e.g. "Node #1"); commented lines are
+    rejected by the explicit prefix check, not by the name character class.
     """
-    m = re.match(r'^[^#=]+=\s*(\w[\w-]*)', line)
+    if line.lstrip().startswith("#"):
+        return None
+    m = re.match(r'^[^=]+=\s*(\w[\w-]*)', line)
     if m:
         return m.group(1).strip().lower()
     return None
@@ -216,7 +289,7 @@ class FileState:
     converted: str               # content after direct-hit transforms (and later cascade)
     is_managed: bool
     default_section: str = None  # for files without explicit section headers
-    is_abandoned: bool = False   # managed + changed → set eagerly during discover()
+    is_abandoned: bool = False   # managed + changed → decided during analyze()
     output_written: bool = False # set during emit()
     output_path: str = None      # destination if written
     # Cascade fields (populated during Discover, consumed during Analyze)
@@ -225,6 +298,7 @@ class FileState:
     owned_proxies: set = field(default_factory=set)    # proxy names defined in this file
     owned_groups: set = field(default_factory=set)     # group names defined in this file
     deleted_names: set = field(default_factory=set)    # names removed (propagates cascade)
+    child_refs: set = field(default_factory=set)       # abs paths of local #!include / policy-path refs
 
 
 def parse_proxy_group_line(line):
@@ -244,7 +318,7 @@ def parse_proxy_group_line(line):
     if not name:
         return None
 
-    tokens = [t.strip() for t in rest.split(",")]
+    tokens = _split_top_level_commas(rest)
     if not tokens or not tokens[0]:
         return None
 
@@ -254,7 +328,7 @@ def parse_proxy_group_line(line):
     for token in tokens[1:]:
         if not token:
             continue
-        if "=" in token:
+        if "=" in token and not token.startswith('"'):
             key, value = token.split("=", 1)
             options.append((key.strip(), value.strip()))
         else:
@@ -282,16 +356,23 @@ RULE_TRAILING_OPTIONS = {
 
 
 def _split_top_level_commas(s):
-    """Split a string by commas at depth 0 (outside of balanced parentheses).
+    """Split a string by commas at depth 0, outside of balanced parentheses
+    AND outside of double quotes.
 
-    Used for rule lines which may contain AND/OR/NOT compound criteria
-    wrapped in parens, where inner commas must not split the tokens.
+    Used for rule lines (AND/OR/NOT compound criteria wrapped in parens) and
+    for proxy group member lists, where quoted names like "HK, Fast" must
+    stay a single token.
     """
     parts = []
     depth = 0
+    in_quote = False
     start = 0
     for i, ch in enumerate(s):
-        if ch == "(":
+        if ch == '"':
+            in_quote = not in_quote
+        elif in_quote:
+            continue
+        elif ch == "(":
             depth += 1
         elif ch == ")":
             depth -= 1
@@ -376,7 +457,7 @@ def transform_proxy_line(line, stats, filename, line_num, section):
 
     # Comment out v5+ only proxy types
     if proxy_type in V5PLUS_ONLY_PROXY_TYPES:
-        stats.lines_commented += 1
+        stats.count_commented(filename)
         stats.add_change(filename, line_num, section, "注释", f"{name} ({proxy_type})")
         return comment_line(line)
 
@@ -387,27 +468,32 @@ def transform_proxy_line(line, stats, filename, line_num, section):
         new, n = re.subn(r'version\s*=\s*5\b', 'version=4', modified)
         if n:
             modified = new
-            stats.params_modified += n
+            stats.count_params(filename, n)
             stats.add_change(filename, line_num, section, "version=5 → version=4", name)
 
     # shadow-tls-version=3 → shadow-tls-version=2
     new, n = re.subn(r'shadow-tls-version\s*=\s*3\b', 'shadow-tls-version=2', modified)
     if n:
         modified = new
-        stats.params_modified += n
+        stats.count_params(filename, n)
         stats.add_change(filename, line_num, section, "shadow-tls-version=3 → 2", name)
 
     # Remove v5+ only parameters
     modified, removed = remove_proxy_params(modified, V5PLUS_ONLY_PROXY_PARAMS)
-    stats.params_modified += len(removed)
+    stats.count_params(filename, len(removed))
     for param in removed:
         stats.add_change(filename, line_num, section, "移除参数", f"{param} ({name})")
 
     return modified
 
 
-def transform_proxy_group_line(line, stats, base_dir, processed_files, filename, line_num, section):
-    """Transform a single line in [Proxy Group] section."""
+def transform_proxy_group_line(line, stats, filename, line_num, section):
+    """Transform a single line in [Proxy Group] section.
+
+    Only direct hits (smart → url-test). policy-path reference rewriting
+    happens later in Pipeline._rewrite_references, once every sub-file's
+    final converted/abandoned status is known.
+    """
     if line.startswith("#"):
         return line
 
@@ -418,86 +504,10 @@ def transform_proxy_group_line(line, stats, base_dir, processed_files, filename,
     if m:
         name = line.split('=', 1)[0].strip()
         modified = m.group(1) + "url-test" + m.group(2)
-        stats.params_modified += 1
+        stats.count_params(filename)
         stats.add_change(filename, line_num, section, "smart → url-test", name)
 
-    # Update local policy-path references
-    modified = update_policy_path(modified, base_dir, processed_files, stats)
-
     return modified
-
-
-def update_policy_path(line, base_dir, processed_files, stats):
-    """Update policy-path=local_file references to -v4 versions.
-
-    Only rewrites the path if the referenced file actually needed conversion.
-    policy-path always references proxy list files, so converted with
-    default_section="Proxy".
-    """
-    def replace_local_path(m):
-        path = m.group(1).strip()
-        if path.startswith("http://") or path.startswith("https://"):
-            return m.group(0)
-
-        abs_path = os.path.normpath(os.path.join(base_dir, path))
-
-        if abs_path not in processed_files:
-            if os.path.isfile(abs_path):
-                processed_files[abs_path] = None
-                result = convert_file(abs_path, stats, processed_files, default_section="Proxy")
-            else:
-                result = None
-        else:
-            result = processed_files[abs_path]
-
-        if result:
-            return f"policy-path={make_v4_relname(path)}"
-        return m.group(0)
-
-    return re.sub(r'policy-path=([^,\s]+)', replace_local_path, line)
-
-
-def update_include_line(line, base_dir, processed_files, stats, current_section=None):
-    """Update #!include references to -v4 versions and trigger conversion.
-
-    Only rewrites a path if the referenced file actually needed conversion.
-    current_section is passed to sub-file conversion so included content
-    is treated as belonging to the parent section.
-    """
-    m = re.match(r'^\s*#!include\s+(.+)$', line)
-    if not m:
-        return line
-
-    files_str = m.group(1)
-    parts = [p.strip() for p in files_str.split(",")]
-    new_parts = []
-    any_changed = False
-
-    for part in parts:
-        if part.startswith("http://") or part.startswith("https://"):
-            new_parts.append(part)
-            continue
-
-        abs_path = os.path.normpath(os.path.join(base_dir, part))
-
-        if abs_path not in processed_files:
-            if os.path.isfile(abs_path):
-                processed_files[abs_path] = None
-                result = convert_file(abs_path, stats, processed_files, default_section=current_section)
-            else:
-                result = None
-        else:
-            result = processed_files[abs_path]
-
-        if result:
-            new_parts.append(make_v4_relname(part))
-            any_changed = True
-        else:
-            new_parts.append(part)
-
-    if not any_changed:
-        return line
-    return _preserve_indent(line, "#!include " + ", ".join(new_parts))
 
 
 def transform_rule_line(line, stats, filename, line_num, section):
@@ -508,9 +518,16 @@ def transform_rule_line(line, stats, filename, line_num, section):
 
     for rule_type in V5PLUS_ONLY_RULE_TYPES:
         if stripped.startswith(rule_type + ","):
-            stats.lines_commented += 1
+            stats.count_commented(filename)
             stats.add_change(filename, line_num, section, "注释", stripped)
             return comment_line(line)
+
+    # v5+ only rule types nested inside AND/OR/NOT compound criteria,
+    # e.g. AND,((DOMAIN-WILDCARD,*bar*),(DEST-PORT,443)),DIRECT
+    if _V5PLUS_NESTED_RULE_RE.search(stripped):
+        stats.count_commented(filename)
+        stats.add_change(filename, line_num, section, "注释", stripped)
+        return comment_line(line)
 
     return line
 
@@ -523,7 +540,7 @@ def transform_general_line(line, stats, filename, line_num, section):
 
     for param in V5PLUS_ONLY_GENERAL_PARAMS:
         if re.match(rf'^{re.escape(param)}\s*=', stripped):
-            stats.lines_commented += 1
+            stats.count_commented(filename)
             stats.add_change(filename, line_num, section, "注释", param)
             return comment_line(line)
 
@@ -531,9 +548,11 @@ def transform_general_line(line, stats, filename, line_num, section):
 
 
 def convert_content(content, base_dir, stats, processed_files, default_section=None, filename=""):
-    """Convert configuration content from v5+ to v4 format.
+    """Convert configuration content from v5+ to v4 format (direct hits only).
 
     Args:
+        base_dir, processed_files: kept for signature compatibility; sub-file
+                         discovery and reference rewriting now live in Pipeline.
         default_section: If set, treat lines before any [Section] header
                          as belonging to this section. Used for included files
                          that lack section headers.
@@ -555,7 +574,7 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
             if section_name in V5PLUS_ONLY_SECTIONS:
                 in_v5plus_only_section = True
                 current_section = section_name
-                stats.lines_commented += 1
+                stats.count_commented(filename)
                 stats.add_change(filename, line_num, current_section, "注释段", f"[{section_name}]")
                 result.append(comment_line(line))
                 continue
@@ -568,21 +587,17 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
         # If inside a v5+ only section, comment everything
         if in_v5plus_only_section:
             if stripped:  # Don't comment empty lines
-                stats.lines_commented += 1
+                stats.count_commented(filename)
                 result.append(comment_line(line))
             else:
                 result.append(line)
             continue
 
-        # Skip already-commented lines (don't double-process)
-        if stripped.startswith("#") and not stripped.startswith("#!include"):
-            # But still handle #!include
+        # Comments and #!include directives pass through untouched here.
+        # Include reference rewriting happens later in the pipeline
+        # (Pipeline._rewrite_references), once sub-file outcomes are known.
+        if stripped.startswith("#"):
             result.append(line)
-            continue
-
-        # Handle #!include directives (can appear in any section)
-        if stripped.startswith("#!include"):
-            result.append(update_include_line(line, base_dir, processed_files, stats, current_section))
             continue
 
         # Apply section-specific transformations
@@ -591,7 +606,7 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
         elif current_section == "Proxy":
             result.append(transform_proxy_line(line, stats, filename, line_num, current_section))
         elif current_section == "Proxy Group":
-            result.append(transform_proxy_group_line(line, stats, base_dir, processed_files, filename, line_num, current_section))
+            result.append(transform_proxy_group_line(line, stats, filename, line_num, current_section))
         elif current_section == "Rule":
             result.append(transform_rule_line(line, stats, filename, line_num, current_section))
         else:
@@ -601,14 +616,6 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
     if content.endswith("\n"):
         joined += "\n"
     return joined
-
-
-# Module-level global: the top-level convert_file creates a Pipeline and
-# parks it here so that nested convert_file calls (triggered by
-# update_include_line / update_policy_path during recursive discovery) can
-# detect the active pipeline and reuse its shared FileState dict instead of
-# spinning up a new, isolated one. Cleared in the top-level finally block.
-_active_pipeline = None
 
 
 class Pipeline:
@@ -627,11 +634,15 @@ class Pipeline:
         self.global_deleted = set()     # union of all names deleted anywhere
 
     def discover(self, input_path, default_section=None):
-        """Read a file, apply direct v5+ hits, recurse into dependencies,
-        and decide abandonment eagerly.
+        """Read a file, apply direct v5+ hits, and recurse into dependencies.
 
-        Returns the FileState for this file, or None if not a valid file.
-        Idempotent: calling twice on the same path returns the cached state.
+        No decisions are made here beyond the direct-hit transforms —
+        abandonment and reference rewriting are analyze-phase concerns,
+        because cascade mutations can change a file's status after discovery.
+
+        Returns the FileState for this file, or None if not a valid /
+        readable file. Idempotent: calling twice on the same path returns
+        the cached state.
         """
         abs_path = os.path.abspath(input_path)
         if abs_path in self.files:
@@ -639,8 +650,14 @@ class Pipeline:
         if not os.path.isfile(abs_path):
             return None
 
-        with open(abs_path, "r", encoding="utf-8") as f:
-            original = f.read()
+        try:
+            # utf-8-sig: strip a leading BOM, which would otherwise defeat
+            # #!MANAGED-CONFIG detection and first-line section headers.
+            with open(abs_path, "r", encoding="utf-8-sig") as f:
+                original = f.read()
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"错误: 无法读取文件: {abs_path} ({e})", file=sys.stderr)
+            return None
 
         state = FileState(
             abs_path=abs_path,
@@ -651,30 +668,12 @@ class Pipeline:
         )
         self.files[abs_path] = state
 
-        # Pre-register so recursive calls from convert_content (via
-        # update_include_line / update_policy_path) don't re-enter this file.
-        self.processed_files[abs_path] = None
-
         base_dir = os.path.dirname(abs_path)
-        converted = convert_content(
+        state.converted = convert_content(
             original, base_dir, self.stats, self.processed_files,
             default_section=default_section,
             filename=os.path.basename(abs_path),
         )
-        state.converted = converted
-
-        # Update processed_files with the intended return value so that later
-        # lookups by update_include_line / update_policy_path (which may be
-        # triggered multiple times for the same sub-file) get the same answer
-        # as the first recursive call would. Without this, the pre-registered
-        # None sentinel persists and subsequent references to the same sub-file
-        # are not rewritten to -v4. Abandoned / unchanged files stay as None.
-        if state.is_managed and state.converted != state.original:
-            self.processed_files[abs_path] = None  # will be abandoned
-        elif state.converted == state.original:
-            self.processed_files[abs_path] = None  # no output
-        else:
-            self.processed_files[abs_path] = make_v4_filename(abs_path)
 
         # Populate cascade fields: split into mutable lines, sectionize, and
         # catalog owned proxy / group names. Seed deleted_names with any
@@ -700,82 +699,182 @@ class Pipeline:
                     if name:
                         state.owned_groups.add(unquote(name))
 
-        # Eager abandonment decision: allows the nested convert_file wrapper
-        # to return None for abandoned files immediately, so the parent's
-        # include / policy-path references stay pointing at the ORIGINAL
-        # name (not rewritten to -v4). Later cascade passes match basenames
-        # against abandoned_files to strip those references.
-        if state.is_managed and state.converted != state.original:
-            state.is_abandoned = True
+        # Recurse into local #!include and policy-path references so every
+        # transitively referenced file lives in the shared FileState dict.
+        for i, line in enumerate(state.lines):
+            stripped = line.lstrip()
+            if stripped.startswith("#!include"):
+                for entry in parse_include_list(line) or []:
+                    self._discover_ref(state, base_dir, entry, state.sections[i])
+            elif state.sections[i] == "Proxy Group" and not stripped.startswith("#"):
+                # policy-path always references proxy list files
+                for m in POLICY_PATH_RE.finditer(line):
+                    self._discover_ref(state, base_dir, m.group(1).strip(), "Proxy")
 
         return state
 
+    def _discover_ref(self, parent, base_dir, ref, default_section):
+        """Discover one local reference; URLs and missing files are ignored."""
+        if ref.startswith("http://") or ref.startswith("https://"):
+            return
+        abs_path = os.path.normpath(os.path.join(base_dir, ref))
+        if not os.path.isfile(abs_path):
+            return
+        if self.discover(abs_path, default_section=default_section) is not None:
+            parent.child_refs.add(abs_path)
+
+    def _pending_change(self, state):
+        """True if the file's working lines differ from its original content."""
+        return _serialize_lines(state.lines, state.original) != state.original
+
     def analyze(self):
-        """Cross-file cascade: propagate abandonment and deleted names across
-        all discovered files, then fixpoint per-file cleanup."""
-        # 1. Collect abandonment bookkeeping from decisions made in discover().
-        # For an abandoned file, EVERY name it defined vanishes from the
-        # global namespace — owned proxies, owned groups, AND names that were
-        # already marked for direct-hit deletion inside the file.
-        for state in self.files.values():
-            if state.is_abandoned:
-                self.abandoned_files.add(state.abs_path)
-                self.global_deleted |= state.owned_proxies
-                self.global_deleted |= state.owned_groups
-                self.global_deleted |= state.deleted_names
+        """Cross-file cascade: abandonment, deleted-name propagation, and
+        per-file cleanup, iterated to a global fixpoint.
 
-        # 2. Merge direct-hit deletions from ALL files into global_deleted,
-        # then seed every non-abandoned file. Without this, a proxy commented
-        # in file A would not cascade into groups defined in file B.
-        for state in self.files.values():
-            if not state.is_abandoned:
-                self.global_deleted |= state.deleted_names
+        Abandonment (managed file + any change) can arise from direct hits
+        OR from cascade mutations. Abandoning a file removes its names from
+        the global namespace, which can cascade further and dirty additional
+        managed files — so the whole sequence loops until no new file gets
+        abandoned. Only then are include / policy-path references rewritten,
+        when every file's final status is known.
+        """
+        while True:
+            # 1. Abandon any managed file whose working content has changed
+            # (direct hits on the first iteration; cascade mutations later).
+            # A -v4 copy of a managed profile would be overwritten by Surge's
+            # periodic refresh, so it must never be written. Its discarded
+            # names vanish from the global namespace.
+            for state in self.files.values():
+                if state.is_managed and not state.is_abandoned and self._pending_change(state):
+                    state.is_abandoned = True
+                    self.abandoned_files.add(state.abs_path)
+                    self.global_deleted |= state.owned_proxies
+                    self.global_deleted |= state.owned_groups
+                    self.global_deleted |= state.deleted_names
+
+            # 2. Merge direct-hit deletions from ALL files into global_deleted,
+            # then seed every non-abandoned file. Without this, a proxy
+            # commented in file A would not cascade into groups in file B.
+            for state in self.files.values():
+                if not state.is_abandoned:
+                    self.global_deleted |= state.deleted_names
+            for state in self.files.values():
+                if state.is_abandoned:
+                    continue
+                state.deleted_names |= self.global_deleted
+
+            # 2a. Strip policy-path options pointing at abandoned files.
+            # May seed additional deletions (groups left without any member
+            # source), which are propagated immediately.
+            for state in self.files.values():
+                if state.is_abandoned:
+                    continue
+                self._strip_abandoned_policy_paths(state)
+
+            # 2b. Strip #!include entries pointing at abandoned files.
+            for state in self.files.values():
+                if state.is_abandoned:
+                    continue
+                self._strip_abandoned_includes(state)
+
+            # 3. Fixpoint across all non-abandoned files: each file's cascade
+            # may produce new deletions that must propagate to other files.
+            changed = True
+            while changed:
+                changed = False
+                for state in self.files.values():
+                    if state.is_abandoned:
+                        continue
+                    before = set(state.deleted_names)
+                    self._cascade_single_file(state)
+                    new_deletions = state.deleted_names - before
+                    if new_deletions:
+                        self.global_deleted |= new_deletions
+                        for other in self.files.values():
+                            if other is not state and not other.is_abandoned:
+                                other.deleted_names |= new_deletions
+                        changed = True
+
+            # 4. If the cascade just dirtied a managed file, its abandonment
+            # must be processed by another round; otherwise we're stable.
+            if not any(
+                s.is_managed and not s.is_abandoned and self._pending_change(s)
+                for s in self.files.values()
+            ):
+                break
+
+        # 5. Rewrite include / policy-path references now that every file's
+        # abandoned / changed status is settled.
+        self._rewrite_references()
+
+        # 6. Re-serialize converted content from mutated lines.
         for state in self.files.values():
             if state.is_abandoned:
                 continue
-            state.deleted_names |= self.global_deleted
+            state.converted = _serialize_lines(state.lines, state.original)
 
-        # 2a. Pre-pass: strip policy-path options pointing at abandoned files.
-        # This may seed additional deletions (groups that become empty after
-        # losing their only member source), which are propagated immediately.
-        for state in self.files.values():
-            if state.is_abandoned:
-                continue
-            self._strip_abandoned_policy_paths(state)
+    def _rewrite_references(self):
+        """Point include / policy-path references at the -v4 names of
+        sub-files that will actually be emitted.
 
-        # 2b. Pre-pass: strip #!include entries pointing at abandoned files.
-        # Independent of policy-path — no cascade interaction.
-        for state in self.files.values():
-            if state.is_abandoned:
-                continue
-            self._strip_abandoned_includes(state)
+        Runs to fixpoint: rewriting a reference makes the PARENT file itself
+        changed, which may in turn require rewriting references to that
+        parent elsewhere (mutual includes). The transition is monotone
+        (unchanged → changed only), so this terminates.
+        """
+        def will_emit(abs_path):
+            sub = self.files.get(abs_path)
+            return sub is not None and not sub.is_abandoned and self._pending_change(sub)
 
-        # 3. Fixpoint across all non-abandoned files: each file's cascade may
-        # produce new deletions that need to propagate to other files.
         changed = True
         while changed:
             changed = False
             for state in self.files.values():
                 if state.is_abandoned:
                     continue
-                before = set(state.deleted_names)
-                self._cascade_single_file(state)
-                new_deletions = state.deleted_names - before
-                if new_deletions:
-                    self.global_deleted |= new_deletions
-                    for other in self.files.values():
-                        if other is not state and not other.is_abandoned:
-                            other.deleted_names |= new_deletions
-                    changed = True
+                base_dir = os.path.dirname(state.abs_path)
+                for i, line in enumerate(state.lines):
+                    new_line = self._rewrite_line_refs(
+                        line, state.sections[i], base_dir, will_emit)
+                    if new_line != line:
+                        state.lines[i] = new_line
+                        changed = True
 
-        # 4. Re-serialize converted content from mutated lines
-        for state in self.files.values():
-            if state.is_abandoned:
-                continue
-            joined = "\n".join(state.lines)
-            if state.original.endswith("\n") and not joined.endswith("\n"):
-                joined += "\n"
-            state.converted = joined
+    def _rewrite_line_refs(self, line, section, base_dir, will_emit):
+        """Rewrite one line's local references to -v4 names. Idempotent:
+        an already-rewritten -v4 name resolves to no discovered file and is
+        left alone."""
+        stripped = line.lstrip()
+        if stripped.startswith("#!include"):
+            entries = parse_include_list(line)
+            if not entries:
+                return line
+            new_entries = []
+            any_changed = False
+            for entry in entries:
+                if not entry.startswith(("http://", "https://")):
+                    abs_path = os.path.normpath(os.path.join(base_dir, entry))
+                    if will_emit(abs_path):
+                        new_entries.append(make_v4_relname(entry))
+                        any_changed = True
+                        continue
+                new_entries.append(entry)
+            if not any_changed:
+                return line
+            return _preserve_indent(line, format_include_list(new_entries))
+
+        if section == "Proxy Group" and not stripped.startswith("#"):
+            def repl(m):
+                path = m.group(1).strip()
+                if path.startswith(("http://", "https://")):
+                    return m.group(0)
+                abs_path = os.path.normpath(os.path.join(base_dir, path))
+                if will_emit(abs_path):
+                    return f"policy-path={make_v4_relname(path)}"
+                return m.group(0)
+            return POLICY_PATH_RE.sub(repl, line)
+
+        return line
 
     def _cascade_single_file(self, state):
         """Fixpoint: remove deleted members from Proxy Group lines; if a group
@@ -797,7 +896,17 @@ class Pipeline:
                     m for m in original_members
                     if unquote(m) not in state.deleted_names
                 ]
-                removed_something = len(pgl.members) < len(original_members)
+                # include-other-group pointing at a deleted group is dead supply
+                original_options = list(pgl.options)
+                pgl.options = [
+                    (k, v) for k, v in original_options
+                    if not (k == "include-other-group"
+                            and unquote(v.strip()) in state.deleted_names)
+                ]
+                removed_something = (
+                    len(pgl.members) < len(original_members)
+                    or len(pgl.options) < len(original_options)
+                )
                 if not removed_something:
                     continue  # D6: pre-existing empty groups left alone
                 if has_effective_members(pgl, state.deleted_names, abandoned_basenames=set()):
@@ -811,7 +920,9 @@ class Pipeline:
                     reformatted = _preserve_indent(line, format_proxy_group_line(pgl))
                     state.lines[i] = CASCADE_TAG + reformatted.lstrip()
                     state.deleted_names.add(unquote(pgl.name))
-                    self.stats.lines_commented += 1
+                    basename = os.path.basename(state.abs_path)
+                    self.stats.count_commented(basename)
+                    self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", pgl.name)
                     changed = True
 
         # Post-fixpoint: comment out Rule lines whose policy is now deleted.
@@ -826,7 +937,9 @@ class Pipeline:
                 continue
             if unquote(policy) in state.deleted_names:
                 state.lines[i] = CASCADE_TAG + line.lstrip()
-                self.stats.lines_commented += 1
+                basename = os.path.basename(state.abs_path)
+                self.stats.count_commented(basename)
+                self.stats.add_change(basename, i + 1, "Rule", "级联注释", line.strip())
 
     def _strip_abandoned_policy_paths(self, state):
         """Remove policy-path=<abandoned> options from Proxy Group lines.
@@ -874,7 +987,9 @@ class Pipeline:
                 for other in self.files.values():
                     if other is not state and not other.is_abandoned:
                         other.deleted_names.add(deleted_name)
-                self.stats.lines_commented += 1
+                basename = os.path.basename(state.abs_path)
+                self.stats.count_commented(basename)
+                self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", pgl.name)
 
     def _strip_abandoned_includes(self, state):
         """Remove entries in #!include lines that point at abandoned files.
@@ -892,13 +1007,19 @@ class Pipeline:
                 continue
             kept = [
                 e for e in entries
-                if os.path.basename(e) not in abandoned_basenames
+                # URLs are never abandoned local files — a remote entry whose
+                # basename happens to collide with an abandoned local file
+                # (e.g. a local mirror named after its source URL) must stay.
+                if e.startswith(("http://", "https://"))
+                or os.path.basename(e) not in abandoned_basenames
             ]
             if len(kept) == len(entries):
                 continue
             if not kept:
                 state.lines[i] = CASCADE_TAG + line.lstrip()
-                self.stats.lines_commented += 1
+                basename = os.path.basename(state.abs_path)
+                self.stats.count_commented(basename)
+                self.stats.add_change(basename, i + 1, "#!include", "级联注释", line.strip())
             else:
                 new_line = format_include_list(kept)
                 state.lines[i] = _preserve_indent(line, new_line)
@@ -907,6 +1028,23 @@ class Pipeline:
         """Write -v4 files based on FileState decisions. Returns root output path."""
         root_output = None
         root_abs = next(iter(self.files))  # first discovered = root
+
+        # Reachability from the root through non-abandoned files: a sub-file
+        # discovered only via an abandoned managed config has nothing left
+        # referencing it — emitting it would drop an orphan into v4/.
+        reachable = set()
+        if not self.files[root_abs].is_abandoned:
+            stack = [root_abs]
+            while stack:
+                cur = stack.pop()
+                if cur in reachable:
+                    continue
+                reachable.add(cur)
+                for ref in self.files[cur].child_refs:
+                    sub = self.files.get(ref)
+                    if sub is not None and not sub.is_abandoned:
+                        stack.append(ref)
+
         for abs_path, state in self.files.items():
             output_path = make_v4_filename(abs_path)
 
@@ -915,12 +1053,27 @@ class Pipeline:
             if state.is_abandoned:
                 self.stats.abandoned_files.append(abs_path)
                 self.processed_files[abs_path] = None
+                # Its recorded edits were discarded along with the conversion.
+                self.stats.discard_file(os.path.basename(abs_path))
                 print(f"已放弃托管配置（含 v5+ 内容）: {abs_path}")
-                if os.path.exists(output_path):
-                    self.stats.stale_v4_files.append(output_path)
-                    print(f"  ⚠️  检测到旧的 v4 文件（未自动删除）: {output_path}")
+                # Check both layouts: the current v4/ subdirectory and the
+                # pre-v4/-subdir layout (-v4 file next to the source), which
+                # is where every file from older converter versions lives.
+                src = Path(abs_path)
+                old_layout = str(src.with_stem(src.stem + "-v4"))
+                for stale in (output_path, old_layout):
+                    if os.path.exists(stale):
+                        self.stats.stale_v4_files.append(stale)
+                        print(f"  ⚠️  检测到旧的 v4 文件（未自动删除）: {stale}")
                 if abs_path == root_abs:
                     root_output = None
+                continue
+
+            # Discovered only through an abandoned file — nothing in the
+            # emitted output references it; skip to avoid orphan files.
+            if abs_path not in reachable:
+                self.processed_files[abs_path] = None
+                self.stats.discard_file(os.path.basename(abs_path))
                 continue
 
             # No changes needed
@@ -964,59 +1117,34 @@ class Pipeline:
         return root_output
 
     def run(self, root_path, default_section=None):
-        self.discover(root_path, default_section)
+        state = self.discover(root_path, default_section)
+        if state is None:
+            # discover already printed the reason (unreadable / undecodable)
+            sys.exit(1)
         self.analyze()
         return self.emit()
 
 
 def convert_file(input_path, stats=None, processed_files=None, default_section=None):
-    """Convert a Surge config file from v5+ to v4.
+    """Convert a Surge config file from v5+ to v4 (top-level entry point).
 
-    Two modes:
-
-    1. Top-level (no active Pipeline): create a Pipeline, run all three phases
-       on this file and its dependencies, return the root file's output path
-       (or None if abandoned / unchanged).
-
-    2. Nested (called from update_include_line / update_policy_path while a
-       Pipeline is already active): reuse the outer Pipeline via
-       pipeline.discover(sub_path) to add this sub-file to the shared
-       FileState dict. Returns a backward-compatible sentinel:
-         - abandoned sub-file → None (parent keeps original reference)
-         - unchanged sub-file → None (parent keeps original reference)
-         - converted sub-file → make_v4_filename(input_path) (parent rewrites to -v4)
-
-       The actual write happens later, when the top-level Pipeline.emit()
-       iterates all discovered FileStates. Nested calls only discover.
+    Creates a Pipeline, runs discover → analyze → emit over this file and
+    every transitively referenced local file, and returns the root file's
+    output path (or None if abandoned / unchanged).
     """
-    global _active_pipeline
-
     if stats is None:
         stats = ConversionStats()
 
     input_path = os.path.abspath(input_path)
     if not os.path.isfile(input_path):
-        print(f"错误: 文件不存在: {input_path}", file=sys.stderr)
+        if os.path.isdir(input_path):
+            print(f"错误: 路径是目录而非文件: {input_path}", file=sys.stderr)
+        else:
+            print(f"错误: 文件不存在: {input_path}", file=sys.stderr)
         sys.exit(1)
 
-    if _active_pipeline is not None:
-        # Nested mode — reuse the outer Pipeline
-        state = _active_pipeline.discover(input_path, default_section=default_section)
-        if state is None:
-            return None
-        if state.is_abandoned:
-            return None
-        if state.converted == state.original:
-            return None
-        return make_v4_filename(input_path)
-
-    # Top-level mode — create a new Pipeline
     pipeline = Pipeline(stats, processed_files)
-    _active_pipeline = pipeline
-    try:
-        return pipeline.run(input_path, default_section=default_section)
-    finally:
-        _active_pipeline = None
+    return pipeline.run(input_path, default_section=default_section)
 
 
 def main():
@@ -1049,8 +1177,14 @@ def main():
         print(f"\n发现 {len(stats.deprecated_files)} 个 deprecated 备份文件:")
         for f in stats.deprecated_files:
             print(f"  - {f}")
-        answer = input("是否删除这些 deprecated 文件？（默认删除）[Y/n] ").strip().lower()
-        if answer != "n":
+        try:
+            answer = input("是否删除这些 deprecated 文件？（默认删除）[Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            # Non-interactive run (cron / pipe): keep the backups, never
+            # destroy files without an explicit human answer.
+            answer = "n"
+            print()
+        if answer in ("", "y", "yes"):
             for f in stats.deprecated_files:
                 send2trash(f)
                 print(f"已移至垃圾桶: {f}")
