@@ -11,6 +11,8 @@ buildServer.json
 CLAUDE.local.md
 .claude/*.local.md
 .claude/*.local.json
+.pr-review-loop/
+.handoff/
 
 # Gemini
 .gemini-clipboard/
