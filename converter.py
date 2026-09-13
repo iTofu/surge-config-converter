@@ -293,6 +293,7 @@ class FileState:
     owned_proxies: set = field(default_factory=set)    # proxy names defined in this file
     owned_groups: set = field(default_factory=set)     # group names defined in this file
     deleted_names: set = field(default_factory=set)    # names removed (propagates cascade)
+    self_deleted: set = field(default_factory=set)     # subset killed by THIS file's own line
 
 
 def parse_proxy_group_line(line):
@@ -683,7 +684,9 @@ class Pipeline:
                     if "=" in raw:
                         name = raw.split("=", 1)[0].strip()
                         if name:
-                            state.deleted_names.add(unquote(name))
+                            deleted_name = unquote(name)
+                            state.deleted_names.add(deleted_name)
+                            state.self_deleted.add(deleted_name)
                 elif not line.lstrip().startswith("#") and "=" in line:
                     name = line.split("=", 1)[0].strip()
                     if name:
@@ -775,6 +778,24 @@ class Pipeline:
                     stack.append(ref)
         return reachable
 
+    def _live_names(self):
+        """Names that still have a surviving definition in the output.
+
+        Surge flattens every emitted file into ONE namespace, so a name is dead
+        only if no emitted file defines it any more. Withdrawing the names of an
+        abandoned or unreachable file must therefore not kill a same-named
+        definition that lives on elsewhere — a root config with its own
+        `Proxy` group keeps it even when an abandoned airport profile happens
+        to define a `Proxy` group too.
+        """
+        reachable = self._compute_reachable()
+        live = set()
+        for state in self.files.values():
+            if state.is_abandoned or state.abs_path not in reachable:
+                continue
+            live |= (state.owned_proxies | state.owned_groups) - state.self_deleted
+        return live
+
     def _will_emit(self, abs_path, _visiting=None):
         """Transitive closure: a file will produce a -v4 output iff it is not
         abandoned AND it differs from its original — either already (direct
@@ -835,10 +856,11 @@ class Pipeline:
             for state in self.files.values():
                 if not state.is_abandoned:
                     self.global_deleted |= state.deleted_names
+            live = self._live_names()
             for state in self.files.values():
                 if state.is_abandoned:
                     continue
-                state.deleted_names |= self.global_deleted
+                state.deleted_names |= self.global_deleted - live
 
             # 2a. Strip policy-path options pointing at abandoned files.
             # May seed additional deletions (groups left without any member
@@ -867,9 +889,10 @@ class Pipeline:
                     new_deletions = state.deleted_names - before
                     if new_deletions:
                         self.global_deleted |= new_deletions
+                        propagated = new_deletions - self._live_names()
                         for other in self.files.values():
                             if other is not state and not other.is_abandoned:
-                                other.deleted_names |= new_deletions
+                                other.deleted_names |= propagated
                         changed = True
 
             # 3b. Withdraw names defined only in unreachable subtrees. A
@@ -1020,7 +1043,9 @@ class Pipeline:
                     # comment shows the group in its cleaned state.
                     reformatted = _preserve_indent(line, format_proxy_group_line(pgl))
                     state.lines[i] = CASCADE_TAG + reformatted.lstrip()
-                    state.deleted_names.add(unquote(pgl.name))
+                    deleted_name = unquote(pgl.name)
+                    state.deleted_names.add(deleted_name)
+                    state.self_deleted.add(deleted_name)
                     basename = os.path.basename(state.abs_path)
                     self.stats.count_commented(basename)
                     self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", pgl.name)
@@ -1085,12 +1110,15 @@ class Pipeline:
                 state.lines[i] = CASCADE_TAG + reformatted.lstrip()
                 deleted_name = unquote(pgl.name)
                 state.deleted_names.add(deleted_name)
+                state.self_deleted.add(deleted_name)
                 self.global_deleted.add(deleted_name)
                 # Propagate to all other non-abandoned files so the downstream
-                # fixpoint catches references to this group.
-                for other in self.files.values():
-                    if other is not state and not other.is_abandoned:
-                        other.deleted_names.add(deleted_name)
+                # fixpoint catches references to this group — unless some other
+                # emitted file still defines the same name.
+                if deleted_name not in self._live_names():
+                    for other in self.files.values():
+                        if other is not state and not other.is_abandoned:
+                            other.deleted_names.add(deleted_name)
                 basename = os.path.basename(state.abs_path)
                 self.stats.count_commented(basename)
                 self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", pgl.name)

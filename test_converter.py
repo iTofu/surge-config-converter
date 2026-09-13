@@ -3244,3 +3244,71 @@ class TestUnreachableSubtreeNames:
         assert "#!include inner.dconf" in out   # kept, managed entry removed
         assert "G = select, X, OK" in out       # X alive — untouched
         assert "# [V5+ cascade]" not in out
+
+
+# --- T74: Name collision between root config and abandoned managed config ---
+
+class TestAbandonedNameCollision:
+    def test_root_group_survives_same_name_in_abandoned_file(self, tmp_path):
+        """A group name defined in BOTH the root config and an abandoned managed
+        config still exists in the output — the root's own definition survives.
+        Withdrawing the abandoned file's names must not kill references to the
+        root's live, same-named group."""
+        managed = tmp_path / "airport.conf"
+        managed.write_text(
+            "#!MANAGED-CONFIG https://x.com/a.conf interval=3600\n"
+            "[Proxy]\n"
+            "JP = anytls, 1.2.3.4, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "Proxy = select, JP\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "#!include airport.conf\n"
+            "OK = trojan, 9.9.9.9, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "Proxy = select, OK, policy-path=airport.conf\n"
+            'AI = select, "Proxy", OK\n'
+            "\n"
+            "[Rule]\n"
+            'FINAL,"Proxy"\n'
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert str(managed) in stats.abandoned_files
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "Proxy = select, OK" in out        # policy-path stripped, group lives
+        assert 'AI = select, "Proxy", OK' in out  # member NOT withdrawn
+        assert 'FINAL,"Proxy"' in out             # rule NOT cascade-commented
+
+    def test_root_proxy_survives_same_name_in_abandoned_file(self, tmp_path):
+        """Same collision on the [Proxy] namespace: a node name defined in both
+        the root and an abandoned managed config stays alive."""
+        managed = tmp_path / "airport.conf"
+        managed.write_text(
+            "#!MANAGED-CONFIG https://x.com/a.conf interval=3600\n"
+            "[Proxy]\n"
+            "JP = anytls, 1.2.3.4, 443, password=pwd\n"
+            "KR = anytls, 5.6.7.8, 443, password=pwd\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "#!include airport.conf\n"
+            "JP = trojan, 9.9.9.9, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "G = select, JP, KR\n"
+            "\n"
+            "[Rule]\n"
+            "FINAL,JP\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert str(managed) in stats.abandoned_files
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "G = select, JP" in out   # KR withdrawn, JP kept
+        assert "FINAL,JP" in out
