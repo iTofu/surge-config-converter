@@ -731,10 +731,12 @@ class Pipeline:
         return _serialize_lines(state.lines, state.original) != state.original
 
     def _live_local_refs(self, state):
-        """(abs_path, kind) for local files referenced by live (non-commented)
-        #!include / policy-path lines, resolved against the file's directory.
+        """(abs_path, kind, section) for local files referenced by live
+        (non-commented) #!include / policy-path lines, resolved against the
+        file's directory.
 
-        `kind` is "include" or "policy-path". The two are NOT interchangeable:
+        `kind` is "include" or "policy-path"; `section` is the section the
+        reference line sits in. The two kinds are NOT interchangeable:
         #!include merges the referenced file textually — every section of it
         joins the profile — whereas policy-path imports only the [Proxy]
         section ("if the content contains a [Proxy] section, the policies in
@@ -751,49 +753,67 @@ class Pipeline:
             if stripped.startswith("#!include"):
                 for entry in parse_include_list(line) or []:
                     if not entry.startswith(("http://", "https://")):
-                        refs.append(
-                            (os.path.normpath(os.path.join(base_dir, entry)), "include"))
+                        refs.append((
+                            os.path.normpath(os.path.join(base_dir, entry)),
+                            "include", state.sections[i]))
             elif state.sections[i] == "Proxy Group" and not stripped.startswith("#"):
                 pgl = parse_proxy_group_line(line)
                 if pgl is None:
                     continue
                 for key, value in pgl.options:
                     if key == "policy-path" and not value.startswith(("http://", "https://")):
-                        refs.append(
-                            (os.path.normpath(os.path.join(base_dir, value)), "policy-path"))
+                        refs.append((
+                            os.path.normpath(os.path.join(base_dir, value)),
+                            "policy-path", state.sections[i]))
         return refs
 
-    def _compute_reachable(self, kinds=None):
+    def _reachable_modes(self):
+        """abs_path → import mode, for every file the profile actually loads.
+
+        Two modes, propagated along the reference edges:
+          "full"  — the whole file joins the profile: the root itself, and
+                    anything a "full" file pulls in with #!include.
+          "proxy" — only the [Proxy] section is used: anything reached by a
+                    policy-path edge (Surge manual, Policy Including).
+
+        A "proxy" file's other sections do not exist as far as the profile is
+        concerned, so references sitting in them are NOT walked — Surge cannot
+        reach those files either, and names defined there never load. This is
+        what makes reachability mean "imported" rather than "mentioned
+        somewhere", at any depth.
+
+        Reaching a file both ways is normal; "full" wins and the file is
+        re-walked so the wider edge set is explored.
+        """
+        modes = {}
+        root_abs = next(iter(self.files))
+        if self.files[root_abs].is_abandoned:
+            return modes
+        stack = [(root_abs, "full")]
+        while stack:
+            cur, mode = stack.pop()
+            if modes.get(cur) == "full" or modes.get(cur) == mode:
+                continue
+            modes[cur] = mode
+            for ref, kind, section in self._live_local_refs(self.files[cur]):
+                if mode == "proxy" and section != "Proxy":
+                    continue
+                sub = self.files.get(ref)
+                if sub is None or sub.is_abandoned:
+                    continue
+                sub_mode = "full" if (mode == "full" and kind == "include") else "proxy"
+                stack.append((ref, sub_mode))
+        return modes
+
+    def _compute_reachable(self):
         """Files reachable from the root through live (non-commented,
         non-stripped) references of non-abandoned files.
 
         NOT the same thing as "not abandoned": a normal sub-file whose only
         parent is an abandoned managed config is unreachable — it won't be
         emitted, so names it defines don't exist in the output.
-
-        `kinds` restricts which reference edges may be walked (None = all).
-        `{"include"}` yields the strictly smaller set of files whose ENTIRE
-        content joins the profile; a file hanging off a policy-path edge
-        contributes only its [Proxy] section, so its other sections never
-        reach the output and must not be walked through.
         """
-        reachable = set()
-        root_abs = next(iter(self.files))
-        if self.files[root_abs].is_abandoned:
-            return reachable
-        stack = [root_abs]
-        while stack:
-            cur = stack.pop()
-            if cur in reachable:
-                continue
-            reachable.add(cur)
-            for ref, kind in self._live_local_refs(self.files[cur]):
-                if kinds is not None and kind not in kinds:
-                    continue
-                sub = self.files.get(ref)
-                if sub is not None and not sub.is_abandoned:
-                    stack.append(ref)
-        return reachable
+        return set(self._reachable_modes())
 
     def _live_names(self):
         """Names that still have a surviving definition in the output.
@@ -805,18 +825,17 @@ class Pipeline:
         `Proxy` group keeps it even when an abandoned airport profile happens
         to define a `Proxy` group too.
 
-        Reachability alone does not make every definition in a file live:
-        policy-path imports only the [Proxy] section, so a file reached solely
-        that way contributes its proxies but NOT its groups.
+        Being loaded does not make every definition in a file live: a file
+        imported in "proxy" mode contributes its [Proxy] entries but NOT its
+        groups, because that section never reaches the profile.
         """
-        reachable = self._compute_reachable()
-        merged = self._compute_reachable({"include"})
         live = set()
-        for state in self.files.values():
-            if state.is_abandoned or state.abs_path not in reachable:
+        for abs_path, mode in self._reachable_modes().items():
+            state = self.files[abs_path]
+            if state.is_abandoned:
                 continue
             names = set(state.owned_proxies)
-            if state.abs_path in merged:
+            if mode == "full":
                 names |= state.owned_groups
             live |= names - state.self_deleted
         return live
@@ -844,7 +863,8 @@ class Pipeline:
             return False
         _visiting.add(abs_path)
         try:
-            return any(self._will_emit(r, _visiting) for r, _ in self._live_local_refs(state))
+            return any(
+                self._will_emit(r, _visiting) for r, _, _ in self._live_local_refs(state))
         finally:
             _visiting.discard(abs_path)
 
