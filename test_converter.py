@@ -3312,3 +3312,87 @@ class TestAbandonedNameCollision:
         out = (tmp_path / "v4" / "main-v4.conf").read_text()
         assert "G = select, JP" in out   # KR withdrawn, JP kept
         assert "FINAL,JP" in out
+
+    def test_policy_path_groups_are_not_live_definitions(self, tmp_path):
+        """A file referenced only via policy-path contributes its [Proxy]
+        section, NOT its [Proxy Group] definitions — Surge imports only the
+        proxy section from such a file. Its group names must therefore not
+        shield a same-named group that died with an abandoned file."""
+        managed = tmp_path / "managed.conf"
+        managed.write_text(
+            "#!MANAGED-CONFIG https://x.com/m.conf interval=3600\n"
+            "[Proxy]\n"
+            "JP = anytls, 1.2.3.4, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "G = select, JP\n"
+        )
+        nodes = tmp_path / "nodes.conf"
+        nodes.write_text(
+            "[Proxy]\n"
+            "OKNODE = trojan, 8.8.8.8, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "G = select, OKNODE\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "#!include managed.conf\n"
+            "OK = trojan, 9.9.9.9, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "Pool = select, policy-path=nodes.conf\n"
+            "Wrap = select, G, DIRECT\n"
+            "\n"
+            "[Rule]\n"
+            "DOMAIN,example.com,G\n"
+            "FINAL,Wrap\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert str(managed) in stats.abandoned_files
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "Wrap = select, DIRECT" in out
+        assert "# [V5+ cascade] DOMAIN,example.com,G" in out
+        assert "FINAL,Wrap" in out
+
+    def test_included_file_groups_stay_live(self, tmp_path):
+        """Counterpart: a file pulled in by #!include IS textually merged, so
+        its group definitions do shield the same name."""
+        managed = tmp_path / "managed.conf"
+        managed.write_text(
+            "#!MANAGED-CONFIG https://x.com/m.conf interval=3600\n"
+            "[Proxy]\n"
+            "JP = anytls, 1.2.3.4, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "G = select, JP\n"
+        )
+        nodes = tmp_path / "nodes.conf"
+        nodes.write_text(
+            "[Proxy]\n"
+            "OKNODE = trojan, 8.8.8.8, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "G = select, OKNODE\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "#!include managed.conf, nodes.conf\n"
+            "OK = trojan, 9.9.9.9, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "Wrap = select, G, DIRECT\n"
+            "\n"
+            "[Rule]\n"
+            "DOMAIN,example.com,G\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert str(managed) in stats.abandoned_files
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "Wrap = select, G, DIRECT" in out
+        assert "DOMAIN,example.com,G" in out
+        assert "# [V5+ cascade]" not in out.split("[Rule]")[1]
