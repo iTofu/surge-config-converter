@@ -3396,3 +3396,85 @@ class TestAbandonedNameCollision:
         assert "Wrap = select, G, DIRECT" in out
         assert "DOMAIN,example.com,G" in out
         assert "# [V5+ cascade]" not in out.split("[Rule]")[1]
+
+    def test_policy_path_chain_does_not_carry_names(self, tmp_path):
+        """Surge takes only [Proxy] from a policy-path file, so that file's
+        [Proxy Group] section — and any policy-path hanging off it — is never
+        loaded. Names defined one level deeper must not count as live."""
+        managed = tmp_path / "managed.conf"
+        managed.write_text(
+            "#!MANAGED-CONFIG https://x.com/m.conf interval=3600\n"
+            "[Proxy]\n"
+            "X = anytls, 1.2.3.4, 443, password=pwd\n"
+        )
+        (tmp_path / "inner.conf").write_text(
+            "[Proxy]\n"
+            "X = trojan, 7.7.7.7, 443, password=pwd\n"
+        )
+        (tmp_path / "outer.conf").write_text(
+            "[Proxy]\n"
+            "OK = trojan, 8.8.8.8, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "Hidden = select, policy-path=inner.conf\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "#!include managed.conf\n"
+            "BASE = trojan, 9.9.9.9, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "Pool = select, policy-path=outer.conf\n"
+            "Wrap = select, X, DIRECT\n"
+            "\n"
+            "[Rule]\n"
+            "DOMAIN,example.com,X\n"
+            "FINAL,Wrap\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert str(managed) in stats.abandoned_files
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "Wrap = select, DIRECT" in out
+        assert "# [V5+ cascade] DOMAIN,example.com,X" in out
+
+    def test_deep_file_also_included_by_root_stays_live(self, tmp_path):
+        """Counterpart: the same deep file ALSO pulled in by a root #!include
+        is genuinely loaded, so its names keep shielding."""
+        managed = tmp_path / "managed.conf"
+        managed.write_text(
+            "#!MANAGED-CONFIG https://x.com/m.conf interval=3600\n"
+            "[Proxy]\n"
+            "X = anytls, 1.2.3.4, 443, password=pwd\n"
+        )
+        (tmp_path / "inner.conf").write_text(
+            "[Proxy]\n"
+            "X = trojan, 7.7.7.7, 443, password=pwd\n"
+        )
+        (tmp_path / "outer.conf").write_text(
+            "[Proxy]\n"
+            "OK = trojan, 8.8.8.8, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "Hidden = select, policy-path=inner.conf\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "#!include managed.conf, inner.conf\n"
+            "BASE = trojan, 9.9.9.9, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "Pool = select, policy-path=outer.conf\n"
+            "Wrap = select, X, DIRECT\n"
+            "\n"
+            "[Rule]\n"
+            "DOMAIN,example.com,X\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert str(managed) in stats.abandoned_files
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "Wrap = select, X, DIRECT" in out
+        assert "DOMAIN,example.com,X" in out
