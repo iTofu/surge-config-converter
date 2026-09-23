@@ -1,5 +1,6 @@
 """Tests for Surge v5+ → v4 configuration converter."""
 
+import re
 import textwrap
 from unittest.mock import patch
 
@@ -357,8 +358,9 @@ class TestIncludeDirective:
         main_v4 = tmp_path / "v4" / "main-v4.conf"
         assert main_v4.exists()
         content = main_v4.read_text()
-        # proxies.conf needs conversion, extra.dconf does not
-        assert "#!include proxies-v4.conf, extra.dconf" in content
+        # extra.dconf needs no conversion but is still copied: v4/ is self-contained
+        assert "#!include proxies-v4.conf, extra-v4.dconf" in content
+        assert (tmp_path / "v4" / "extra-v4.dconf").exists()
 
         # Check proxies-v4.conf (has v5+ content)
         proxies_v4 = tmp_path / "v4" / "proxies-v4.conf"
@@ -369,8 +371,8 @@ class TestIncludeDirective:
         assert "version=5" not in p_content
         assert "TROJAN-HK = trojan" in p_content
 
-        # extra.dconf is pure v4, no -v4 copy created
-        assert not (tmp_path / "v4" / "extra-v4.dconf").exists()
+        # extra.dconf is pure v4: its copy is verbatim
+        assert (tmp_path / "v4" / "extra-v4.dconf").read_text() == extra.read_text()
 
     def test_include_extra_spaces_no_false_positive(self, tmp_path):
         """#!include 行有多余空格时不应误判为内容变化"""
@@ -463,8 +465,9 @@ class TestPolicyPath:
         convert_file(str(main), stats, processed)
 
         content = (tmp_path / "v4" / "main-v4.conf").read_text()
-        # home.dconf is pure v4, keeps original reference
-        assert "policy-path=home.dconf" in content
+        # home.dconf is pure v4 but still copied: v4/ is self-contained
+        assert "policy-path=home-v4.dconf" in content
+        assert (tmp_path / "v4" / "home-v4.dconf").exists()
         assert "policy-path=https://sub.example.com/surge.conf" in content
 
     def test_multiple_policy_path_refs_to_same_file_all_rewritten(self, tmp_path):
@@ -587,7 +590,8 @@ class TestSkipUnchangedSubfile:
         assert not (tmp_path / "v4" / "main-v4.conf").exists()
 
     def test_mixed_subfiles(self, tmp_path):
-        """Only sub-files with changes get -v4 copies."""
+        """Once anything emits, every reachable sub-file gets a -v4 copy —
+        v4/ must be self-contained, a bare `pure.conf` would dangle there."""
         pure_v4 = tmp_path / "pure.conf"
         pure_v4.write_text("T1 = trojan, 1.2.3.4, 443, password=pwd\n")
 
@@ -601,10 +605,76 @@ class TestSkipUnchangedSubfile:
         processed = {str(main): None}
         convert_file(str(main), stats, processed)
 
-        assert not (tmp_path / "v4" / "pure-v4.conf").exists()
         assert (tmp_path / "v4" / "needs-conv-v4.conf").exists()
+        assert (tmp_path / "v4" / "pure-v4.conf").read_text() == pure_v4.read_text()
         content = (tmp_path / "v4" / "main-v4.conf").read_text()
-        assert "#!include pure.conf, needs-conv-v4.conf" in content
+        assert "#!include pure-v4.conf, needs-conv-v4.conf" in content
+
+    def test_clean_policy_path_subfile_copied_when_tree_emits(self, tmp_path):
+        """policy-path to a v4-clean file from a converted root → copied and
+        the reference rewritten, never left pointing at a missing v4/ file."""
+        res = tmp_path / "res.dconf"
+        res.write_text("[Proxy]\nR1 = http, 1.2.3.4, 823, username=u, password=p\n")
+
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy Group]\n"
+            "Auto = smart, R1\n"
+            "Res = select, policy-path=res.dconf\n"
+        )
+
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+
+        assert (tmp_path / "v4" / "res-v4.dconf").read_text() == res.read_text()
+        content = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "policy-path=res-v4.dconf" in content
+        assert "policy-path=res.dconf" not in content
+
+    def test_every_local_reference_resolves_inside_v4(self, tmp_path):
+        """Invariant: each local include / policy-path in any emitted file
+        names a file that exists in v4/."""
+        (tmp_path / "a.dconf").write_text("[Proxy]\nA = trojan, 1.1.1.1, 443, password=x\n")
+        (tmp_path / "b.dconf").write_text("[Proxy]\nB = hysteria2, 2.2.2.2, 443, password=x\n")
+        (tmp_path / "c.conf").write_text("[Proxy]\n#!include a.dconf\n")
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n#!include c.conf, b.dconf\n"
+            "[Proxy Group]\nG = select, policy-path=a.dconf\n"
+        )
+
+        convert_file(str(main), ConversionStats(), {str(main): None})
+
+        v4 = tmp_path / "v4"
+        for out in v4.iterdir():
+            for line in out.read_text().splitlines():
+                refs = []
+                if line.startswith("#!include"):
+                    refs = [e.strip() for e in line[len("#!include"):].split(",")]
+                refs += re.findall(r"policy-path=([^,\s]+)", line)
+                for ref in refs:
+                    assert (v4 / ref).exists(), f"{out.name}: {ref} missing in v4/"
+
+    def test_clean_managed_subfile_abandoned_not_dangling(self, tmp_path):
+        """A managed sub-file must not be copied (Surge's refresh would
+        overwrite the copy), so when the tree emits it is abandoned and its
+        reference stripped instead of left dangling."""
+        (tmp_path / "sub.conf").write_text(
+            "#!MANAGED-CONFIG https://x.com/sub.conf interval=43200\n"
+            "[Proxy]\nHK = trojan, 5.6.7.8, 443, password=pwd\n"
+        )
+        (tmp_path / "own.conf").write_text("OWN = hysteria2, 1.2.3.4, 443, password=pwd\n")
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy]\n#!include sub.conf, own.conf\n")
+
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+
+        assert str(tmp_path / "sub.conf") in stats.abandoned_files
+        assert not (tmp_path / "v4" / "sub-v4.conf").exists()
+        content = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "#!include own-v4.conf" in content
+        assert "sub.conf" not in content
 
     def test_policy_path_subfile_skipped(self, tmp_path):
         """policy-path sub-file with no changes → keep original reference."""
@@ -1571,7 +1641,8 @@ class TestCrossFileInclude:
         )
         convert_file(str(main), ConversionStats(), {str(main): None})
         out = (tmp_path / "v4" / "main-v4.conf").read_text()
-        assert "#!include other.conf" in out
+        assert "#!include other-v4.conf" in out
+        assert (tmp_path / "v4" / "other-v4.conf").exists()
         assert "sub.conf" not in out
 
     def test_sole_abandoned_include_commented(self, tmp_path):
@@ -1680,7 +1751,8 @@ class TestRealWorldCascade:
         assert "xflash-leodxkr-v4.conf" not in out
         assert "mai-vps-v4.dconf" in out
         assert "self-home-v4.dconf" in out
-        assert "self-vps.dconf" in out
+        assert "self-vps-v4.dconf" in out
+        assert (tmp_path / "v4" / "self-vps-v4.dconf").exists()
 
         # 4. ✈️ Proxy lost policy-path, lost ♻️ Auto (cascaded), kept other 3
         assert '✈️ Proxy = select, "💼 MAI", "🧑‍💻 SelfVPS", "🏡 HomeProxy"' in out
@@ -2290,7 +2362,8 @@ class TestMultipleAbandonedFiles:
 
         assert str(sub1) in stats.abandoned_files
         assert str(sub2) in stats.abandoned_files
-        assert "#!include other.conf" in out
+        assert "#!include other-v4.conf" in out
+        assert (tmp_path / "v4" / "other-v4.conf").exists()
         assert "sub1" not in out
         assert "sub2" not in out
         assert "All = select, HK" in out
@@ -3241,7 +3314,8 @@ class TestUnreachableSubtreeNames:
         stats = ConversionStats()
         convert_file(str(main), stats, {str(main): None})
         out = (tmp_path / "v4" / "main-v4.conf").read_text()
-        assert "#!include inner.dconf" in out   # kept, managed entry removed
+        assert "#!include inner-v4.dconf" in out   # kept, managed entry removed
+        assert (tmp_path / "v4" / "inner-v4.dconf").exists()
         assert "G = select, X, OK" in out       # X alive — untouched
         assert "# [V5+ cascade]" not in out
 

@@ -16,11 +16,10 @@ Output layout:
             └── mai-vps-v4.dconf
 
     Files inside v4/ reference each other using bare filenames (e.g.
-    #!include mai-vps-v4.dconf) with no directory prefix. To use them,
-    copy everything in v4/ to the top-level config directory on the
-    Surge v4 device. Referenced sub-files that needed no conversion get
-    no -v4 copy and keep their original names in the parent — the
-    destination directory must contain those originals too.
+    #!include mai-vps-v4.dconf) with no directory prefix. v4/ is
+    self-contained: whenever anything needs conversion, every file the
+    profile loads gets a -v4 copy (verbatim if it needed no conversion),
+    so copying v4/ alone to the Surge v4 device is enough.
 
 Limitation:
     All referenced files (#!include, policy-path) must reside in the
@@ -628,6 +627,7 @@ class Pipeline:
         self.abandoned_files = set()    # absolute paths of managed files we refused
         self.global_deleted = set()     # union of all names deleted anywhere
         self.reachable = set()          # final root-reachable set, settled by analyze()
+        self.emitting = set()           # files that get a -v4 copy, settled by analyze()
 
     def discover(self, input_path, default_section=None):
         """Read a file, apply direct v5+ hits, and recurse into dependencies.
@@ -840,33 +840,24 @@ class Pipeline:
             live |= names - state.self_deleted
         return live
 
-    def _will_emit(self, abs_path, _visiting=None):
-        """Transitive closure: a file will produce a -v4 output iff it is not
-        abandoned AND it differs from its original — either already (direct
-        hits / cascade mutations) or prospectively (a live reference points
-        at a file that will emit, so that reference will be rewritten to a
-        -v4 name, changing this file too).
+    def _emitting(self):
+        """Files that get a -v4 copy in v4/: all-or-nothing over the profile.
 
-        This is the single predicate shared by the abandonment loop and the
-        reference-rewrite pass, so a managed file whose ONLY change would be
-        a reference rewrite is caught by abandonment BEFORE any rewrite
-        happens. Cycle back-edges contribute False (no independent change).
+        v4/ must be self-contained — references inside it are bare -v4 names
+        — so once anything in the loaded profile needs conversion, every file
+        it loads is emitted, unchanged ones as verbatim copies. Emitting only
+        the changed ones would leave the root pointing at `x.dconf` inside
+        v4/, where no such file exists. If nothing needs conversion, nothing
+        is emitted.
+
+        Shared by the abandonment loop and the reference-rewrite pass: a
+        managed file in this set would need a -v4 copy that Surge's refresh
+        overwrites, so it is abandoned BEFORE any rewrite happens.
         """
-        if _visiting is None:
-            _visiting = set()
-        state = self.files.get(abs_path)
-        if state is None or state.is_abandoned:
-            return False
-        if self._pending_change(state):
-            return True
-        if abs_path in _visiting:
-            return False
-        _visiting.add(abs_path)
-        try:
-            return any(
-                self._will_emit(r, _visiting) for r, _, _ in self._live_local_refs(state))
-        finally:
-            _visiting.discard(abs_path)
+        reachable = self._reachable_modes()
+        if not any(self._pending_change(self.files[p]) for p in reachable):
+            return set()
+        return set(reachable)
 
     def analyze(self):
         """Cross-file cascade: abandonment, deleted-name propagation, and
@@ -880,15 +871,14 @@ class Pipeline:
         when every file's final status is known.
         """
         while True:
-            # 1. Abandon any managed file that WOULD change — direct hits,
-            # cascade mutations, or a prospective reference rewrite (its
-            # sub-file will emit, so its include/policy-path line would be
-            # rewritten; _will_emit folds that in). A -v4 copy of a managed
-            # profile would be overwritten by Surge's periodic refresh, so
-            # it must never be written. Its discarded names vanish from the
-            # global namespace.
+            # 1. Abandon any managed file that would need a -v4 copy (see
+            # _emitting). A -v4 copy of a managed profile would be
+            # overwritten by Surge's periodic refresh, so it must never be
+            # written. Its discarded names vanish from the global namespace.
+            # Re-evaluated per file: one abandonment can make another
+            # managed file unreachable, and unreachable is not abandoned.
             for state in self.files.values():
-                if state.is_managed and not state.is_abandoned and self._will_emit(state.abs_path):
+                if state.is_managed and not state.is_abandoned and state.abs_path in self._emitting():
                     state.is_abandoned = True
                     self.abandoned_files.add(state.abs_path)
                     self.global_deleted |= state.owned_proxies
@@ -956,19 +946,21 @@ class Pipeline:
                 self.global_deleted |= new_withdrawn
                 continue
 
-            # 4. If the cascade just dirtied a managed file (directly or via
-            # a prospective reference rewrite), its abandonment must be
-            # processed by another round; otherwise we're stable.
+            # 4. If the cascade just put a managed file into the emitting set
+            # (the profile became dirty, or the file itself changed), its
+            # abandonment must be processed by another round; otherwise
+            # we're stable.
+            emitting = self._emitting()
             if not any(
-                s.is_managed and not s.is_abandoned and self._will_emit(s.abs_path)
+                s.is_managed and not s.is_abandoned and s.abs_path in emitting
                 for s in self.files.values()
             ):
                 break
 
-        # 5. Rewrite include / policy-path references now that every file's
-        # abandoned / changed status is settled. Single pass: _will_emit is
-        # already transitive, so a parent whose only change is this rewrite
-        # is itself will_emit and gets rewritten in the same pass.
+        # 5. Settle the emitting set, then rewrite include / policy-path
+        # references to -v4 names. Settled BEFORE the rewrite: afterwards
+        # references name -v4 files, and reachability can't be recomputed.
+        self.emitting = self._emitting()
         self._rewrite_references()
 
         # 6. Re-serialize converted content from mutated lines.
@@ -1011,7 +1003,7 @@ class Pipeline:
             for entry in entries:
                 if not entry.startswith(("http://", "https://")):
                     abs_path = os.path.normpath(os.path.join(base_dir, entry))
-                    if self._will_emit(abs_path):
+                    if abs_path in self.emitting:
                         new_entries.append(make_v4_relname(entry))
                         notes.append(f"{entry} → {make_v4_relname(entry)}")
                         continue
@@ -1028,7 +1020,7 @@ class Pipeline:
             for key, value in pgl.options:
                 if key == "policy-path" and not value.startswith(("http://", "https://")):
                     abs_path = os.path.normpath(os.path.join(base_dir, value))
-                    if self._will_emit(abs_path):
+                    if abs_path in self.emitting:
                         new_options.append((key, make_v4_relname(value)))
                         notes.append(
                             f"policy-path={value} → policy-path={make_v4_relname(value)}")
@@ -1247,8 +1239,8 @@ class Pipeline:
                 self.stats.discard_file(os.path.basename(abs_path))
                 continue
 
-            # No changes needed
-            if state.converted == state.original:
+            # Not part of the output: nothing in the profile needs conversion.
+            if abs_path not in self.emitting:
                 self.processed_files[abs_path] = None
                 if abs_path == root_abs:
                     root_output = None
@@ -1281,7 +1273,8 @@ class Pipeline:
             state.output_path = output_path
             self.stats.files_processed.append(output_path)
             self.processed_files[abs_path] = output_path
-            print(f"已转换: {abs_path} → {output_path}")
+            verb = "已复制（无需转换）" if state.converted == state.original else "已转换"
+            print(f"{verb}: {abs_path} → {output_path}")
             if abs_path == root_abs:
                 root_output = output_path
 
