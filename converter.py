@@ -61,6 +61,17 @@ V5PLUS_ONLY_PROXY_PARAMS = {"port-hopping", "port-hopping-interval", "ecn"}
 # Cascade-cleanup tag prefix: distinguishes follow-on deletions from direct hits.
 CASCADE_TAG = "# [V5+ cascade] "
 
+# Comment prefixes Surge accepts ("#", ";", "//", Surge manual, Profile
+# Format), possibly repeated with spaces in between. "#!" is a directive
+# (#!include, #!MANAGED-CONFIG), not a comment.
+_COMMENT_PREFIX_RE = re.compile(r'^\s*(?:(?:#(?!!)|//|;)\s*)+')
+
+# Proxy types whose definition is "name = type, host, port, key=value...".
+# Only these are recognized inside comments; anything else stays verbatim.
+HOST_PORT_PROXY_TYPES = {
+    "http", "https", "socks5", "socks5-tls", "ss", "snell", "vmess", "trojan", "ssh",
+} | V5PLUS_ONLY_PROXY_TYPES
+
 
 def unquote(name):
     """Strip surrounding double quotes from a proxy / group name token."""
@@ -481,6 +492,45 @@ def transform_proxy_line(line, stats, filename, line_num, section):
     return modified
 
 
+def is_proxy_definition(body):
+    """Strictly check that body is a complete proxy definition:
+    name = type, host, port[, key=value...] with a known host/port type.
+
+    Used to tell commented-out nodes from free-form comment text, so it
+    rejects anything it cannot fully account for.
+    """
+    if "=" not in body:
+        return False
+    name, rest = body.split("=", 1)
+    if not name.strip():
+        return False
+    tokens = _split_top_level_commas(rest)
+    if len(tokens) < 3 or tokens[0].lower() not in HOST_PORT_PROXY_TYPES:
+        return False
+    host, port = tokens[1], tokens[2]
+    if not host or "=" in host or " " in host or not port.isdigit():
+        return False
+    return all(re.match(r'^[\w-]+\s*=', t) for t in tokens[3:])
+
+
+def transform_commented_proxy_line(line, stats, filename, line_num, section):
+    """Apply the proxy-line transforms to a commented-out node, keeping the
+    comment prefix verbatim, so uncommenting it in v4 yields a v4-valid node.
+
+    Free-form comments, converter tags and v5+ only types (already disabled;
+    a "# [V5+]" tag on top would add nothing) are returned unchanged.
+    """
+    if line.startswith(("# [V5+] ", CASCADE_TAG)):
+        return line
+    m = _COMMENT_PREFIX_RE.match(line)
+    if not m:
+        return line
+    prefix, body = line[:m.end()], line[m.end():]
+    if not is_proxy_definition(body) or extract_proxy_type(body) in V5PLUS_ONLY_PROXY_TYPES:
+        return line
+    return prefix + transform_proxy_line(body, stats, filename, line_num, section)
+
+
 def transform_proxy_group_line(line, stats, filename, line_num, section):
     """Transform a single line in [Proxy Group] section.
 
@@ -590,7 +640,11 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
         # Comments and #!include directives pass through untouched here.
         # Include reference rewriting happens later in the pipeline
         # (Pipeline._rewrite_references), once sub-file outcomes are known.
-        if stripped.startswith("#"):
+        # Commented-out nodes ("#", ";" or "//" in [Proxy]) never decide
+        # whether a file needs conversion; they are rewritten only in files
+        # that get emitted anyway (Pipeline._convert_commented_proxies).
+        if stripped.startswith("#") or (
+                current_section == "Proxy" and _COMMENT_PREFIX_RE.match(line)):
             result.append(line)
             continue
 
@@ -963,11 +1017,24 @@ class Pipeline:
         self.emitting = self._emitting()
         self._rewrite_references()
 
-        # 6. Re-serialize converted content from mutated lines.
+        # 6. Convert commented-out nodes in emitted files, then re-serialize
+        # converted content from mutated lines. Done after every decision so
+        # a comment alone never dirties a file (or abandons a managed one).
         for state in self.files.values():
             if state.is_abandoned:
                 continue
+            if state.abs_path in self.emitting:
+                self._convert_commented_proxies(state)
             state.converted = _serialize_lines(state.lines, state.original)
+
+    def _convert_commented_proxies(self, state):
+        """Give commented-out [Proxy] nodes the same transforms as live ones,
+        so uncommenting a node in the v4 copy yields a v4-valid line."""
+        basename = os.path.basename(state.abs_path)
+        for i, line in enumerate(state.lines):
+            if state.sections[i] == "Proxy":
+                state.lines[i] = transform_commented_proxy_line(
+                    line, self.stats, basename, i + 1, "Proxy")
 
     def _rewrite_references(self):
         """Point include / policy-path references at the -v4 names of files
