@@ -3552,3 +3552,105 @@ class TestAbandonedNameCollision:
         out = (tmp_path / "v4" / "main-v4.conf").read_text()
         assert "Wrap = select, X, DIRECT" in out
         assert "DOMAIN,example.com,X" in out
+
+
+# --- T70: commented-out nodes get the same transforms as live ones ---
+
+class TestCommentedProxyConversion:
+    """A node the user commented out must still be v4-valid in the v4 copy,
+    so uncommenting it there works. Comments never dirty a file by themselves."""
+
+    def _run(self, tmp_path, proxy_lines, extra_live="LIVE = snell, example.com, 443, psk=test, version=5"):
+        sub = tmp_path / "nodes.dconf"
+        sub.write_text("\n".join(proxy_lines + [extra_live]) + "\n")
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy]\n#!include nodes.dconf\n")
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        out = (tmp_path / "v4" / "nodes-v4.dconf").read_text().splitlines()
+        return out, stats
+
+    def test_commented_snell_v5_becomes_v4(self, tmp_path):
+        out, stats = self._run(tmp_path, [
+            "# OFF = snell, example.com, 443, psk=test, version=5, reuse=true",
+        ])
+        assert out[0] == "# OFF = snell, example.com, 443, psk=test, version=4, reuse=true"
+        assert out[1] == "LIVE = snell, example.com, 443, psk=test, version=4"
+        assert any(c[3] == "version=5 → version=4" and c[4] == "OFF" for c in stats.changes)
+
+    def test_prefix_variants_preserved(self, tmp_path):
+        out, _ = self._run(tmp_path, [
+            "#OFF1 = snell, example.com, 443, psk=test, version=5",
+            "##  OFF2 = snell, example.com, 443, psk=test, version=5",
+            "  # # OFF3 = snell, example.com, 443, psk=test, version=5",
+            "// OFF4 = snell, example.com, 443, psk=test, version=5",
+            "; OFF5 = snell, example.com, 443, psk=test, version=5",
+        ])
+        assert out[0] == "#OFF1 = snell, example.com, 443, psk=test, version=4"
+        assert out[1] == "##  OFF2 = snell, example.com, 443, psk=test, version=4"
+        assert out[2] == "  # # OFF3 = snell, example.com, 443, psk=test, version=4"
+        assert out[3] == "// OFF4 = snell, example.com, 443, psk=test, version=4"
+        assert out[4] == "; OFF5 = snell, example.com, 443, psk=test, version=4"
+
+    def test_other_param_transforms_apply(self, tmp_path):
+        out, _ = self._run(tmp_path, [
+            "# T = trojan, example.com, 443, password=test, shadow-tls-version=3, ecn=true",
+        ])
+        assert out[0] == "# T = trojan, example.com, 443, password=test, shadow-tls-version=2"
+
+    def test_free_form_comments_verbatim(self, tmp_path):
+        notes = [
+            "# 说明：snell version=5 要改成 version=4",
+            "# shadow-tls-version=3, ecn=true 是 v5 参数",
+            "# note = snell, see docs, version=5",
+            "# X = snell, example.com, abc, version=5",
+            "# X = snell, example.com, 443, psk test, version=5",
+            "# X = wireguard, section-name=test, version=5",
+            "#",
+            "#!include other.dconf",
+        ]
+        out, _ = self._run(tmp_path, notes)
+        assert out[:len(notes)] == notes
+
+    def test_commented_v5plus_type_not_double_commented(self, tmp_path):
+        lines = [
+            "# AT = anytls, example.com, 443, password=test",
+            "; HY = hysteria2, example.com, 443, password=test, port-hopping=1-2, ecn=true",
+        ]
+        out, stats = self._run(tmp_path, lines)
+        assert out[:2] == lines
+        assert stats.lines_commented == 0
+
+    def test_live_nodes_unchanged_behavior(self, tmp_path):
+        out, _ = self._run(tmp_path, [
+            "AT = anytls, example.com, 443, password=test",
+            "T = trojan, example.com, 443, password=test, ecn=true",
+        ])
+        assert out[0] == "# [V5+] AT = anytls, example.com, 443, password=test"
+        assert out[1] == "T = trojan, example.com, 443, password=test"
+        assert out[2] == "LIVE = snell, example.com, 443, psk=test, version=4"
+
+    def test_comment_alone_does_not_trigger_output(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "# OFF = snell, example.com, 443, psk=test, version=5\n"
+            "// OFF2 = snell, example.com, 443, psk=test, version=5\n"
+            "ON = snell, example.com, 443, psk=test, version=4\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is None
+        assert not (tmp_path / "v4").exists()
+        assert stats.changes == []
+
+    def test_comment_alone_does_not_abandon_managed(self, tmp_path):
+        managed = tmp_path / "managed.conf"
+        managed.write_text(
+            "#!MANAGED-CONFIG https://example.com/m.conf interval=3600\n"
+            "[Proxy]\n"
+            "# OFF = snell, example.com, 443, psk=test, version=5\n"
+            "ON = trojan, example.com, 443, password=test\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(managed), stats, {str(managed): None}) is None
+        assert stats.abandoned_files == []
