@@ -75,6 +75,7 @@ Documents/
 | `HOSTNAME-TYPE` | 注释 |
 | `DOMAIN-WILDCARD` | 注释 |
 | `AND` / `OR` / `NOT` 复合规则内嵌上述类型 | 注释整行 |
+| 策略后的 `extended-matching` / `pre-matching` 参数 | 移除参数，规则保留 |
 
 ### 通用参数（[General]）
 

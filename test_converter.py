@@ -3654,3 +3654,90 @@ class TestCommentedProxyConversion:
         stats = ConversionStats()
         assert convert_file(str(managed), stats, {str(managed): None}) is None
         assert stats.abandoned_files == []
+
+
+# --- T81: v5+ only rule options stripped, rule kept ---
+
+class TestV5OnlyRuleOptions:
+    def test_rule_set_extended_matching_removed(self):
+        result = convert("""
+            [Rule]
+            RULE-SET,https://example.com/ad.list,REJECT-NO-DROP,extended-matching
+        """)
+        assert result.splitlines()[1] == "RULE-SET,https://example.com/ad.list,REJECT-NO-DROP"
+
+    def test_pre_matching_removed(self):
+        result = convert("""
+            [Rule]
+            DOMAIN-SET,https://example.com/ad.txt,REJECT,pre-matching
+        """)
+        assert result.splitlines()[1] == "DOMAIN-SET,https://example.com/ad.txt,REJECT"
+
+    def test_both_removed(self):
+        result = convert("""
+            [Rule]
+            DOMAIN-SUFFIX,example.com,REJECT,extended-matching,pre-matching
+        """)
+        assert result.splitlines()[1] == "DOMAIN-SUFFIX,example.com,REJECT"
+
+    def test_other_options_kept(self):
+        result = convert("""
+            [Rule]
+            RULE-SET,https://example.com/cn.list,DIRECT,extended-matching,no-resolve
+            URL-REGEX,^https?://a\\.com/,Proxy,pre-matching,dns-failed
+        """)
+        lines = result.splitlines()
+        assert lines[1] == "RULE-SET,https://example.com/cn.list,DIRECT,no-resolve"
+        assert lines[2] == "URL-REGEX,^https?://a\\.com/,Proxy,dns-failed"
+
+    def test_indent_preserved(self):
+        result = convert("""
+            [Rule]
+            DOMAIN,a.com,DIRECT
+              DOMAIN,b.com,DIRECT,extended-matching
+        """)
+        assert result.splitlines()[2] == "  DOMAIN,b.com,DIRECT"
+
+    def test_criteria_value_not_touched(self):
+        """Only options after the policy are stripped, never the matched value."""
+        result = convert("""
+            [Rule]
+            DOMAIN-KEYWORD,pre-matching,DIRECT
+        """)
+        assert result.splitlines()[1] == "DOMAIN-KEYWORD,pre-matching,DIRECT"
+
+    def test_commented_rule_unchanged(self):
+        result = convert("""
+            [Rule]
+            # RULE-SET,https://example.com/ad.list,REJECT-NO-DROP,extended-matching
+        """)
+        assert result.splitlines()[1] == "# RULE-SET,https://example.com/ad.list,REJECT-NO-DROP,extended-matching"
+
+    def test_plain_rules_unchanged(self):
+        stats = ConversionStats()
+        result = convert("""
+            [Rule]
+            RULE-SET,https://example.com/ad.list,REJECT-NO-DROP
+            IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+            FINAL,Proxy,dns-failed
+        """, stats=stats)
+        assert result.splitlines()[1:] == [
+            "RULE-SET,https://example.com/ad.list,REJECT-NO-DROP",
+            "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+            "FINAL,Proxy,dns-failed",
+        ]
+        assert stats.changes == []
+        assert stats.params_modified == 0
+
+    def test_change_recorded(self):
+        stats = ConversionStats()
+        convert("""
+            [Rule]
+            DOMAIN,a.com,DIRECT,extended-matching,pre-matching
+        """, stats=stats, filename="test.conf")
+        assert stats.params_modified == 2
+        assert stats.lines_commented == 0
+        assert [(c[1], c[2], c[3], c[4]) for c in stats.changes] == [
+            (2, "Rule", "移除参数", "extended-matching (DOMAIN,a.com,DIRECT)"),
+            (2, "Rule", "移除参数", "pre-matching (DOMAIN,a.com,DIRECT)"),
+        ]

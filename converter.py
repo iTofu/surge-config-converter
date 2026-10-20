@@ -50,6 +50,10 @@ V5PLUS_ONLY_GENERAL_PARAMS = {"udp-priority", "block-quic"}
 # Rule types not supported in v4
 V5PLUS_ONLY_RULE_TYPES = {"HOSTNAME-TYPE", "DOMAIN-WILDCARD"}
 
+# Rule options not supported in v4 (extended-matching: iOS 5.8.0+,
+# pre-matching: iOS 5.14.0+). Stripped from the line; the rule itself stays.
+V5PLUS_ONLY_RULE_OPTIONS = {"extended-matching", "pre-matching"}
+
 # v5+ only rule types appearing as parenthesized criteria of AND/OR/NOT rules
 _V5PLUS_NESTED_RULE_RE = re.compile(
     r'\(\s*(?:' + '|'.join(sorted(V5PLUS_ONLY_RULE_TYPES)) + r')\s*,'
@@ -409,30 +413,28 @@ def format_include_list(entries):
     return "#!include " + ", ".join(entries)
 
 
-def extract_rule_policy(line):
-    """Return the policy target from a rule line, or None if not a rule.
+def _rule_policy_index(tokens):
+    """Return the index of the policy among a rule line's top-level tokens,
+    or 0 if none is found.
 
-    Walks top-level comma-separated tokens from the end, skipping known
-    trailing option keywords and key=value option pairs; the first remaining
-    token is the policy.
+    Walks from the end, skipping known trailing option keywords and
+    key=value option pairs; the first remaining token is the policy.
     """
+    i = len(tokens) - 1
+    while i > 0 and (tokens[i] in RULE_TRAILING_OPTIONS
+                     or ("=" in tokens[i] and not tokens[i].startswith('"'))):
+        i -= 1
+    return i
+
+
+def extract_rule_policy(line):
+    """Return the policy target from a rule line, or None if not a rule."""
     stripped = line.lstrip()
     if not stripped or stripped.startswith("#") or stripped.startswith("["):
         return None
     tokens = _split_top_level_commas(stripped)
-    if len(tokens) < 2:
-        return None
-    i = len(tokens) - 1
-    while i > 0:
-        t = tokens[i]
-        if t in RULE_TRAILING_OPTIONS:
-            i -= 1
-            continue
-        if "=" in t and not t.startswith('"'):
-            i -= 1
-            continue
-        return t
-    return None
+    i = _rule_policy_index(tokens)
+    return tokens[i] if i > 0 else None
 
 
 def remove_proxy_params(line, params_to_remove):
@@ -573,7 +575,22 @@ def transform_rule_line(line, stats, filename, line_num, section):
         stats.add_change(filename, line_num, section, "注释", stripped)
         return comment_line(line)
 
-    return line
+    # Strip v5+ only options after the policy, e.g.
+    # RULE-SET,<url>,REJECT,extended-matching → RULE-SET,<url>,REJECT
+    tokens = _split_top_level_commas(stripped)
+    i = _rule_policy_index(tokens)
+    if i == 0:
+        return line
+    options = tokens[i + 1:]
+    removed = [t for t in options if t in V5PLUS_ONLY_RULE_OPTIONS]
+    if not removed:
+        return line
+    kept = tokens[:i + 1] + [t for t in options if t not in V5PLUS_ONLY_RULE_OPTIONS]
+    rule = ",".join(kept)
+    stats.count_params(filename, len(removed))
+    for opt in removed:
+        stats.add_change(filename, line_num, section, "移除参数", f"{opt} ({rule})")
+    return line[:len(line) - len(stripped)] + rule
 
 
 def transform_general_line(line, stats, filename, line_num, section):
