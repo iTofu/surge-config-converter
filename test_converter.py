@@ -2062,13 +2062,15 @@ class TestFinalRuleCascade:
 
 class TestSnellVersionBoundary:
     def test_version_50_not_downgraded(self):
-        """version=50 must NOT be matched by the \\b boundary."""
+        """version=50 must NOT be matched by the \\b boundary; like any
+        version above 5 it has no v4 equivalent and is disabled instead."""
         result = convert("""
             [Proxy]
             S1 = snell, x.com, 443, psk=pwd, version=50
         """)
         assert "version=50" in result
         assert "version=4" not in result
+        assert result.splitlines()[1].startswith("# [V5+] S1 = snell")
 
     def test_version_5_end_of_line(self):
         """version=5 at the very end of the line."""
@@ -2090,6 +2092,90 @@ class TestSnellVersionBoundary:
         assert "shadow-tls-version=2" in result
         assert "shadow-tls-version=3" not in result
         assert "shadow-tls-password=abc" in result
+
+
+# --- T37b: Snell version=6+ has no v4 equivalent: disabled like anytls ---
+
+class TestSnellVersion6:
+    def test_version6_commented(self):
+        stats = ConversionStats()
+        result = convert("""
+            [Proxy]
+            S6 = snell, x.com, 443, psk=pwd, version=6
+            S5 = snell, y.com, 443, psk=pwd, version=5
+        """, stats=stats)
+        lines = result.splitlines()
+        assert lines[1] == "# [V5+] S6 = snell, x.com, 443, psk=pwd, version=6"
+        assert lines[2] == "S5 = snell, y.com, 443, psk=pwd, version=4"
+        assert stats.lines_commented == 1
+        assert ("注释", "S6 (snell version=6)") in [(c[3], c[4]) for c in stats.changes]
+
+    def test_version_7_also_commented(self):
+        result = convert("""
+            [Proxy]
+            S7 = snell, x.com, 443, psk=pwd, version=7
+        """)
+        assert result.splitlines()[1].startswith("# [V5+] S7 = snell")
+
+    def test_shadow_tls_version_not_mistaken_for_snell_version(self):
+        result = convert("""
+            [Proxy]
+            S = snell, x.com, 443, psk=pwd, version=4, shadow-tls-version=6
+        """)
+        assert not result.splitlines()[1].startswith("#")
+
+    def test_non_snell_version_param_ignored(self):
+        result = convert("""
+            [Proxy]
+            T = trojan, x.com, 443, password=pwd, version=6
+        """)
+        assert not result.splitlines()[1].startswith("#")
+
+    def test_cross_file_cascade(self, tmp_path):
+        """A v6 node cascades exactly like an anytls node: removed from
+        groups, emptied groups and their rules commented."""
+        nodes = tmp_path / "nodes.dconf"
+        nodes.write_text(
+            "S6 = snell, 1.2.3.4, 443, psk=pwd, version=6\n"
+            "S5 = snell, 5.6.7.8, 443, psk=pwd, version=5\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "#!include nodes.dconf\n"
+            "[Proxy Group]\n"
+            "Mixed = select, S6, S5\n"
+            "Only6 = select, S6\n"
+            "[Rule]\n"
+            "DOMAIN,a.com,Only6\n"
+            "DOMAIN,b.com,Mixed\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        nodes_out = (tmp_path / "v4" / "nodes-v4.dconf").read_text().splitlines()
+        assert nodes_out[0] == "# [V5+] S6 = snell, 1.2.3.4, 443, psk=pwd, version=6"
+        assert nodes_out[1] == "S5 = snell, 5.6.7.8, 443, psk=pwd, version=4"
+        main_out = (tmp_path / "v4" / "main-v4.conf").read_text().splitlines()
+        assert "Mixed = select, S5" in main_out
+        assert "# [V5+ cascade] Only6 = select" in main_out
+        assert "# [V5+ cascade] DOMAIN,a.com,Only6" in main_out
+        assert "DOMAIN,b.com,Mixed" in main_out
+
+    def test_commented_version6_left_verbatim(self, tmp_path):
+        """Already disabled by the user: no v4 rewrite, no extra tag."""
+        nodes = tmp_path / "nodes.dconf"
+        nodes.write_text(
+            "# OFF = snell, 1.2.3.4, 443, psk=pwd, version=6\n"
+            "LIVE = snell, 5.6.7.8, 443, psk=pwd, version=5\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy]\n#!include nodes.dconf\n")
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        out = (tmp_path / "v4" / "nodes-v4.dconf").read_text().splitlines()
+        assert out[0] == "# OFF = snell, 1.2.3.4, 443, psk=pwd, version=6"
+        assert out[1] == "LIVE = snell, 5.6.7.8, 443, psk=pwd, version=4"
+        assert stats.lines_commented == 0
 
 
 # --- T38: Proxy name extraction with special characters ---

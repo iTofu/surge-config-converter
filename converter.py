@@ -41,6 +41,12 @@ from send2trash import send2trash
 # Proxy types not supported in Surge v4
 V5PLUS_ONLY_PROXY_TYPES = {"hysteria2", "hy2", "anytls", "tuic", "trust-tunnel"}
 
+# Snell versions above this have no v4 equivalent: v4 speaks up to version=4,
+# version=5 is down-converted to 4, version=6+ nodes are disabled like the
+# v5+ only types above. The lookbehind keeps shadow-tls-version=N out.
+SNELL_MAX_V4_VERSION = 5
+_SNELL_VERSION_RE = re.compile(r'(?<![\w-])version\s*=\s*(\d+)')
+
 # Sections that should be entirely commented out in v4
 V5PLUS_ONLY_SECTIONS = {"Port Forwarding", "Body Rewrite"}
 
@@ -454,6 +460,21 @@ def remove_proxy_params(line, params_to_remove):
     return line, removed
 
 
+def v5plus_only_proxy_reason(line):
+    """Why an uncommented proxy line cannot exist in v4 at all, or None.
+
+    Covers v5+ only proxy types and snell versions with no v4 equivalent.
+    """
+    proxy_type = extract_proxy_type(line)
+    if proxy_type in V5PLUS_ONLY_PROXY_TYPES:
+        return proxy_type
+    if proxy_type == "snell":
+        m = _SNELL_VERSION_RE.search(line)
+        if m and int(m.group(1)) > SNELL_MAX_V4_VERSION:
+            return f"snell version={m.group(1)}"
+    return None
+
+
 def transform_proxy_line(line, stats, filename, line_num, section):
     """Transform a single proxy line in [Proxy] section."""
     proxy_type = extract_proxy_type(line)
@@ -462,10 +483,11 @@ def transform_proxy_line(line, stats, filename, line_num, section):
 
     name = line.split('=', 1)[0].strip()
 
-    # Comment out v5+ only proxy types
-    if proxy_type in V5PLUS_ONLY_PROXY_TYPES:
+    # Comment out proxies v4 cannot use (v5+ only types, snell version=6+)
+    reason = v5plus_only_proxy_reason(line)
+    if reason:
         stats.count_commented(filename)
-        stats.add_change(filename, line_num, section, "注释", f"{name} ({proxy_type})")
+        stats.add_change(filename, line_num, section, "注释", f"{name} ({reason})")
         return comment_line(line)
 
     modified = line
@@ -519,8 +541,9 @@ def transform_commented_proxy_line(line, stats, filename, line_num, section):
     """Apply the proxy-line transforms to a commented-out node, keeping the
     comment prefix verbatim, so uncommenting it in v4 yields a v4-valid node.
 
-    Free-form comments, converter tags and v5+ only types (already disabled;
-    a "# [V5+]" tag on top would add nothing) are returned unchanged.
+    Free-form comments, converter tags and nodes v4 cannot use (v5+ only
+    types, snell version=6+: already disabled; a "# [V5+]" tag on top would
+    add nothing) are returned unchanged.
     """
     if line.startswith(("# [V5+] ", CASCADE_TAG)):
         return line
@@ -528,7 +551,7 @@ def transform_commented_proxy_line(line, stats, filename, line_num, section):
     if not m:
         return line
     prefix, body = line[:m.end()], line[m.end():]
-    if not is_proxy_definition(body) or extract_proxy_type(body) in V5PLUS_ONLY_PROXY_TYPES:
+    if not is_proxy_definition(body) or v5plus_only_proxy_reason(body):
         return line
     return prefix + transform_proxy_line(body, stats, filename, line_num, section)
 
