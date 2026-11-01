@@ -14,8 +14,10 @@ pip3 install -r requirements.txt   # 运行只需 send2trash，测试另需 pyte
 ## 使用
 
 ```bash
-python3 converter.py <config_file_path>
+python3 converter.py [--snell-legacy PATH] <config_file_path>
 ```
+
+`--snell-legacy` 可选，见下文「Snell 旧版实例覆盖」。
 
 示例：
 
@@ -57,11 +59,29 @@ Documents/
 | `tuic` | 注释（iOS 5.2.0+） |
 | `trust-tunnel` | 注释（Mac 6.4.4+） |
 | Snell `version=5` | 替换为 `version=4` |
-| Snell `version=6` 及以上 | 注释（v4 无对应版本） |
+| Snell `version=6` 及以上 | 注释（v4 无对应版本）；配了旧版实例覆盖的文件改写为 `version=4`，见下文 |
 | `shadow-tls-version=3` | 替换为 `shadow-tls-version=2` |
 | `port-hopping` / `port-hopping-interval` / `ecn` | 移除参数 |
 
 被注释掉的节点行（`#` / `;` / `//` 开头，可重复、可带空格）在产出的 `-v4` 文件里按上表同样改参数，注释前缀原样保留，取消注释即可在 v4 使用；v5+ 独有协议与 Snell `version=6` 及以上的注释行本已停用，原样保留。去掉前缀后必须是完整的 `名称 = 类型, host, port, key=value...` 才转换，其余注释文字一律原样。注释行不参与「是否需要转换」的判定：只有注释行变化时不产出 `v4/`，也不会因此放弃托管配置。
+
+### Snell 旧版实例覆盖（可选）
+
+Snell v6 server 不兼容 v4 客户端，同一端口也不能同时跑两个版本，所以只改 `version` 得不到能用的 v4 节点。如果服务端另开了一个旧版 snell 实例（独立端口、独立 PSK，可能还有独立 host），可以用覆盖文件告诉转换器怎么连它：
+
+```ini
+# 每个 section 名是源配置文件的 basename
+[my-vps.dconf]
+port = 8444
+psk = <legacy-psk>
+# server = legacy.example.com
+```
+
+- 允许的键只有 `server`、`port`、`psk`，都可选、至少一个，键名区分大小写；`%` 不做插值。未知键、空值、含逗号或换行的值、非数字端口都会报错退出，报错信息不含取值
+- 加载顺序：命令行 `--snell-legacy PATH`；未给时若存在 `${XDG_CONFIG_HOME:-~/.config}/surge-config-converter/snell-legacy.ini` 则自动加载；都没有则功能关闭，行为与不支持此功能时完全一致
+- 文件含凭证，权限宽于 `0600` 时打印警告。运行日志只出现文件名、节点名、计数和被替换的键名，不出现 server / psk 的值
+- 命中 section 的源文件里，未注释的 Snell `version=6` 及以上节点不注释：`version` 改为 `4`，并替换给出的 `server` / `port` / `psk` 字段，其余字段逐字节不变（含空格风格），所在策略组与规则不级联；改写后的行继续走上表的常规转换（如 `shadow-tls-version=3` 降为 `2`）
+- 未命中的文件照旧注释并级联；已注释的 v6 节点原样保留；`version=5` 节点照旧只降为 `4`；其他 v5+ 独有协议照旧注释
 
 ### 策略组（[Proxy Group]）
 

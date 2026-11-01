@@ -27,6 +27,12 @@ from converter import (
 
 # --- Helpers ---
 
+@pytest.fixture(autouse=True)
+def _isolated_config_home(tmp_path_factory, monkeypatch):
+    """Keep main() away from the real default snell legacy override file."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path_factory.mktemp("xdg")))
+
+
 def convert(text, base_dir="/tmp", stats=None, processed_files=None, filename=""):
     """Shorthand for convert_content with defaults."""
     if stats is None:
@@ -3827,3 +3833,170 @@ class TestV5OnlyRuleOptions:
             (2, "Rule", "移除参数", "extended-matching (DOMAIN,a.com,DIRECT)"),
             (2, "Rule", "移除参数", "pre-matching (DOMAIN,a.com,DIRECT)"),
         ]
+
+
+# --- T80: optional snell legacy override (extra v4-compatible server instance) ---
+
+class TestSnellLegacyOverride:
+    PSK = "FAKE-LEGACY-PSK-0000"
+    HOST = "legacy.fake.example"
+    V6 = "S6 = snell,  v6.fake.example , 6000 ,psk = FAKE-V6-PSK,  version = 6, tfo=true"
+
+    def _run(self, tmp_path, nodes_text, legacy, nodes_name="nodes.dconf"):
+        (tmp_path / nodes_name).write_text(nodes_text)
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            f"#!include {nodes_name}\n"
+            "[Proxy Group]\n"
+            "G6 = select, S6\n"
+            "[Rule]\n"
+            "DOMAIN,a.com,G6\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None}, snell_legacy=legacy)
+        stem, ext = nodes_name.rsplit(".", 1)
+        nodes_out = (tmp_path / "v4" / f"{stem}-v4.{ext}").read_text().splitlines()
+        main_out = (tmp_path / "v4" / "main-v4.conf").read_text().splitlines()
+        return nodes_out, main_out, stats
+
+    def test_all_fields_replaced_rest_verbatim(self, tmp_path):
+        legacy = {"nodes.dconf": {"server": self.HOST, "port": "7000", "psk": self.PSK}}
+        nodes, main, stats = self._run(tmp_path, self.V6 + "\n", legacy)
+        assert nodes[0] == (
+            f"S6 = snell,  {self.HOST} , 7000 ,psk = {self.PSK},  version = 4, tfo=true")
+        assert "G6 = select, S6" in main
+        assert "DOMAIN,a.com,G6" in main
+        assert stats.lines_commented == 0
+        logged = repr(stats.changes)
+        assert self.PSK not in logged and self.HOST not in logged
+
+    @pytest.mark.parametrize("key, value, expected", [
+        ("server", "legacy.fake.example",
+         "S6 = snell,  legacy.fake.example , 6000 ,psk = FAKE-V6-PSK,  version = 4, tfo=true"),
+        ("port", "7000",
+         "S6 = snell,  v6.fake.example , 7000 ,psk = FAKE-V6-PSK,  version = 4, tfo=true"),
+        ("psk", "FAKE-LEGACY-PSK-0000",
+         "S6 = snell,  v6.fake.example , 6000 ,psk = FAKE-LEGACY-PSK-0000,  version = 4, tfo=true"),
+    ])
+    def test_single_field(self, tmp_path, key, value, expected):
+        nodes, _, _ = self._run(tmp_path, self.V6 + "\n", {"nodes.dconf": {key: value}})
+        assert nodes[0] == expected
+
+    def test_partial_keys(self, tmp_path):
+        legacy = {"nodes.dconf": {"port": "7000", "psk": self.PSK}}
+        nodes, _, _ = self._run(tmp_path, self.V6 + "\n", legacy)
+        assert nodes[0] == (
+            f"S6 = snell,  v6.fake.example , 7000 ,psk = {self.PSK},  version = 4, tfo=true")
+
+    def test_rewritten_line_gets_normal_v4_transforms(self, tmp_path):
+        line = "S6 = snell, h.example, 6000, psk=x, version=6, shadow-tls-version=3, ecn=true\n"
+        nodes, _, _ = self._run(tmp_path, line, {"nodes.dconf": {"port": "7000"}})
+        assert nodes[0] == "S6 = snell, h.example, 7000, psk=x, version=4, shadow-tls-version=2"
+
+    def test_unmatched_file_still_commented_and_cascades(self, tmp_path):
+        legacy = {"other.dconf": {"port": "7000", "psk": self.PSK}}
+        nodes, main, _ = self._run(tmp_path, self.V6 + "\n", legacy)
+        assert nodes[0] == "# [V5+] " + self.V6
+        assert any(l.startswith("# [V5+ cascade] G6 = select") for l in main)
+        assert "# [V5+ cascade] DOMAIN,a.com,G6" in main
+
+    def test_commented_v6_and_v5_and_other_types(self, tmp_path):
+        text = (
+            "# OFF = snell, 1.2.3.4, 6000, psk=FAKE-OFF, version=6\n"
+            "S5 = snell, 5.6.7.8, 5000, psk=FAKE-V5, version=5\n"
+            "HY = hysteria2, 9.9.9.9, 443, password=FAKE-HY\n"
+            + self.V6 + "\n"
+        )
+        nodes, _, _ = self._run(tmp_path, text, {"nodes.dconf": {"port": "7000"}})
+        assert nodes[0] == "# OFF = snell, 1.2.3.4, 6000, psk=FAKE-OFF, version=6"
+        assert nodes[1] == "S5 = snell, 5.6.7.8, 5000, psk=FAKE-V5, version=4"
+        assert nodes[2] == "# [V5+] HY = hysteria2, 9.9.9.9, 443, password=FAKE-HY"
+        assert ", 7000 ," in nodes[3]
+
+    def test_no_override_matches_default_behaviour(self, tmp_path):
+        plain_dir, legacy_dir = tmp_path / "a", tmp_path / "b"
+        plain_dir.mkdir(), legacy_dir.mkdir()
+        assert (self._run(plain_dir, self.V6 + "\n", None)[:2]
+                == self._run(legacy_dir, self.V6 + "\n", {})[:2])
+        nodes, _, _ = self._run(plain_dir, self.V6 + "\n", None)
+        assert nodes[0] == "# [V5+] " + self.V6
+
+
+class TestSnellLegacyLoading:
+    PSK = "FAKE-LEGACY-PSK-0000"
+
+    def _write(self, path, text, mode=0o600):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        path.chmod(mode)
+        return path
+
+    def _main(self, monkeypatch, *argv):
+        from converter import main as converter_main
+        monkeypatch.setattr("sys.argv", ["converter.py", *argv])
+        converter_main()
+
+    def _profile(self, tmp_path):
+        (tmp_path / "srv.dconf").write_text(
+            "S6 = snell, v6.fake.example, 6000, psk=FAKE-V6-PSK, version=6\n")
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy]\n#!include srv.dconf\n")
+        return main
+
+    def test_parse_keeps_case_and_percent(self, tmp_path):
+        from converter import load_snell_legacy
+        f = self._write(tmp_path / "o.ini", "[Work.dconf]\nport = 7000\npsk = a%b\n")
+        assert load_snell_legacy(str(f)) == {"Work.dconf": {"port": "7000", "psk": "a%b"}}
+
+    @pytest.mark.parametrize("text", [
+        f"[x.dconf]\npsk = {PSK}\npassword = {PSK}\n",          # unknown key
+        "[x.dconf]\n",                                           # no keys
+        f"[x.dconf]\nport = {PSK}\n",                            # non-numeric port
+        f"[x.dconf]\npsk = {PSK},x\n",                           # comma breaks the line
+        f"{PSK}\n",                                              # no section header
+        f"[x.dconf]\n{PSK}\n",                                   # line without '='
+    ])
+    def test_invalid_file_exits_without_echoing_values(self, tmp_path, capsys, text):
+        from converter import load_snell_legacy
+        f = self._write(tmp_path / "o.ini", text)
+        with pytest.raises(SystemExit) as exc:
+            load_snell_legacy(str(f))
+        captured = capsys.readouterr()
+        assert self.PSK not in str(exc.value) + captured.out + captured.err
+
+    def test_default_path_autoloaded(self, tmp_path, monkeypatch, capsys):
+        xdg = tmp_path / "xdg"
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+        self._write(xdg / "surge-config-converter" / "snell-legacy.ini",
+                    f"[srv.dconf]\nserver = legacy.fake.example\npsk = {self.PSK}\n")
+        main = self._profile(tmp_path)
+        self._main(monkeypatch, str(main))
+        out = (tmp_path / "v4" / "srv-v4.dconf").read_text()
+        assert out == f"S6 = snell, legacy.fake.example, 6000, psk={self.PSK}, version=4\n"
+        captured = capsys.readouterr()
+        assert "snell-legacy.ini" in captured.out
+        for secret in (self.PSK, "legacy.fake.example"):
+            assert secret not in captured.out + captured.err
+
+    def test_explicit_path_and_no_default(self, tmp_path, monkeypatch, capsys):
+        f = self._write(tmp_path / "custom.ini", "[srv.dconf]\nport = 7000\n")
+        main = self._profile(tmp_path)
+        self._main(monkeypatch, "--snell-legacy", str(f), str(main))
+        assert ", 7000," in (tmp_path / "v4" / "srv-v4.dconf").read_text()
+
+    def test_no_file_feature_off(self, tmp_path, monkeypatch, capsys):
+        main = self._profile(tmp_path)
+        self._main(monkeypatch, str(main))
+        out = (tmp_path / "v4" / "srv-v4.dconf").read_text()
+        assert out.startswith("# [V5+] S6 = snell")
+        assert "snell" not in capsys.readouterr().err
+
+    @pytest.mark.parametrize("mode, warned", [(0o600, False), (0o400, False), (0o644, True)])
+    def test_permission_warning(self, tmp_path, capsys, mode, warned):
+        from converter import load_snell_legacy
+        f = self._write(tmp_path / "o.ini", f"[x.dconf]\npsk = {self.PSK}\n", mode)
+        load_snell_legacy(str(f))
+        captured = capsys.readouterr()
+        assert ("权限宽于 0600" in captured.err) is warned
+        assert self.PSK not in captured.out + captured.err

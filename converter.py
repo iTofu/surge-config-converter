@@ -2,7 +2,7 @@
 """Surge v5+ -> v4 configuration converter.
 
 Usage:
-    python3 converter.py <input_file_path>
+    python3 converter.py [--snell-legacy PATH] <input_file_path>
 
 Output layout:
     All generated -v4 files are written to a v4/ subdirectory next to
@@ -29,6 +29,8 @@ Limitation:
     sub-directories would collide.
 """
 
+import argparse
+import configparser
 import os
 import re
 import sys
@@ -46,6 +48,18 @@ V5PLUS_ONLY_PROXY_TYPES = {"hysteria2", "hy2", "anytls", "tuic", "trust-tunnel"}
 # v5+ only types above. The lookbehind keeps shadow-tls-version=N out.
 SNELL_MAX_V4_VERSION = 5
 _SNELL_VERSION_RE = re.compile(r'(?<![\w-])version\s*=\s*(\d+)')
+
+# Optional per-file override for servers that run an extra v4-compatible snell
+# instance next to the version=6+ one (own port / PSK, maybe own host). Live
+# version=6+ nodes of a matching source file are rewritten to version=4 with
+# these fields instead of being disabled. Group 1 of each regex spans the
+# value; every other byte of the line is kept.
+_SNELL_LEGACY_FIELD_RES = {
+    "server": re.compile(r'^[^=]+=[^,]*,\s*([^,]*?)\s*(?=,)'),
+    "port": re.compile(r'^[^=]+=[^,]*,[^,]*,\s*([^,]*?)\s*(?=,|$)'),
+    "psk": re.compile(r'(?<![\w-])psk\s*=\s*([^,]*?)\s*(?=,|$)'),
+}
+SNELL_LEGACY_FILENAME = "snell-legacy.ini"
 
 # Sections that should be entirely commented out in v4
 V5PLUS_ONLY_SECTIONS = {"Port Forwarding", "Body Rewrite"}
@@ -475,16 +489,42 @@ def v5plus_only_proxy_reason(line):
     return None
 
 
-def transform_proxy_line(line, stats, filename, line_num, section):
-    """Transform a single proxy line in [Proxy] section."""
+def _replace_group(regex, line, value):
+    """Replace regex group 1 of its first match with value (no match: as is)."""
+    m = regex.search(line)
+    return line if m is None else line[:m.start(1)] + value + line[m.end(1):]
+
+
+def snell_legacy_line(line, legacy):
+    """Point a snell version=6+ node at the server's v4-compatible instance:
+    version becomes 4 and each overridden field takes its value."""
+    line = _replace_group(_SNELL_VERSION_RE, line, "4")
+    for key, value in legacy.items():
+        line = _replace_group(_SNELL_LEGACY_FIELD_RES[key], line, value)
+    return line
+
+
+def transform_proxy_line(line, stats, filename, line_num, section, legacy=None):
+    """Transform a single proxy line in [Proxy] section.
+
+    legacy: this file's snell override ({field: value}) or None. Only field
+    names ever reach the change log, never values.
+    """
     proxy_type = extract_proxy_type(line)
     if not proxy_type:
         return line
 
     name = line.split('=', 1)[0].strip()
 
-    # Comment out proxies v4 cannot use (v5+ only types, snell version=6+)
+    # Comment out proxies v4 cannot use (v5+ only types, snell version=6+),
+    # unless the file's server keeps a v4-compatible snell instance.
     reason = v5plus_only_proxy_reason(line)
+    if reason and legacy and proxy_type == "snell":
+        line = snell_legacy_line(line, legacy)
+        stats.count_params(filename, 1 + len(legacy))
+        stats.add_change(filename, line_num, section, f"{reason} → version=4",
+                         f"{name} (旧版实例: {', '.join(legacy)})")
+        reason = None
     if reason:
         stats.count_commented(filename)
         stats.add_change(filename, line_num, section, "注释", f"{name} ({reason})")
@@ -631,7 +671,8 @@ def transform_general_line(line, stats, filename, line_num, section):
     return line
 
 
-def convert_content(content, base_dir, stats, processed_files, default_section=None, filename=""):
+def convert_content(content, base_dir, stats, processed_files, default_section=None, filename="",
+                    legacy=None):
     """Convert configuration content from v5+ to v4 format (direct hits only).
 
     Args:
@@ -640,6 +681,7 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
         default_section: If set, treat lines before any [Section] header
                          as belonging to this section. Used for included files
                          that lack section headers.
+        legacy: this file's snell override, see transform_proxy_line.
 
     Returns the converted content string.
     """
@@ -692,7 +734,8 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
         if current_section == "General":
             result.append(transform_general_line(line, stats, filename, line_num, current_section))
         elif current_section == "Proxy":
-            result.append(transform_proxy_line(line, stats, filename, line_num, current_section))
+            result.append(transform_proxy_line(
+                line, stats, filename, line_num, current_section, legacy))
         elif current_section == "Proxy Group":
             result.append(transform_proxy_group_line(line, stats, filename, line_num, current_section))
         elif current_section == "Rule":
@@ -714,8 +757,9 @@ class Pipeline:
     shared dict — this is what makes cross-file cascade cleanup possible.
     """
 
-    def __init__(self, stats, processed_files=None):
+    def __init__(self, stats, processed_files=None, snell_legacy=None):
         self.stats = stats
+        self.snell_legacy = snell_legacy or {}  # source basename → {field: value}
         self.files = {}  # abs_path → FileState (insertion order = discovery order)
         self.processed_files = processed_files if processed_files is not None else {}
         self.abandoned_files = set()    # absolute paths of managed files we refused
@@ -759,10 +803,12 @@ class Pipeline:
         self.files[abs_path] = state
 
         base_dir = os.path.dirname(abs_path)
+        basename = os.path.basename(abs_path)
         state.converted = convert_content(
             original, base_dir, self.stats, self.processed_files,
             default_section=default_section,
-            filename=os.path.basename(abs_path),
+            filename=basename,
+            legacy=self.snell_legacy.get(basename),
         )
 
         # Populate cascade fields: split into mutable lines, sectionize, and
@@ -1396,12 +1442,14 @@ class Pipeline:
         return self.emit()
 
 
-def convert_file(input_path, stats=None, processed_files=None, default_section=None):
+def convert_file(input_path, stats=None, processed_files=None, default_section=None,
+                 snell_legacy=None):
     """Convert a Surge config file from v5+ to v4 (top-level entry point).
 
     Creates a Pipeline, runs discover → analyze → emit over this file and
     every transitively referenced local file, and returns the root file's
-    output path (or None if abandoned / unchanged).
+    output path (or None if abandoned / unchanged). snell_legacy is the
+    table from load_snell_legacy (None: feature off).
     """
     if stats is None:
         stats = ConversionStats()
@@ -1414,19 +1462,71 @@ def convert_file(input_path, stats=None, processed_files=None, default_section=N
             print(f"错误: 文件不存在: {input_path}", file=sys.stderr)
         sys.exit(1)
 
-    pipeline = Pipeline(stats, processed_files)
+    pipeline = Pipeline(stats, processed_files, snell_legacy)
     return pipeline.run(input_path, default_section=default_section)
 
 
-def main():
-    if len(sys.argv) != 2:
-        print(f"用法: {sys.argv[0]} <input_file_path>", file=sys.stderr)
-        sys.exit(1)
+def default_snell_legacy_path():
+    """${XDG_CONFIG_HOME:-~/.config}/surge-config-converter/snell-legacy.ini"""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "surge-config-converter", SNELL_LEGACY_FILENAME)
 
-    input_path = sys.argv[1]
+
+def _check_legacy_section(path, name, fields):
+    """Exit on a malformed section. Messages name keys, never values."""
+    unknown = sorted(set(fields) - set(_SNELL_LEGACY_FIELD_RES))
+    if unknown or not fields:
+        sys.exit(f"错误: {path} [{name}] 只允许 server / port / psk 且至少一个"
+                 f"（未知键: {', '.join(unknown) or '无'}）")
+    for key, value in fields.items():
+        if not value or "," in value or "\n" in value or (key == "port" and not value.isdigit()):
+            sys.exit(f"错误: {path} [{name}] 的 {key} 取值无效（不能为空、含逗号或换行，port 须为数字）")
+
+
+def load_snell_legacy(path):
+    """Parse a snell legacy override file into {source basename: {field: value}}.
+
+    INI sections are source basenames; keys are server / port / psk. Parse
+    errors report only the exception type: configparser messages quote the
+    offending line, which may hold a secret.
+    """
+    parser = configparser.RawConfigParser()
+    parser.optionxform = str
+    try:
+        mode = os.stat(path).st_mode
+        with open(path, encoding="utf-8") as f:
+            parser.read_file(f)
+    except (OSError, UnicodeDecodeError, configparser.Error) as e:
+        sys.exit(f"错误: 无法读取 snell 旧版覆盖文件: {path} ({type(e).__name__})")
+    if mode & 0o177:
+        print(f"警告: {path} 权限宽于 0600，建议 chmod 600", file=sys.stderr)
+    table = {name: dict(parser.items(name)) for name in parser.sections()}
+    for name, fields in table.items():
+        _check_legacy_section(path, name, fields)
+    print(f"已加载 snell 旧版覆盖: {path}（{len(table)} 个文件）")
+    return table
+
+
+def resolve_snell_legacy(arg_path):
+    """Explicit --snell-legacy path, else the default path if it exists, else None."""
+    if arg_path:
+        return load_snell_legacy(arg_path)
+    default = default_snell_legacy_path()
+    return load_snell_legacy(default) if os.path.isfile(default) else None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Surge v5+ → v4 配置转换")
+    parser.add_argument("input_path")
+    parser.add_argument("--snell-legacy", metavar="PATH",
+                        help=f"snell 旧版覆盖文件（默认 {default_snell_legacy_path()}，存在才加载）")
+    args = parser.parse_args()
+
+    input_path = args.input_path
+    snell_legacy = resolve_snell_legacy(args.snell_legacy)
     stats = ConversionStats()
     processed_files = {os.path.abspath(input_path): None}
-    result = convert_file(input_path, stats, processed_files)
+    result = convert_file(input_path, stats, processed_files, snell_legacy=snell_legacy)
     if result is None and not stats.abandoned_files:
         print("未发现 v5+ 内容，无需转换。")
     stats.print_summary()
