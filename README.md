@@ -116,8 +116,8 @@ psk = <legacy-psk>
 | `[Port Forwarding]` | 整段注释 |
 | `[Body Rewrite]` | 整段注释 |
 | `[Tailscale <name>]` | 整段注释（iOS 5.20.0+ / Mac 6.7.0+） |
-| `[Ruleset <name>]` | 整段注释（内联规则集，Mac 5.3.1+）；若仍有活跃 `RULE-SET`（含 `AND`/`OR`/`NOT` 逻辑规则内嵌与本地嵌套规则集）引用，按根配置隔离命名导出为 `v4/<根名>-<规则集>-<hash>-ruleset-v4.list` 并改写引用；内置 `LAN` / `SYSTEM` 始终优先 |
-| `[Tailscale *]` / `[WireGuard *]` / `[Ruleset *]` | 整段注释（通配符 `#!include` 段，iOS 5.22.0+ / Mac 6.9.0+）；本地非托管 `[WireGuard *]` 展开为具名 `[WireGuard <name>]` `#!include`，本地非托管 `[Ruleset *]` 按需导出为外部规则集文件，无法保留或缺少 WireGuard 必需字段时级联清理受影响段落、节点与规则 |
+| `[Ruleset <name>]` | 整段注释（内联规则集，Mac 5.3.1+）；若仍有活跃 `RULE-SET`（含 `AND`/`OR`/`NOT` 逻辑规则内嵌与本地嵌套规则集）引用，按根配置隔离命名导出为 `v4/<根名>-<规则集>-<hash>-ruleset-v4.list` 并改写引用（共用规则子文件同步按根配置隔离）；内置 `LAN` / `SYSTEM` 始终优先；若规则集因裁剪 v5+ 条件而缩小且被 `NOT` 否定引用，则级联注释该否定规则避免扩大匹配范围 |
+| `[Tailscale *]` / `[WireGuard *]` / `[Ruleset *]` | 整段注释（通配符 `#!include` 段，iOS 5.22.0+ / Mac 6.9.0+）；本地非托管 `[WireGuard *]` 展开为具名 `[WireGuard <name>]` `#!include`，具名 WireGuard 段中的远端 `#!include` 一律剥离，本地非托管 `[Ruleset *]` 按需导出为外部规则集文件，无法保留或缺少 WireGuard 必需字段时级联清理受影响段落、节点与规则 |
 
 ### 引用文件
 

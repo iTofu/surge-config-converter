@@ -287,7 +287,7 @@ def compute_sections(lines, default_section=None):
     return result
 
 
-def has_effective_members(pgl, deleted_names, abandoned_basenames):
+def has_effective_members(pgl, deleted_names, abandoned_basenames, iog_decoded_lists=None):
     """Return True if the Proxy Group still has at least one valid member source.
 
     Valid sources:
@@ -296,16 +296,26 @@ def has_effective_members(pgl, deleted_names, abandoned_basenames):
       - include-other-group=<group> where <group> is not in deleted_names
       - policy-path=<file> where <file> is an HTTP URL, or a local file whose
         basename is NOT in abandoned_basenames
+
+    When iog_decoded_lists is provided (list of decoded group lists aligned
+    with include-other-group options in pgl.options), uses those cached lists
+    directly without re-decoding option text.
     """
     for m in pgl.members:
         if unquote(m) not in deleted_names:
             return True
+    iog_idx = 0
     for key, value in pgl.options:
         k = key.lower()
         if k == "include-all-proxies" and value.strip() in {"1", "true"}:
             return True
         if k == "include-other-group":
-            if any(g not in deleted_names for g in parse_include_other_groups(value)):
+            if iog_decoded_lists is not None and iog_idx < len(iog_decoded_lists):
+                groups = iog_decoded_lists[iog_idx]
+            else:
+                groups = parse_include_other_groups(value)
+            iog_idx += 1
+            if any(g not in deleted_names for g in groups):
                 return True
         if k == "policy-path":
             path_val = unquote(value.strip())
@@ -479,6 +489,9 @@ class FileState:
     has_unexpanded_wg_wildcard: bool = False
     has_unexpanded_ruleset_wildcard: bool = False
     managed_wildcard_targets: set = field(default_factory=set)    # managed files referenced via wildcard/ruleset include
+    wg_lost_remote: set = field(default_factory=set)              # WireGuard sections whose remote #!include was stripped
+    iog_sources: dict = field(default_factory=dict)               # line_idx → [(orig_groups, was_quoted, had_v5_escape)]
+    pending_iog_lines: set = field(default_factory=set)           # line_idx needing final v4 include-other-group writeback
     deleted_names: set = field(default_factory=set)    # names removed (propagates cascade)
     self_deleted: set = field(default_factory=set)     # subset killed by THIS file's own line
 
@@ -678,9 +691,10 @@ def _strip_outer_parens(s, start, end):
     return (start + 1, end - 1) if depth == 0 else None
 
 
-def _collect_logical_ruleset_spans(body, start, end, refs):
-    """Recursively collect (abs_start, abs_end, decoded_target) for every
-    (RULE-SET,<target>) criterion inside a logical rule's criteria block."""
+def _collect_logical_ruleset_spans(body, start, end, refs, negated=False):
+    """Recursively collect (abs_start, abs_end, decoded_target, is_negated)
+    for every (RULE-SET,<target>) criterion inside a logical rule's criteria
+    block, flipping negation polarity whenever descending into a NOT node."""
     inner = _strip_outer_parens(body, start, end)
     if inner is None:
         return
@@ -698,15 +712,18 @@ def _collect_logical_ruleset_spans(body, start, end, refs):
         if kind == "RULE-SET":
             r1_s, r1_e = sub_spans[1]
             abs_s, abs_e = c_start + r1_s, c_start + r1_e
-            refs.append((abs_s, abs_e, unquote(body[abs_s:abs_e].strip())))
+            refs.append((abs_s, abs_e, unquote(body[abs_s:abs_e].strip()), negated))
         elif kind in ("AND", "OR", "NOT"):
             r1_s, r1_e = sub_spans[1]
-            _collect_logical_ruleset_spans(body, c_start + r1_s, c_start + r1_e, refs)
+            next_neg = (not negated) if kind == "NOT" else negated
+            _collect_logical_ruleset_spans(
+                body, c_start + r1_s, c_start + r1_e, refs, negated=next_neg
+            )
 
 
 def _find_rule_ruleset_spans(body, require_policy=True):
-    """Return [(start, end, decoded_target), ...] for every RULE-SET target
-    in a rule body (top-level RULE-SET and nested inside AND/OR/NOT)."""
+    """Return [(start, end, decoded_target, is_negated), ...] for every
+    RULE-SET target in a rule body (top-level RULE-SET and inside AND/OR/NOT)."""
     refs = []
     min_tokens = 3 if require_policy else 2
     spans = _split_top_level_comma_spans(body, track_parens=True)
@@ -715,21 +732,28 @@ def _find_rule_ruleset_spans(body, require_policy=True):
     first = body[spans[0][0]:spans[0][1]].strip().upper()
     if first == "RULE-SET":
         s1, e1 = spans[1]
-        refs.append((s1, e1, unquote(body[s1:e1].strip())))
+        refs.append((s1, e1, unquote(body[s1:e1].strip()), False))
     elif first in ("AND", "OR", "NOT"):
-        _collect_logical_ruleset_spans(body, spans[1][0], spans[1][1], refs)
+        _collect_logical_ruleset_spans(
+            body, spans[1][0], spans[1][1], refs, negated=(first == "NOT")
+        )
     return refs
 
 
-def extract_rule_ruleset_targets(line):
-    """Return decoded RULE-SET targets referenced by a live [Rule] line
-    (both top-level RULE-SET and nested inside AND/OR/NOT)."""
+def extract_rule_ruleset_refs(line):
+    """Return [(decoded_target, is_negated), ...] referenced by a live [Rule]
+    line (top-level RULE-SET and nested inside AND/OR/NOT)."""
     stripped = line.lstrip()
     if (not stripped or _COMMENT_PREFIX_RE.match(stripped)
             or stripped.startswith("[") or stripped.startswith("#!")):
         return []
     body, _ = split_inline_comment(stripped)
-    return [target for _, _, target in _find_rule_ruleset_spans(body, require_policy=True)]
+    return [(target, neg) for _, _, target, neg in _find_rule_ruleset_spans(body, require_policy=True)]
+
+
+def extract_rule_ruleset_targets(line):
+    """Return decoded RULE-SET targets referenced by a live [Rule] line."""
+    return [target for target, _ in extract_rule_ruleset_refs(line)]
 
 
 def extract_ruleset_target(line):
@@ -754,7 +778,7 @@ def _replace_rule_ruleset_targets(line, replacements):
     if not refs:
         return line
     new_body = body
-    for s1, e1, decoded in reversed(refs):
+    for s1, e1, decoded, _ in reversed(refs):
         if decoded not in replacements:
             continue
         raw_seg = new_body[s1:e1]
@@ -843,16 +867,18 @@ def _expand_ruleset_for_v4(rs_name, available_rulesets, visited=None):
     """Expand an inline [Ruleset <rs_name>] tree into v4 external ruleset text.
 
     Recursively inlines nested `RULE-SET,<Inner>` referencing other local inline
-    rulesets. Returns (converted_text, None) on success, or (None, reason) if
-    the ruleset contains a v5+/v6 nested RULE-SET / DOMAIN-SET / cycle / logical
-    RULE-SET condition that Surge v4 external .list files cannot express.
+    rulesets. Returns (converted_text, err, lost_matchers):
+      - err is None on success, or a reason string when v4 cannot express the tree.
+      - lost_matchers is True if any v5+-only rule was commented out (narrowing
+        the ruleset, which makes negated NOT references unsafe to keep).
     """
     if visited is None:
         visited = set()
     if rs_name in visited:
-        return None, f"规则集 {rs_name} 存在循环嵌套引用"
+        return None, f"规则集 {rs_name} 存在循环嵌套引用", False
     next_visited = visited | {rs_name}
     out = []
+    lost_matchers = False
     for line in available_rulesets[rs_name]:
         stripped = line.lstrip()
         if not stripped or _COMMENT_PREFIX_RE.match(stripped) or stripped.startswith("#!"):
@@ -863,6 +889,7 @@ def _expand_ruleset_for_v4(rs_name, available_rulesets, visited=None):
         rule_type = tokens[0].upper() if len(tokens) >= 2 else ""
         if rule_type in V5PLUS_ONLY_RULE_TYPES or _V5PLUS_NESTED_RULE_RE.search(body):
             out.append(comment_line(line))
+            lost_matchers = True
             continue
         if rule_type == "RULE-SET":
             nested_target = unquote(tokens[1])
@@ -871,22 +898,23 @@ def _expand_ruleset_for_v4(rs_name, available_rulesets, visited=None):
                 return None, (
                     f"嵌套规则集 RULE-SET,{nested_target} 带附加选项"
                     f" ({', '.join(extra_opts)}) 无法等价展开到 v4 外部规则集"
-                )
+                ), False
             if (nested_target.upper() not in BUILTIN_RULESETS
                     and nested_target in available_rulesets):
-                sub_text, err = _expand_ruleset_for_v4(
+                sub_text, err, sub_lost = _expand_ruleset_for_v4(
                     nested_target, available_rulesets, next_visited
                 )
                 if err is not None:
-                    return None, err
+                    return None, err, False
+                lost_matchers = lost_matchers or sub_lost
                 if sub_text:
                     out.extend(sub_text.splitlines())
                 continue
-            return None, f"嵌套规则集 RULE-SET,{nested_target} 无法等价展开到 v4 外部规则集"
+            return None, f"嵌套规则集 RULE-SET,{nested_target} 无法等价展开到 v4 外部规则集", False
         if rule_type == "DOMAIN-SET":
-            return None, f"嵌套 {tokens[0]} 无法等价展开到 v4 外部规则集"
+            return None, f"嵌套 {tokens[0]} 无法等价展开到 v4 外部规则集", False
         if rule_type in ("AND", "OR", "NOT") and _find_rule_ruleset_spans(body, require_policy=False):
-            return None, "规则集内含逻辑规则嵌套 RULE-SET，无法等价展开到 v4 外部规则集"
+            return None, "规则集内含逻辑规则嵌套 RULE-SET，无法等价展开到 v4 外部规则集", False
         idx = len(tokens)
         while idx > 1 and (tokens[idx - 1] in RULE_TRAILING_OPTIONS
                            or ("=" in tokens[idx - 1] and not tokens[idx - 1].startswith('"'))):
@@ -898,12 +926,12 @@ def _expand_ruleset_for_v4(rs_name, available_rulesets, visited=None):
             out.append(indent + ",".join(kept) + trailing)
         else:
             out.append(line)
-    return "\n".join(out) + ("\n" if out else ""), None
+    return "\n".join(out) + ("\n" if out else ""), None, lost_matchers
 
 
 def convert_ruleset_lines(raw_lines):
     """Convert flat inline [Ruleset <name>] body lines into a v4 external ruleset."""
-    text, err = _expand_ruleset_for_v4("_inline", {"_inline": raw_lines})
+    text, err, _ = _expand_ruleset_for_v4("_inline", {"_inline": raw_lines})
     if err is not None:
         raise ValueError(err)
     return text
@@ -1218,6 +1246,7 @@ class Pipeline:
         self.dead_rulesets = set()      # inline ruleset names lost to abandonment/unresolvable
         self.ruleset_wildcard_sources = {}  # host abs_path → [target abs_path] from [Ruleset *]
         self.generated_rulesets = {}    # abs output path in v4/ → converted .list content
+        self.output_relnames = {}       # abs_path → custom root-scoped bare filename in v4/
         self.reachable = set()          # final root-reachable set, settled by analyze()
         self.emitting = set()           # files that get a -v4 copy, settled by analyze()
 
@@ -1361,8 +1390,23 @@ class Pipeline:
         if os.path.isfile(abs_path):
             self.discover(abs_path, default_section=default_section)
 
+    def _output_relname(self, abs_path, entry):
+        """Bare filename in v4/ for abs_path (root-scoped override or default -v4)."""
+        return self.output_relnames.get(abs_path, make_v4_relname(entry))
+
+    def _output_path(self, abs_path):
+        """Absolute output path inside v4/ for abs_path."""
+        custom = self.output_relnames.get(abs_path)
+        if custom is not None:
+            return str(Path(abs_path).parent / V4_SUBDIR / custom)
+        return make_v4_filename(abs_path)
+
     def _pending_change(self, state, loaded_set=None):
-        """True if the file's loaded sections differ from its original content."""
+        """True if the file's loaded sections differ from its original content
+        (or hold deferred v4 include-other-group rewrites in loaded sections)."""
+        if any(_section_is_loaded(loaded_set, state.sections[idx])
+               for idx in state.pending_iog_lines):
+            return True
         if loaded_set is None:
             return _serialize_lines(state.lines, state.original) != state.original
         orig_lines = state.original.splitlines()
@@ -1379,7 +1423,7 @@ class Pipeline:
         `kind` is "include" or "policy-path"; `section` is the section the
         reference line sits in. In Surge, #!include inside `[S]` loads ONLY
         section `[S]` from the referenced file (Detached Profile Section), and
-        policy-path loads ONLY `[Proxy]`.
+        policy-path loads ONLY `[Proxy]` privately for the owning group.
 
         Recomputed from current lines each call, so entries already stripped
         by abandoned-reference cleanup no longer count.
@@ -1407,23 +1451,25 @@ class Pipeline:
                                 "policy-path", state.sections[i]))
         return refs
 
-    def _loaded_sections(self):
-        """abs_path → set[str] | None of sections the root profile actually loads.
+    def _loaded_state(self):
+        """Return (loaded_sections, global_proxy_files).
 
-        Surge's #!include is strictly section-scoped: an `#!include other.conf`
-        under `[S]` loads ONLY section `[S]` from `other.conf`. `policy-path`
-        under `[Proxy Group]` loads ONLY `[Proxy]`.
-
-        The root file maps to None (every section loaded); any other reachable
-        non-abandoned file maps to the non-empty set of section names loaded
-        from it. Unloaded sections in sub-files never dirty the profile, never
-        register live definitions, and never cascade.
+        - loaded_sections: abs_path → set[str] | None of sections loaded by root
+          (None = root file, all sections loaded). Includes both #!include
+          (section-scoped) and policy-path (loads [Proxy] privately for the
+          owning group).
+        - global_proxy_files: set of abs_path whose [Proxy] definitions enter
+          Surge's global policy namespace (root + transitive [Proxy] #!include).
+          Files reached ONLY via policy-path are private to their owning group
+          and never visible to external underlying-proxy or [Rule] targets.
         """
         loaded = {}
+        global_proxy_files = set()
         root_abs = next(iter(self.files))
         if self.files[root_abs].is_abandoned:
-            return loaded
+            return loaded, global_proxy_files
         loaded[root_abs] = None
+        global_proxy_files.add(root_abs)
         stack = [root_abs]
         while stack:
             cur = stack.pop()
@@ -1437,33 +1483,47 @@ class Pipeline:
                 target_sec = "Proxy" if kind == "policy-path" else section
                 if target_sec is None:
                     continue
+                changed = False
                 if ref not in loaded:
                     loaded[ref] = {target_sec}
-                    stack.append(ref)
+                    changed = True
                 elif loaded[ref] is not None and target_sec not in loaded[ref]:
                     loaded[ref].add(target_sec)
+                    changed = True
+                if (kind == "include" and section == "Proxy"
+                        and cur in global_proxy_files
+                        and ref not in global_proxy_files):
+                    global_proxy_files.add(ref)
+                    changed = True
+                if changed:
                     stack.append(ref)
-        return loaded
+        return loaded, global_proxy_files
+
+    def _loaded_sections(self):
+        """abs_path → set[str] | None of sections the root profile actually loads."""
+        return self._loaded_state()[0]
 
     def _compute_reachable(self):
         """Files reachable from the root through live references in loaded sections."""
         return set(self._loaded_sections())
 
     def _live_names(self):
-        """Names that still have a surviving definition in actually-loaded sections.
+        """Globally visible policy names that still have a surviving definition.
 
-        Surge flattens every loaded definition into ONE namespace, so a name is
-        dead only if no loaded section defines it any more. Unloaded sections
-        (e.g. [Proxy Group] in a file imported only via [Proxy] #!include or
-        policy-path) never contribute live names.
+        - [Proxy] names are globally visible ONLY when loaded by the root or a
+          [Proxy] #!include chain (NOT policy-path-only files, whose nodes are
+          private to the owning Proxy Group and rejected by Surge for external
+          underlying-proxy / [Rule] references regardless of regex filters).
+        - [Proxy Group] names are globally visible when [Proxy Group] is loaded.
         """
         live = set()
-        for abs_path, loaded_set in self._loaded_sections().items():
+        loaded_map, global_proxy_files = self._loaded_state()
+        for abs_path, loaded_set in loaded_map.items():
             state = self.files[abs_path]
             if state.is_abandoned:
                 continue
             names = set()
-            if _section_is_loaded(loaded_set, "Proxy"):
+            if abs_path in global_proxy_files:
                 names |= state.owned_proxies
             if _section_is_loaded(loaded_set, "Proxy Group"):
                 names |= state.owned_groups
@@ -1628,7 +1688,8 @@ class Pipeline:
             return set(), True
         base_dir = os.path.dirname(abs_path)
         keys = set()
-        lost_supply = False
+        wg_name = section_name[len("WireGuard "):].strip() if section_name.startswith("WireGuard ") else ""
+        lost_supply = wg_name in state.wg_lost_remote
         for i, line in enumerate(state.lines):
             if state.sections[i] != section_name:
                 continue
@@ -1726,7 +1787,7 @@ class Pipeline:
         root_abs = next(iter(self.files))
         root_state = self.files[root_abs]
         if root_state.is_abandoned:
-            return {}, {}, False
+            return {}, set(), {}, False
         raw_available = {}
         unresolved_reasons = {}
         has_unexpanded = root_state.has_unexpanded_ruleset_wildcard
@@ -1763,17 +1824,151 @@ class Pipeline:
             queue.extend(self.ruleset_wildcard_sources.get(src_abs, []))
 
         exportable = {}
+        narrowed_rulesets = set()
         for rs_name in raw_available:
-            text, err = _expand_ruleset_for_v4(rs_name, raw_available)
+            text, err, lost_matchers = _expand_ruleset_for_v4(rs_name, raw_available)
             if err is not None:
                 unresolved_reasons[rs_name] = err
             else:
                 exportable[rs_name] = text
+                if lost_matchers:
+                    narrowed_rulesets.add(rs_name)
 
         for rs_name in exportable:
             unresolved_reasons.pop(rs_name, None)
 
-        return exportable, unresolved_reasons, has_unexpanded
+        return exportable, narrowed_rulesets, unresolved_reasons, has_unexpanded
+
+    def _strip_remote_wireguard_includes(self, loaded_map):
+        """Unconditionally remove v5+/v6 remote URL entries (Mac 6.0.0+ Linked
+        Profiles) from #!include lines inside loaded concrete [WireGuard <name>]
+        sections, even when remaining local fields keep the tunnel complete."""
+        for abs_path, loaded_set in loaded_map.items():
+            state = self.files[abs_path]
+            if state.is_abandoned:
+                continue
+            basename = os.path.basename(abs_path)
+            for i, line in enumerate(state.lines):
+                sec = state.sections[i]
+                if not (sec and sec.startswith("WireGuard ") and sec != "WireGuard *"):
+                    continue
+                if not _section_is_loaded(loaded_set, sec):
+                    continue
+                if not line.lstrip().startswith("#!include"):
+                    continue
+                entries = parse_include_list(line)
+                if not entries:
+                    continue
+                local_entries = [e for e in entries if not e.startswith(("http://", "https://"))]
+                remote_entries = [e for e in entries if e.startswith(("http://", "https://"))]
+                if not remote_entries:
+                    continue
+                wg_name = sec[len("WireGuard "):].strip()
+                state.wg_lost_remote.add(wg_name)
+                if local_entries:
+                    new_line = format_include_list(local_entries, _include_trailing_comment(line))
+                    state.lines[i] = _preserve_indent(line, new_line)
+                    self.stats.add_change(
+                        basename, i + 1, sec, "移除远端 include", ", ".join(remote_entries)
+                    )
+                else:
+                    state.lines[i] = comment_line(line)
+                    self.stats.count_commented(basename)
+                    self.stats.add_change(
+                        basename, i + 1, sec, "注释", f"远端 include ({', '.join(remote_entries)})"
+                    )
+
+    def _snapshot_iog_sources(self):
+        """Decode every include-other-group option ONCE from original v5+ input
+        so the fixpoint loop never re-parses v4-encoded text or emits premature
+        order-dependent encoding errors."""
+        for state in self.files.values():
+            state.iog_sources.clear()
+            state.pending_iog_lines.clear()
+            for i, line in enumerate(state.lines):
+                if state.sections[i] != "Proxy Group":
+                    continue
+                pgl = parse_proxy_group_line(line)
+                if pgl is None:
+                    continue
+                entries = []
+                for k, v in pgl.options:
+                    if k.lower() == "include-other-group":
+                        sv = v.strip()
+                        was_quoted = len(sv) >= 2 and sv[0] == '"' and sv[-1] == '"'
+                        had_v5_escape = _has_v5_quote_escape(sv)
+                        entries.append((parse_include_other_groups(sv), was_quoted, had_v5_escape))
+                        if had_v5_escape:
+                            state.pending_iog_lines.add(i)
+                if entries:
+                    state.iog_sources[i] = entries
+
+    def _finalize_include_other_groups(self, loaded_map, effective_deleted):
+        """Validate and encode surviving include-other-group values ONCE for
+        Surge v4 after the global cascade fixpoint has fully converged."""
+        for abs_path, loaded_set in loaded_map.items():
+            if not _section_is_loaded(loaded_set, "Proxy Group"):
+                continue
+            state = self.files[abs_path]
+            if state.is_abandoned:
+                continue
+            basename = os.path.basename(abs_path)
+            for i in sorted(state.iog_sources):
+                line = state.lines[i]
+                stripped = line.lstrip()
+                if not stripped or stripped.startswith("#") or _COMMENT_PREFIX_RE.match(stripped):
+                    continue
+                pgl = parse_proxy_group_line(line)
+                if pgl is None:
+                    continue
+                cached = state.iog_sources[i]
+                iog_idx = 0
+                new_options = []
+                dropped_notes = []
+                reencoded = False
+                for k, v in pgl.options:
+                    if k.lower() == "include-other-group" and iog_idx < len(cached):
+                        orig_groups, was_quoted, had_v5_escape = cached[iog_idx]
+                        iog_idx += 1
+                        kept = [g for g in orig_groups if g not in effective_deleted]
+                        dropped = [g for g in orig_groups if g in effective_deleted]
+                        if not dropped and not had_v5_escape:
+                            new_options.append((k, v))
+                            continue
+                        if not kept:
+                            dropped_notes.append(f"{k}={v}")
+                            continue
+                        try:
+                            encoded = format_include_other_groups(kept, was_quoted=was_quoted)
+                        except ValueError as exc:
+                            err_msg = f"{basename}:{i + 1} [{pgl.name}] {exc}"
+                            if err_msg not in self.stats.errors:
+                                self.stats.errors.append(err_msg)
+                            new_options.append((k, v))
+                            continue
+                        new_options.append((k, encoded))
+                        if dropped:
+                            dropped_notes.append(f"{k}:{', '.join(dropped)}")
+                        elif encoded != v:
+                            reencoded = True
+                    else:
+                        new_options.append((k, v))
+                if not dropped_notes and not reencoded:
+                    continue
+                pgl.options = new_options
+                new_line = _preserve_indent(line, format_proxy_group_line(pgl))
+                if new_line != line:
+                    state.lines[i] = new_line
+                    if dropped_notes:
+                        self.stats.add_change(
+                            basename, i + 1, "Proxy Group", "级联移除成员",
+                            f"{pgl.name}: {', '.join(dropped_notes)}",
+                        )
+                    else:
+                        self.stats.count_params(basename)
+                        self.stats.add_change(
+                            basename, i + 1, "Proxy Group", "v4 语法改写", pgl.name
+                        )
 
     def _cleanup_dead_wireguard_sections(self, root_state):
         """Cascade-comment concrete [WireGuard <name>] sections in root that lost
@@ -1849,6 +2044,7 @@ class Pipeline:
         ever_loaded = set(initial_loaded)
         had_initial_final = self._has_live_final(initial_loaded, use_original=True)
         self._expand_wildcard_sections()
+        self._snapshot_iog_sources()
         ever_loaded |= set(self._loaded_sections())
         exportable_rulesets = {}
 
@@ -1872,21 +2068,24 @@ class Pipeline:
                         self._abandon_state(target)
 
             # 2. Merge direct-hit deletions ONLY from files whose [Proxy]
-            # section is actually loaded by the root profile, then seed every
-            # loaded non-abandoned file with global_deleted - live_names.
-            loaded_map = self._loaded_sections()
+            # enters the global namespace (root + [Proxy] #!include; NOT
+            # policy-path-only files), then seed every loaded file.
+            loaded_map, global_proxy_files = self._loaded_state()
             ever_loaded |= set(loaded_map)
-            for abs_path, loaded_set in loaded_map.items():
+            for abs_path in global_proxy_files:
                 state = self.files[abs_path]
-                if not state.is_abandoned and _section_is_loaded(loaded_set, "Proxy"):
-                    self.global_deleted |= state.deleted_names
+                if not state.is_abandoned:
+                    self.global_deleted |= state.self_deleted
             live = self._live_names()
             effective_deleted = self.global_deleted - live
             for abs_path in loaded_map:
                 state = self.files[abs_path]
                 if state.is_abandoned:
                     continue
-                state.deleted_names = set(effective_deleted)
+                if abs_path in global_proxy_files:
+                    state.deleted_names = set(effective_deleted)
+                else:
+                    state.deleted_names = set(effective_deleted) | set(state.self_deleted)
 
             # 2a. Strip policy-path options in loaded [Proxy Group] sections.
             for abs_path, loaded_set in loaded_map.items():
@@ -1896,13 +2095,15 @@ class Pipeline:
                 if _section_is_loaded(loaded_set, "Proxy Group"):
                     self._strip_abandoned_policy_paths(state)
 
-            # 2b. Strip #!include entries pointing at abandoned files (in loaded
-            # sections only), then check root [WireGuard <name>] completeness.
+            # 2b. Strip abandoned #!include entries and v5+ remote URL #!include
+            # inside [WireGuard <name>] sections, then check root WireGuard
+            # required-field completeness.
             for abs_path, loaded_set in loaded_map.items():
                 state = self.files[abs_path]
                 if state.is_abandoned:
                     continue
                 self._strip_abandoned_includes(state, loaded_set=loaded_set)
+            self._strip_remote_wireguard_includes(loaded_map)
             root_state = self.files[next(iter(self.files))]
             if not root_state.is_abandoned:
                 self._cleanup_dead_wireguard_sections(root_state)
@@ -1911,7 +2112,7 @@ class Pipeline:
             # so dangling wireguard / RULE-SET references cascade cleanly.
             live_wg_sections = self._root_live_wireguard_sections()
             has_unexpanded_wg = root_state.has_unexpanded_wg_wildcard
-            exportable_rulesets, unresolved_rs_reasons, has_unexpanded_rs = (
+            exportable_rulesets, narrowed_rulesets, unresolved_rs_reasons, has_unexpanded_rs = (
                 self._root_available_rulesets()
             )
             dead_rulesets = {
@@ -1925,28 +2126,31 @@ class Pipeline:
             changed = True
             while changed:
                 changed = False
-                loaded_map = self._loaded_sections()
+                loaded_map, global_proxy_files = self._loaded_state()
                 ever_loaded |= set(loaded_map)
                 for abs_path, loaded_set in loaded_map.items():
                     state = self.files[abs_path]
                     if state.is_abandoned:
                         continue
                     live_now = self._live_names()
-                    state.deleted_names = self.global_deleted - live_now
+                    eff = self.global_deleted - live_now
+                    is_global_proxy = abs_path in global_proxy_files
+                    state.deleted_names = set(eff) if is_global_proxy else (set(eff) | set(state.self_deleted))
                     before_self = set(state.self_deleted)
                     self._cascade_single_file(
                         state,
                         loaded_set=loaded_set,
+                        is_global_proxy_file=is_global_proxy,
                         live_wg_sections=live_wg_sections,
                         has_unexpanded_wg=has_unexpanded_wg,
                         exportable_rulesets=exportable_rulesets,
+                        narrowed_rulesets=narrowed_rulesets,
                         dead_rulesets=dead_rulesets,
                         unresolved_rs_reasons=unresolved_rs_reasons,
                         has_unexpanded_rs=has_unexpanded_rs,
                     )
                     new_self = state.self_deleted - before_self
                     if new_self:
-                        self.global_deleted |= new_self
                         changed = True
 
             # 3b. Withdraw names defined only in unreachable subtrees. A
@@ -1978,25 +2182,31 @@ class Pipeline:
             ):
                 break
 
-        # 5. Settle the emitting set, validate v4 output invariants (no lost
-        # FINAL, no v4-unrepresentable names), then rewrite include /
-        # policy-path references to -v4 names and materialize referenced inline
-        # rulesets to v4 .list files.
+        # 5. Global fixpoint has converged: finalize include-other-group v4
+        # validation & writeback ONCE (order-independent, never re-decoded),
+        # validate v4 output invariants (no lost FINAL, no unrepresentable
+        # group names), materialize root-scoped rulesets + isolate shared
+        # sub-files that depend on them, then rewrite #!include / policy-path.
         final_loaded = self._loaded_sections()
         self.emitting = self._emitting()
-        if self.emitting and had_initial_final and not self._has_live_final(final_loaded, use_original=False):
-            self.stats.errors.append(
-                "级联清理后 [Rule] 缺少可用的 FINAL 规则（原 FINAL 指向已删除的策略或已放弃的文件），"
-                "请为 v4 指定替代兜底策略；已停止导出。"
-            )
+        if self.emitting:
+            final_deleted = self.global_deleted - self._live_names()
+            self._finalize_include_other_groups(final_loaded, final_deleted)
+            if had_initial_final and not self._has_live_final(final_loaded, use_original=False):
+                self.stats.errors.append(
+                    "级联清理后 [Rule] 缺少可用的 FINAL 规则（原 FINAL 指向已删除的策略或已放弃的文件），"
+                    "请为 v4 指定替代兜底策略；已停止导出。"
+                )
         if self.stats.errors:
             self.emitting = set()
             self.generated_rulesets = {}
+            self.output_relnames = {}
             return
 
-        self._rewrite_references(final_loaded)
         if self.emitting:
-            self._materialize_rulesets(exportable_rulesets, final_loaded)
+            root_scoped_files = self._materialize_rulesets(exportable_rulesets, final_loaded)
+            self._assign_root_scoped_subfiles(root_scoped_files, final_loaded)
+        self._rewrite_references(final_loaded)
 
         # 6. Convert commented-out nodes in emitted files (loaded [Proxy] only),
         # then re-serialize converted content from mutated lines.
@@ -2056,8 +2266,9 @@ class Pipeline:
                 if not entry.startswith(("http://", "https://")):
                     abs_path = os.path.normpath(os.path.join(base_dir, entry))
                     if abs_path in self.emitting:
-                        new_entries.append(make_v4_relname(entry))
-                        notes.append(f"{entry} → {make_v4_relname(entry)}")
+                        rel_v4 = self._output_relname(abs_path, entry)
+                        new_entries.append(rel_v4)
+                        notes.append(f"{entry} → {rel_v4}")
                         continue
                 new_entries.append(entry)
             if not notes:
@@ -2076,7 +2287,7 @@ class Pipeline:
                     if not path_val.startswith(("http://", "https://")):
                         abs_path = os.path.normpath(os.path.join(base_dir, path_val))
                         if abs_path in self.emitting:
-                            rel_v4 = make_v4_relname(path_val)
+                            rel_v4 = self._output_relname(abs_path, path_val)
                             is_q = len(value.strip()) >= 2 and value.strip()[0] == '"' and value.strip()[-1] == '"'
                             new_val = f'"{_escape_quoted(rel_v4)}"' if is_q else rel_v4
                             new_options.append((key, new_val))
@@ -2093,9 +2304,15 @@ class Pipeline:
     def _materialize_rulesets(self, exportable_rulesets, loaded_map=None):
         """Export inline [Ruleset <name>] sections that still have live RULE-SET
         references (top-level or inside AND/OR/NOT) into root-scoped v4/*.list
-        files and rewrite those RULE-SET targets."""
+        files and rewrite those RULE-SET targets.
+
+        Returns the set of non-root abs_paths whose content was rewritten to
+        reference a root-scoped .list file (so callers can isolate those shared
+        sub-files per root profile too).
+        """
+        root_scoped_files = set()
         if not exportable_rulesets:
-            return
+            return root_scoped_files
         root_abs = next(iter(self.files))
         root_path = Path(root_abs)
         root_stem = re.sub(r'[^A-Za-z0-9._-]+', '-', root_path.stem).strip('.-') or "profile"
@@ -2142,29 +2359,81 @@ class Pipeline:
                 new_line = _replace_rule_ruleset_targets(line, replacements)
                 if new_line != line:
                     state.lines[i] = new_line
+                    if abs_path != root_abs:
+                        root_scoped_files.add(abs_path)
                     for target, list_name in replacements.items():
                         self.stats.add_change(
                             basename, i + 1, "Rule", "规则集导出", f"{target} → {list_name}")
+        return root_scoped_files
 
-    def _cascade_single_file(self, state, loaded_set=None, live_wg_sections=None,
-                             has_unexpanded_wg=False, exportable_rulesets=None,
+    def _assign_root_scoped_subfiles(self, root_scoped_files, loaded_map):
+        """Give root-dependent non-root sub-files (and any non-root ancestors
+        that include them) root-scoped v4 output filenames so multiple root
+        profiles sharing a sub-file never overwrite each other's rewrites."""
+        if not root_scoped_files:
+            return
+        root_abs = next(iter(self.files))
+        root_path = Path(root_abs)
+        root_stem = re.sub(r'[^A-Za-z0-9._-]+', '-', root_path.stem).strip('.-') or "profile"
+
+        reverse_refs = {}
+        for p in self.emitting:
+            if p == root_abs:
+                continue
+            p_loaded = loaded_map.get(p)
+            for ref, _, sec in self._live_local_refs(self.files[p]):
+                if _section_is_loaded(p_loaded, sec) and ref in self.emitting:
+                    reverse_refs.setdefault(ref, set()).add(p)
+
+        all_scoped = set(root_scoped_files)
+        queue = list(root_scoped_files)
+        while queue:
+            cur = queue.pop()
+            for parent in reverse_refs.get(cur, ()):
+                if parent != root_abs and parent not in all_scoped:
+                    all_scoped.add(parent)
+                    queue.append(parent)
+
+        used_names = {os.path.basename(make_v4_filename(p)) for p in self.emitting if p not in all_scoped}
+        used_names |= {os.path.basename(p) for p in self.generated_rulesets}
+        for sub_abs in sorted(all_scoped):
+            sub_path = Path(sub_abs)
+            sub_stem = re.sub(r'[^A-Za-z0-9._-]+', '-', sub_path.stem).strip('.-') or "include"
+            digest = hashlib.sha256(
+                f"{root_path.name}\0{sub_path.name}".encode("utf-8")
+            ).hexdigest()[:8]
+            cand = f"{root_stem}-{sub_stem}-{digest}-v4{sub_path.suffix}"
+            suffix = 2
+            while cand in used_names:
+                cand = f"{root_stem}-{sub_stem}-{digest}-{suffix}-v4{sub_path.suffix}"
+                suffix += 1
+            used_names.add(cand)
+            self.output_relnames[sub_abs] = cand
+
+    def _cascade_single_file(self, state, loaded_set=None, is_global_proxy_file=True,
+                             live_wg_sections=None, has_unexpanded_wg=False,
+                             exportable_rulesets=None, narrowed_rulesets=None,
                              dead_rulesets=None, unresolved_rs_reasons=None,
                              has_unexpanded_rs=False):
         """Fixpoint over loaded sections only: cascade deleted proxies/groups
         through underlying-proxy, dangling WireGuard section-names, Proxy Group
-        members/options (using v4-readable formatting), and finally Rule
-        policies and dead/unconvertible RULE-SET references (top-level and
-        nested inside AND/OR/NOT)."""
+        members/options (using cached decoded include-other-group lists without
+        premature v4 encoding), and finally Rule policies and dead/unsafe
+        RULE-SET references (top-level and nested inside AND/OR/NOT)."""
         live_wg_sections = live_wg_sections if live_wg_sections is not None else set()
         exportable_rulesets = exportable_rulesets if exportable_rulesets is not None else {}
+        narrowed_rulesets = narrowed_rulesets if narrowed_rulesets is not None else set()
         dead_rulesets = dead_rulesets if dead_rulesets is not None else set()
         unresolved_rs_reasons = unresolved_rs_reasons if unresolved_rs_reasons is not None else {}
         basename = os.path.basename(state.abs_path)
 
-        def _mark_deleted(deleted_name):
+        def _mark_deleted(deleted_name, global_scope=True):
             state.self_deleted.add(deleted_name)
-            self.global_deleted.add(deleted_name)
-            if deleted_name not in self._live_names():
+            if global_scope:
+                self.global_deleted.add(deleted_name)
+                if deleted_name not in self._live_names():
+                    state.deleted_names.add(deleted_name)
+            else:
                 state.deleted_names.add(deleted_name)
 
         changed = True
@@ -2187,7 +2456,7 @@ class Pipeline:
                     underlying = extract_proxy_option(line, "underlying-proxy")
                     if underlying and underlying in state.deleted_names:
                         state.lines[i] = CASCADE_TAG + stripped
-                        _mark_deleted(unquote(name))
+                        _mark_deleted(unquote(name), global_scope=is_global_proxy_file)
                         self.stats.count_commented(basename)
                         self.stats.add_change(
                             basename, i + 1, "Proxy", "级联注释",
@@ -2200,7 +2469,7 @@ class Pipeline:
                         if (wg_sec and wg_sec not in live_wg_sections
                                 and (wg_sec in self.dead_wg_sections or has_unexpanded_wg)):
                             state.lines[i] = CASCADE_TAG + stripped
-                            _mark_deleted(unquote(name))
+                            _mark_deleted(unquote(name), global_scope=is_global_proxy_file)
                             self.stats.count_commented(basename)
                             self.stats.add_change(
                                 basename, i + 1, "Proxy", "级联注释",
@@ -2226,7 +2495,7 @@ class Pipeline:
                             break
                 if dead_relay is not None:
                     state.lines[i] = CASCADE_TAG + stripped
-                    _mark_deleted(unquote(pgl.name))
+                    _mark_deleted(unquote(pgl.name), global_scope=True)
                     self.stats.count_commented(basename)
                     self.stats.add_change(
                         basename, i + 1, "Proxy Group", "级联注释",
@@ -2240,58 +2509,55 @@ class Pipeline:
                     m for m in original_members
                     if unquote(m) not in state.deleted_names
                 ]
-                # include-other-group pointing at deleted group(s) is dead supply;
-                # multi-group values ("G1, G2") strip only deleted entries and
-                # re-encode surviving names into Surge v4-readable syntax.
+                # Use cached decoded include-other-group lists from original v5+
+                # input. Strip completely-emptied include-other-group options
+                # immediately so empty groups cascade; defer v4 validation &
+                # formatting of surviving multi-group lists until convergence.
+                cached_iog = state.iog_sources.get(i)
+                iog_idx = 0
                 original_options = list(pgl.options)
                 new_options = []
+                new_iog_entries = []
                 removed_opt_tokens = []
-                reencoded_iog = False
                 for k, v in original_options:
                     if k.lower() == "include-other-group":
-                        sv = v.strip()
-                        was_quoted = len(sv) >= 2 and sv[0] == '"' and sv[-1] == '"'
-                        groups = parse_include_other_groups(sv)
+                        if cached_iog is not None and iog_idx < len(cached_iog):
+                            entry = cached_iog[iog_idx]
+                            groups = entry[0]
+                            iog_idx += 1
+                        else:
+                            sv = v.strip()
+                            entry = (
+                                parse_include_other_groups(sv),
+                                len(sv) >= 2 and sv[0] == '"' and sv[-1] == '"',
+                                _has_v5_quote_escape(sv),
+                            )
+                            groups = entry[0]
                         kept = [g for g in groups if g not in state.deleted_names]
                         dropped = [g for g in groups if g in state.deleted_names]
-                        needs_v4_reencode = _has_v5_quote_escape(sv)
-                        if not dropped and not needs_v4_reencode:
+                        if kept:
                             new_options.append((k, v))
-                        elif kept:
-                            try:
-                                encoded = format_include_other_groups(kept, was_quoted=was_quoted)
-                            except ValueError as exc:
-                                err_msg = f"{basename}:{i + 1} [{pgl.name}] {exc}"
-                                if err_msg not in self.stats.errors:
-                                    self.stats.errors.append(err_msg)
-                                new_options.append((k, v))
-                                continue
-                            new_options.append((k, encoded))
+                            new_iog_entries.append(entry)
                             if dropped:
-                                removed_opt_tokens.append(f"{k}:{', '.join(dropped)}")
-                            elif encoded != v:
-                                reencoded_iog = True
+                                state.pending_iog_lines.add(i)
                         else:
                             removed_opt_tokens.append(f"{k}={v}")
                     else:
                         new_options.append((k, v))
                 pgl.options = new_options
+                if cached_iog is not None:
+                    state.iog_sources[i] = new_iog_entries
                 removed_tokens = (
                     [m for m in original_members if m not in pgl.members]
                     + removed_opt_tokens
                 )
-                if not removed_tokens and not reencoded_iog:
+                if not removed_tokens:
                     continue  # D6: pre-existing empty groups left alone
-                if not removed_tokens and reencoded_iog:
-                    new_line = _preserve_indent(line, format_proxy_group_line(pgl))
-                    if new_line != line:
-                        state.lines[i] = new_line
-                        self.stats.count_params(basename)
-                        self.stats.add_change(
-                            basename, i + 1, "Proxy Group", "v4 语法改写", pgl.name)
-                        changed = True
-                    continue
-                if has_effective_members(pgl, state.deleted_names, abandoned_basenames=set()):
+                surviving_iog_lists = [e[0] for e in new_iog_entries]
+                if has_effective_members(
+                    pgl, state.deleted_names, abandoned_basenames=set(),
+                    iog_decoded_lists=surviving_iog_lists,
+                ):
                     new_line = _preserve_indent(line, format_proxy_group_line(pgl))
                     if new_line != line:
                         state.lines[i] = new_line
@@ -2304,13 +2570,14 @@ class Pipeline:
                     # comment shows the group in its cleaned state.
                     reformatted = _preserve_indent(line, format_proxy_group_line(pgl))
                     state.lines[i] = CASCADE_TAG + reformatted.lstrip()
-                    _mark_deleted(unquote(pgl.name))
+                    _mark_deleted(unquote(pgl.name), global_scope=True)
                     self.stats.count_commented(basename)
                     self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", pgl.name)
                     changed = True
 
         # Post-fixpoint: comment out loaded [Rule] lines whose policy or
-        # RULE-SET target (top-level or nested inside AND/OR/NOT) is now dead.
+        # RULE-SET target (top-level or nested inside AND/OR/NOT) is now dead
+        # or narrowed under a negated NOT condition.
         if not _section_is_loaded(loaded_set, "Rule"):
             return
         base_dir = os.path.dirname(state.abs_path)
@@ -2326,13 +2593,18 @@ class Pipeline:
                 self.stats.count_commented(basename)
                 self.stats.add_change(basename, i + 1, "Rule", "级联注释", line.strip())
                 continue
-            rs_targets = extract_rule_ruleset_targets(line)
+            rs_refs = extract_rule_ruleset_refs(line)
             dead_reason = None
-            for rs_target in rs_targets:
+            for rs_target, is_negated in rs_refs:
                 if rs_target.upper() in BUILTIN_RULESETS:
                     continue
                 if rs_target in dead_rulesets:
                     dead_reason = unresolved_rs_reasons.get(rs_target) or f"规则集 {rs_target} 不可用"
+                    break
+                if is_negated and rs_target in narrowed_rulesets:
+                    dead_reason = (
+                        f"否定条件引用的规则集 {rs_target} 已裁剪 v5+ 匹配项，保留会扩大否定范围"
+                    )
                     break
                 if (has_unexpanded_rs
                         and not rs_target.startswith(("http://", "https://"))
@@ -2382,7 +2654,11 @@ class Pipeline:
             if not removed_values:
                 continue
             pgl.options = new_options
-            if has_effective_members(pgl, state.deleted_names, abandoned_basenames):
+            cached_iog = state.iog_sources.get(i)
+            iog_lists = [e[0] for e in cached_iog] if cached_iog is not None else None
+            if has_effective_members(
+                pgl, state.deleted_names, abandoned_basenames, iog_decoded_lists=iog_lists
+            ):
                 state.lines[i] = _preserve_indent(line, format_proxy_group_line(pgl))
                 self.stats.add_change(
                     os.path.basename(state.abs_path), i + 1, "Proxy Group",
@@ -2462,7 +2738,7 @@ class Pipeline:
         reachable = self.reachable
 
         for abs_path, state in self.files.items():
-            output_path = make_v4_filename(abs_path)
+            output_path = self._output_path(abs_path)
 
             # Abandon decision was made in discover(). Just act on it here:
             # refuse to write, surface stale -v4 (don't delete).

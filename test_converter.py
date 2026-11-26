@@ -4992,4 +4992,182 @@ class TestRound2Fixes:
         assert any('A"B' in e for e in stats.errors)
 
 
+# --- T83: Round 3 fixes — shared rule subfile isolation, policy-path visibility, deferred iog v4 finalize, WG remote strip, NOT negation safety ---
+
+class TestRound3Fixes:
+    WG_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    WG_PUB = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+
+    def test_shared_rule_subfile_isolated_per_root_profile(self, tmp_path):
+        (tmp_path / "rules.dconf").write_text("[Rule]\nRULE-SET,Shared,DIRECT\n")
+        ios = tmp_path / "ios.conf"
+        mac = tmp_path / "mac.conf"
+        ios.write_text(textwrap.dedent("""\
+            [Ruleset Shared]
+            DOMAIN-SUFFIX,ios.example
+
+            [Rule]
+            #!include rules.dconf
+            FINAL,DIRECT
+        """))
+        mac.write_text(textwrap.dedent("""\
+            [Ruleset Shared]
+            DOMAIN-SUFFIX,mac.example
+
+            [Rule]
+            #!include rules.dconf
+            FINAL,DIRECT
+        """))
+        stats_ios = ConversionStats()
+        stats_mac = ConversionStats()
+        convert_file(str(ios), stats_ios)
+        convert_file(str(mac), stats_mac)
+
+        assert stats_mac.deprecated_files == []
+        ios_v4 = (tmp_path / "v4" / "ios-v4.conf").read_text()
+        mac_v4 = (tmp_path / "v4" / "mac-v4.conf").read_text()
+        ios_rules = list((tmp_path / "v4").glob("ios-rules-*-v4.dconf"))
+        mac_rules = list((tmp_path / "v4").glob("mac-rules-*-v4.dconf"))
+        assert len(ios_rules) == 1 and len(mac_rules) == 1
+        assert ios_rules[0] != mac_rules[0]
+        assert f"#!include {ios_rules[0].name}" in ios_v4
+        assert f"#!include {mac_rules[0].name}" in mac_v4
+        ios_list = list((tmp_path / "v4").glob("ios-Shared-*-ruleset-v4.list"))[0]
+        mac_list = list((tmp_path / "v4").glob("mac-Shared-*-ruleset-v4.list"))[0]
+        assert f"RULE-SET,{ios_list.name},DIRECT" in ios_rules[0].read_text()
+        assert f"RULE-SET,{mac_list.name},DIRECT" in mac_rules[0].read_text()
+
+    def test_policy_path_node_does_not_shield_deleted_global_underlying_proxy(self, tmp_path):
+        (tmp_path / "pool.conf").write_text(textwrap.dedent("""\
+            [Proxy]
+            Entry = snell, 1.1.1.1, 8000, psk=a, version=4
+            Safe = snell, 2.2.2.2, 8000, psk=b, version=4
+        """))
+        root = tmp_path / "main.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            Entry = vless, 9.9.9.9, 443, username=00000000-0000-0000-0000-000000000000
+            Exit = snell, 3.3.3.3, 8000, psk=c, version=4, underlying-proxy=Entry
+
+            [Proxy Group]
+            SafePool = select, policy-path=pool.conf, policy-regex-filter=^Safe$
+
+            [Rule]
+            DOMAIN,chain.example,Exit
+            FINAL,SafePool
+        """))
+        convert_file(str(root))
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+] Entry = vless" in out
+        assert "# [V5+ cascade] Exit = snell" in out
+        assert "# [V5+ cascade] DOMAIN,chain.example,Exit" in out
+        assert "\nFINAL,SafePool\n" in out
+
+    def test_include_other_group_order_independent_and_preserves_double_backslash(self, tmp_path):
+        # Consumer declared BEFORE the eventually-deleted quote-bearing group
+        root1 = tmp_path / "before.conf"
+        root1.write_text(textwrap.dedent("""\
+            [Proxy]
+            V5 = vless, 1.1.1.1, 443, username=00000000-0000-0000-0000-000000000000
+            OK = snell, 2.2.2.2, 8000, psk=a, version=4
+
+            [Proxy Group]
+            Consumer = select, include-other-group="A\\"B, Safe"
+            "A\\"B" = select, V5
+            Safe = select, OK
+            Keep\\\\Team = select, OK
+            Gone = select, V5
+            DoubleBS = select, include-other-group="Gone, Keep\\\\\\\\Team, Safe"
+
+            [Rule]
+            FINAL,Consumer
+        """))
+        stats1 = ConversionStats()
+        out1 = convert_file(str(root1), stats1)
+        assert out1 is not None
+        assert stats1.errors == []
+        text1 = (tmp_path / "v4" / "before-v4.conf").read_text()
+        assert 'Consumer = select, include-other-group="Safe"\n' in text1
+        # Two literal backslashes preserved (NOT collapsed to one across passes)
+        assert 'DoubleBS = select, include-other-group="Keep\\\\Team, Safe"\n' in text1
+
+        # Reversed order: "A\"B" declared BEFORE Consumer -> identical result
+        root2 = tmp_path / "after.conf"
+        root2.write_text(textwrap.dedent("""\
+            [Proxy]
+            V5 = vless, 1.1.1.1, 443, username=00000000-0000-0000-0000-000000000000
+            OK = snell, 2.2.2.2, 8000, psk=a, version=4
+
+            [Proxy Group]
+            "A\\"B" = select, V5
+            Safe = select, OK
+            Consumer = select, include-other-group="A\\"B, Safe"
+
+            [Rule]
+            FINAL,Consumer
+        """))
+        stats2 = ConversionStats()
+        out2 = convert_file(str(root2), stats2)
+        assert out2 is not None
+        assert stats2.errors == []
+        assert 'Consumer = select, include-other-group="Safe"\n' in (tmp_path / "v4" / "after-v4.conf").read_text()
+
+    def test_wireguard_strips_remote_include_even_when_local_fields_complete(self, tmp_path):
+        (tmp_path / "local-wg.dconf").write_text(textwrap.dedent(f"""\
+            [WireGuard office]
+            private-key = {self.WG_KEY}
+            self-ip = 10.20.0.2
+            mtu = 1280
+            peer = (public-key = {self.WG_PUB}, allowed-ips = "10.20.0.0/24", endpoint = 1.2.3.4:51820)
+        """))
+        root = tmp_path / "profile.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            OfficeWG = wireguard, section-name=office
+
+            [WireGuard office]
+            #!include local-wg.dconf, https://example.com/remote-wg.conf
+
+            [Rule]
+            DOMAIN,corp.example,OfficeWG
+            FINAL,DIRECT
+        """))
+        out = convert_file(str(root))
+        assert out is not None
+        text = (tmp_path / "v4" / "profile-v4.conf").read_text()
+        assert "https://example.com/remote-wg.conf" not in text
+        assert "#!include local-wg-v4.dconf" in text
+        assert "\nOfficeWG = wireguard, section-name=office\n" in text
+        assert "\nDOMAIN,corp.example,OfficeWG\n" in text
+
+    def test_not_rule_referencing_narrowed_ruleset_is_cascaded(self, tmp_path):
+        root = tmp_path / "profile.conf"
+        root.write_text(textwrap.dedent("""\
+            [Ruleset Office]
+            DOMAIN-WILDCARD,*.office.example.test
+            DOMAIN,portal.office.example.test
+
+            [Ruleset CleanOffice]
+            DOMAIN,portal.office.example.test
+
+            [Rule]
+            NOT,((RULE-SET,Office)),REJECT
+            AND,((PROTOCOL,TCP),(NOT,((RULE-SET,Office)))),REJECT
+            NOT,((RULE-SET,CleanOffice)),REJECT
+            FINAL,DIRECT
+        """))
+        stats = ConversionStats()
+        convert_file(str(root), stats)
+        out = (tmp_path / "v4" / "profile-v4.conf").read_text()
+        assert "# [V5+ cascade] NOT,((RULE-SET,Office)),REJECT" in out
+        assert "# [V5+ cascade] AND,((PROTOCOL,TCP),(NOT,((RULE-SET,Office)))),REJECT" in out
+        # Narrowed Office had only negated refs -> no orphan .list emitted
+        assert list((tmp_path / "v4").glob("profile-Office-*")) == []
+        # Un-narrowed CleanOffice stays valid under NOT
+        clean_lists = list((tmp_path / "v4").glob("profile-CleanOffice-*-ruleset-v4.list"))
+        assert len(clean_lists) == 1
+        assert f"NOT,((RULE-SET,{clean_lists[0].name})),REJECT" in out
+
+
+
 
