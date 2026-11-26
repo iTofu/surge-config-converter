@@ -100,7 +100,7 @@ psk = <legacy-psk>
 | `HOSTNAME-TYPE` | 注释 |
 | `DOMAIN-WILDCARD` | 注释 |
 | `AND` / `OR` / `NOT` 复合规则内嵌上述类型 | 注释整行 |
-| 策略后的 `extended-matching` / `pre-matching` 参数 | 移除参数，规则保留 |
+| 策略后的 `extended-matching` / `pre-matching` 参数（含 `AND` / `OR` / `NOT` 子规则内参数） | 正向条件移除参数、规则保留；位于 `NOT` 否定作用域下的 `extended-matching`（移除会扩大否定范围）则注释整行 |
 
 ### 通用参数（[General]）
 
@@ -123,6 +123,7 @@ psk = <legacy-psk>
 
 - `#!include` 严格遵循 Surge 分段加载语义（`[S]` 下的 `#!include` 仅加载目标文件的 `[S]` 段），`policy-path` 仅加载 `[Proxy]` 段；子文件未加载段中的内容不触发转换、不参与名称登记与级联
 - 只要配置实际加载的段内有任何内容需要转换，它实际加载的每个本地文件都产出 `-v4` 副本，无需转换的原样复制；引用一律改写为 `-v4` 名，保证 `v4/` 内没有悬空引用
+- 凡受根配置上下文（跨文件级联、内联规则集导出、托管配置剥离、v4 `include-other-group` 改写等）影响的非根子文件及其非根祖先，统一按根配置隔离命名（带长度截断与 8 位摘要，并为 `-deprecated` 备份预留长度余量）；写盘前先校验全部目标文件名不超过文件系统上限，避免写出半成品
 - 仅被未加载段落提及的文件不算加载，不产出
 - HTTP/HTTPS URL 不处理（具名 `[WireGuard <name>]` 中的远端 `#!include` 属 Mac 6.0.0+ 语法，v4 不可用）
 

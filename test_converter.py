@@ -2,10 +2,12 @@
 
 import re
 import textwrap
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+import converter
 from converter import (
     ConversionStats,
     _split_top_level_commas,
@@ -2558,10 +2560,12 @@ class TestCrossFileDirectHitCascade:
         convert_file(str(main), stats, {str(main): None})
         main_out = (tmp_path / "v4" / "main-v4.conf").read_text()
         assert "# [V5+] JP = anytls" in main_out
-        # The parent must reference the -v4 copy of the cascade-modified sub
-        assert "#!include groups-v4.dconf" in main_out
-        # The group is in groups-v4.dconf — JP must be removed from it
-        sub_out = (tmp_path / "v4" / "groups-v4.dconf").read_text()
+        # The parent must reference the root-scoped -v4 copy of the cascade-modified sub
+        scoped_subs = list((tmp_path / "v4").glob("main-groups-*-v4.dconf"))
+        assert len(scoped_subs) == 1
+        assert f"#!include {scoped_subs[0].name}" in main_out
+        # The group is in the scoped subfile — JP must be removed from it
+        sub_out = scoped_subs[0].read_text()
         assert "Fast = select, HK" in sub_out
         assert "JP" not in sub_out
 
@@ -2582,7 +2586,9 @@ class TestCrossFileDirectHitCascade:
         )
         stats = ConversionStats()
         convert_file(str(main), stats, {str(main): None})
-        sub_out = (tmp_path / "v4" / "groups-v4.dconf").read_text()
+        scoped_subs = list((tmp_path / "v4").glob("main-groups-*-v4.dconf"))
+        assert len(scoped_subs) == 1
+        sub_out = scoped_subs[0].read_text()
         assert "# [V5+ cascade] OnlyV5 = select" in sub_out
 
 
@@ -3271,8 +3277,10 @@ class TestCascadeDetailCompleteness:
         )
         stats = ConversionStats()
         convert_file(str(main), stats, {str(main): None})
+        scoped_subs = list((tmp_path / "v4").glob("main-groups-*-v4.dconf"))
+        assert len(scoped_subs) == 1
         assert any(
-            c[0] == "main.conf" and c[3] == "引用改写" and "groups-v4.dconf" in c[4]
+            c[0] == "main.conf" and c[3] == "引用改写" and scoped_subs[0].name in c[4]
             for c in stats.changes
         )
 
@@ -4463,8 +4471,11 @@ class TestWildcardIncludePreservationAndCascade:
             FINAL,DIRECT
         """))
         convert_file(str(root))
-        tunnels_v4 = (tmp_path / "v4" / "tunnels-v4.dconf").read_text()
+        scoped_tunnels = list((tmp_path / "v4").glob("profile-tunnels-*-v4.dconf"))
+        assert len(scoped_tunnels) == 1
+        tunnels_v4 = scoped_tunnels[0].read_text()
         root_v4 = (tmp_path / "v4" / "profile-v4.conf").read_text()
+        assert f"#!include {scoped_tunnels[0].name}" in root_v4
         assert "# [V5+ cascade] OfficeWG = wireguard, section-name=office" in tunnels_v4
         assert "# [V5+ cascade] DOMAIN,corp.example,OfficeWG" in root_v4
 
@@ -4563,7 +4574,10 @@ class TestUnderlyingProxyCascade:
         """))
         convert_file(str(root))
         main_v4 = (tmp_path / "v4" / "main-v4.conf").read_text()
-        exit_v4 = (tmp_path / "v4" / "exit-v4.dconf").read_text()
+        scoped_exit = list((tmp_path / "v4").glob("main-exit-*-v4.dconf"))
+        assert len(scoped_exit) == 1
+        exit_v4 = scoped_exit[0].read_text()
+        assert f"#!include entry-v4.dconf, {scoped_exit[0].name}" in main_v4
         assert "# [V5+ cascade] EntryGroup = select" in main_v4
         assert "# [V5+ cascade] ChainedGroup = select, OK, underlying-proxy=Entry" in main_v4
         assert "# [V5+ cascade] ExitViaGroup = snell" in exit_v4
@@ -5167,6 +5181,282 @@ class TestRound3Fixes:
         clean_lists = list((tmp_path / "v4").glob("profile-CleanOffice-*-ruleset-v4.list"))
         assert len(clean_lists) == 1
         assert f"NOT,((RULE-SET,{clean_lists[0].name})),REJECT" in out
+
+
+class TestRound4Fixes:
+    """Regression tests for Round 4 findings:
+    1. Universal root-scoped isolation for any root-dependent sub-file
+    2. Length-bounded scoped filenames + pre-emit NAME_MAX validation
+    3. Strict one-way phase ordering: rewrite references before v4 iog writeback
+    4. extended-matching narrowing under NOT and inside AND/OR/NOT sub-rules
+    """
+
+    def test_shared_subfile_cascaded_by_one_root_isolated_from_other_root(self, tmp_path):
+        (tmp_path / "common.dconf").write_text(textwrap.dedent("""\
+            [Proxy]
+            Exit = snell, 2.2.2.2, 8000, psk=a, version=4, underlying-proxy=Entry
+            OK = snell, 3.3.3.3, 8000, psk=b, version=4
+        """))
+        ios = tmp_path / "ios.conf"
+        ios.write_text(textwrap.dedent("""\
+            [Proxy]
+            Entry = vless, 1.1.1.1, 443, username=00000000-0000-0000-0000-000000000000
+            #!include common.dconf
+
+            [Rule]
+            FINAL,OK
+        """))
+        mac = tmp_path / "mac.conf"
+        mac.write_text(textwrap.dedent("""\
+            [Proxy]
+            Entry = snell, 1.1.1.1, 8000, psk=c, version=4
+            Dead = anytls, 4.4.4.4, 443, password=pwd
+            #!include common.dconf
+
+            [Rule]
+            FINAL,Exit
+        """))
+        # Convert ios then mac — mac must NOT overwrite ios's cascaded common.dconf
+        convert_file(str(ios))
+        convert_file(str(mac))
+
+        ios_v4 = (tmp_path / "v4" / "ios-v4.conf").read_text()
+        mac_v4 = (tmp_path / "v4" / "mac-v4.conf").read_text()
+        ios_common_files = list((tmp_path / "v4").glob("ios-common-*-v4.dconf"))
+        assert len(ios_common_files) == 1
+        assert f"#!include {ios_common_files[0].name}" in ios_v4
+        assert "# [V5+ cascade] Exit = snell" in ios_common_files[0].read_text()
+        assert "#!include common-v4.dconf" in mac_v4
+        assert "\nExit = snell, 2.2.2.2" in (tmp_path / "v4" / "common-v4.dconf").read_text()
+
+        # Reverse order: converting ios again must NOT overwrite mac's common-v4.dconf
+        convert_file(str(ios))
+        assert "\nExit = snell, 2.2.2.2" in (tmp_path / "v4" / "common-v4.dconf").read_text()
+        assert "# [V5+ cascade] Exit = snell" in ios_common_files[0].read_text()
+
+    def test_shared_ancestor_of_cascaded_subfile_is_also_isolated(self, tmp_path):
+        (tmp_path / "leaf.dconf").write_text(
+            "[Proxy]\nExit = snell, 2.2.2.2, 8000, psk=a, version=4, underlying-proxy=Entry\n"
+            "OK = snell, 3.3.3.3, 8000, psk=b, version=4\n"
+        )
+        (tmp_path / "wrapper.dconf").write_text("[Proxy]\n#!include leaf.dconf\n")
+        ios = tmp_path / "ios.conf"
+        ios.write_text(textwrap.dedent("""\
+            [Proxy]
+            Entry = vless, 1.1.1.1, 443, username=00000000-0000-0000-0000-000000000000
+            #!include wrapper.dconf
+
+            [Rule]
+            FINAL,OK
+        """))
+        mac = tmp_path / "mac.conf"
+        mac.write_text(textwrap.dedent("""\
+            [Proxy]
+            Entry = snell, 1.1.1.1, 8000, psk=c, version=4
+            Dead = anytls, 4.4.4.4, 443, password=pwd
+            #!include wrapper.dconf
+
+            [Rule]
+            FINAL,Exit
+        """))
+        convert_file(str(ios))
+        convert_file(str(mac))
+
+        ios_wrappers = list((tmp_path / "v4").glob("ios-wrapper-*-v4.dconf"))
+        ios_leaves = list((tmp_path / "v4").glob("ios-leaf-*-v4.dconf"))
+        assert len(ios_wrappers) == 1 and len(ios_leaves) == 1
+        assert f"#!include {ios_wrappers[0].name}" in (tmp_path / "v4" / "ios-v4.conf").read_text()
+        assert f"#!include {ios_leaves[0].name}" in ios_wrappers[0].read_text()
+        assert "#!include wrapper-v4.dconf" in (tmp_path / "v4" / "mac-v4.conf").read_text()
+        assert "#!include leaf-v4.dconf" in (tmp_path / "v4" / "wrapper-v4.dconf").read_text()
+
+    def test_long_root_and_subfile_names_stay_within_name_max(self, tmp_path):
+        root_name = ("r" * 131) + ".conf"
+        sub_name = ("s" * 133) + ".dconf"
+        long_rs = "Ruleset" + ("x" * 120)
+        (tmp_path / sub_name).write_text(f"[Rule]\nRULE-SET,{long_rs},DIRECT\n")
+        root = tmp_path / root_name
+        root.write_text(textwrap.dedent(f"""\
+            [Ruleset {long_rs}]
+            DOMAIN,corp.example.test
+
+            [Rule]
+            #!include {sub_name}
+            FINAL,DIRECT
+        """))
+        stats = ConversionStats()
+        out_path = convert_file(str(root), stats)
+        assert out_path is not None
+        assert stats.errors == []
+
+        v4_files = list((tmp_path / "v4").iterdir())
+        assert len(v4_files) == 3  # root, scoped subfile, scoped ruleset .list
+        for f in v4_files:
+            assert len(f.name.encode("utf-8")) <= 255
+        scoped_files = [f for f in v4_files if f.name != Path(out_path).name]
+        assert len(scoped_files) == 2
+        for f in scoped_files:
+            # Must leave headroom for -deprecated backup
+            assert len((f.stem + "-deprecated" + f.suffix).encode("utf-8")) <= 255
+
+        # Re-running with changed ruleset must back up to -deprecated without OSError
+        root.write_text(textwrap.dedent(f"""\
+            [Ruleset {long_rs}]
+            DOMAIN,corp2.example.test
+
+            [Rule]
+            #!include {sub_name}
+            FINAL,DIRECT
+        """))
+        stats2 = ConversionStats()
+        assert convert_file(str(root), stats2) is not None
+        assert stats2.errors == []
+        assert len(stats2.deprecated_files) >= 1
+
+    def test_pre_emit_path_length_validation_aborts_before_writing_anything(self, tmp_path, monkeypatch):
+        sub = tmp_path / "common.dconf"
+        sub.write_text("[Proxy]\nOK = snell, 1.1.1.1, 8000, psk=a, version=4\n")
+        root = tmp_path / (("a" * 50) + ".conf")
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            Dead = anytls, 2.2.2.2, 443, password=pwd
+            #!include common.dconf
+
+            [Rule]
+            FINAL,OK
+        """))
+        monkeypatch.setattr(converter, "_fs_name_max", lambda _d: 40)
+        stats = ConversionStats()
+        res = convert_file(str(root), stats)
+        assert res is None
+        assert any("长度上限" in e for e in stats.errors)
+        assert not (tmp_path / "v4").exists()
+
+    def test_pre_emit_backup_length_validation_aborts_cleanly(self, tmp_path, monkeypatch):
+        root = tmp_path / "profile-long-name.conf"  # profile-long-name-v4.conf = 25B, -deprecated = 36B
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            Dead = anytls, 2.2.2.2, 443, password=pwd
+            OK = snell, 1.1.1.1, 8000, psk=a, version=4
+
+            [Rule]
+            FINAL,OK
+        """))
+        v4_dir = tmp_path / "v4"
+        v4_dir.mkdir()
+        existing = v4_dir / "profile-long-name-v4.conf"
+        existing.write_text("old content\n")
+        monkeypatch.setattr(converter, "_fs_name_max", lambda _d: 30)
+        stats = ConversionStats()
+        res = convert_file(str(root), stats)
+        assert res is None
+        assert any("备份文件名超出文件系统长度上限" in e for e in stats.errors)
+        # Existing v4 file must stay completely untouched
+        assert existing.read_text() == "old content\n"
+
+    def test_iog_trailing_backslash_and_policy_path_on_same_line(self, tmp_path):
+        (tmp_path / "provider.dconf").write_text(
+            "P1 = snell, 1.1.1.1, 8000, psk=a, version=4\n"
+        )
+        root = tmp_path / "main.conf"
+        root.write_text(textwrap.dedent(r"""
+            [Proxy]
+            Dead = anytls, 2.2.2.2, 443, password=pwd
+            OK = snell, 3.3.3.3, 8000, psk=b, version=4
+
+            [Proxy Group]
+            Gone = select, Dead
+            G1 = select, OK
+            Keep\Team\ = select, OK
+            Mix = select, include-other-group="Gone, G1, Keep\\Team\\", policy-path=provider.dconf
+
+            [Rule]
+            FINAL,Mix
+        """).lstrip())
+        stats = ConversionStats()
+        out_path = convert_file(str(root), stats)
+        assert out_path is not None
+        assert stats.errors == []
+        out = Path(out_path).read_text()
+        assert (tmp_path / "v4" / "provider-v4.dconf").exists()
+        assert r'Mix = select, include-other-group="G1, Keep\Team\", policy-path=provider-v4.dconf' in out
+
+    def test_iog_escape_only_and_policy_path_on_same_line(self, tmp_path):
+        (tmp_path / "provider.dconf").write_text(
+            "P1 = snell, 1.1.1.1, 8000, psk=a, version=4\n"
+        )
+        root = tmp_path / "main.conf"
+        root.write_text(textwrap.dedent(r"""
+            [Proxy]
+            OK = snell, 3.3.3.3, 8000, psk=b, version=4
+
+            [Proxy Group]
+            G1 = select, OK
+            Keep\Team\ = select, OK
+            Mix = select, include-other-group="G1, Keep\\Team\\", policy-path=provider.dconf
+
+            [Rule]
+            FINAL,Mix
+        """).lstrip())
+        stats = ConversionStats()
+        out_path = convert_file(str(root), stats)
+        assert out_path is not None
+        assert stats.errors == []
+        out = Path(out_path).read_text()
+        assert (tmp_path / "v4" / "provider-v4.dconf").exists()
+        assert r'Mix = select, include-other-group="G1, Keep\Team\", policy-path=provider-v4.dconf' in out
+
+    def test_extended_matching_in_ruleset_narrows_not_and_logical_subrules(self, tmp_path):
+        root = tmp_path / "profile.conf"
+        root.write_text(textwrap.dedent("""\
+            [Ruleset Office]
+            DOMAIN,office.example.test,extended-matching
+
+            [Ruleset CleanOffice]
+            DOMAIN,portal.example.test
+
+            [Ruleset LogicOffice]
+            AND,((PROTOCOL,TCP),(DOMAIN,corp.example.test,extended-matching))
+
+            [Rule]
+            RULE-SET,Office,DIRECT
+            NOT,((RULE-SET,Office)),REJECT
+            AND,((PROTOCOL,TCP),(RULE-SET,Office,extended-matching)),REJECT
+            NOT,((RULE-SET,CleanOffice,extended-matching)),REJECT
+            NOT,((DOMAIN,a.example,extended-matching)),REJECT
+            NOT,((NOT,((DOMAIN,b.example,extended-matching)))),REJECT
+            NOT,((DOMAIN,c.example)),REJECT,extended-matching
+            NOT,((RULE-SET,LogicOffice)),REJECT
+            FINAL,DIRECT
+        """))
+        stats = ConversionStats()
+        out_path = convert_file(str(root), stats)
+        assert out_path is not None
+        assert stats.errors == []
+        out = Path(out_path).read_text()
+
+        office_lists = list((tmp_path / "v4").glob("profile-Office-*-ruleset-v4.list"))
+        assert len(office_lists) == 1
+        office_list_text = office_lists[0].read_text()
+        assert "DOMAIN,office.example.test" in office_list_text
+        assert "extended-matching" not in office_list_text
+
+        # Positive RULE-SET and positive logical sub-rule stay active with extended-matching stripped
+        assert f"\nRULE-SET,{office_lists[0].name},DIRECT\n" in out
+        assert f"\nAND,((PROTOCOL,TCP),(RULE-SET,{office_lists[0].name})),REJECT\n" in out
+        # Narrowed Office under NOT must be cascade-commented
+        assert "# [V5+ cascade] NOT,((RULE-SET,Office)),REJECT" in out
+        # Negated sub-rules / outer NOT with extended-matching must be commented out
+        assert "# [V5+] NOT,((RULE-SET,CleanOffice,extended-matching)),REJECT" in out
+        assert "# [V5+] NOT,((DOMAIN,a.example,extended-matching)),REJECT" in out
+        assert "# [V5+] NOT,((DOMAIN,c.example)),REJECT,extended-matching" in out
+        # Double negation is positive polarity -> extended-matching stripped, rule stays
+        assert "\nNOT,((NOT,((DOMAIN,b.example)))),REJECT\n" in out
+        # Narrowed logical ruleset under NOT must be cascade-commented, no orphan .list
+        assert "# [V5+ cascade] NOT,((RULE-SET,LogicOffice)),REJECT" in out
+        assert list((tmp_path / "v4").glob("profile-LogicOffice-*")) == []
+        assert list((tmp_path / "v4").glob("profile-CleanOffice-*")) == []
+
 
 
 

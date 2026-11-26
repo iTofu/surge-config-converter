@@ -478,6 +478,7 @@ class FileState:
     is_abandoned: bool = False   # managed + changed → decided during analyze()
     output_written: bool = False # set during emit()
     output_path: str = None      # destination if written
+    local_only_converted: str = ""  # standalone direct-hit result before cross-file cascade
     # Cascade fields (populated during Discover, consumed during Analyze)
     lines: list = field(default_factory=list)          # mutable working copy of converted
     sections: list = field(default_factory=list)       # per-line section name
@@ -863,14 +864,82 @@ def remove_proxy_params(line, params_to_remove):
     return lhs + "=" + "".join(out) + trailing, removed
 
 
+def _transform_logical_criteria(body, start, end, negated=False):
+    """Recursively process v5+ options inside AND/OR/NOT logical sub-rules.
+
+    Returns (new_slice, removed_opts, unsafe_negation):
+      - Strips V5PLUS_ONLY_RULE_OPTIONS (extended-matching, pre-matching) from
+        leaf sub-rules under positive polarity.
+      - Sets unsafe_negation=True if a leaf sub-rule under negative polarity
+        (odd NOT depth) uses `extended-matching` (removing it would narrow the
+        inner criterion and expand the outer NOT match set).
+    """
+    inner = _strip_outer_parens(body, start, end)
+    if inner is None:
+        return body[start:end], [], False
+    inner_start, inner_end = inner
+    item_spans = _split_top_level_comma_spans(body[inner_start:inner_end], track_parens=True)
+    replacements = []
+    removed_all = []
+    for rel_s, rel_e in item_spans:
+        item_abs_s, item_abs_e = inner_start + rel_s, inner_start + rel_e
+        crit = _strip_outer_parens(body, item_abs_s, item_abs_e)
+        if crit is None:
+            continue
+        c_start, c_end = crit
+        sub_spans = _split_top_level_comma_spans(body[c_start:c_end], track_parens=True)
+        if len(sub_spans) < 2:
+            continue
+        r0_s, r0_e = sub_spans[0]
+        kind = body[c_start + r0_s:c_start + r0_e].strip().upper()
+        if kind in ("AND", "OR", "NOT"):
+            r1_s, r1_e = sub_spans[1]
+            sub_abs_s, sub_abs_e = c_start + r1_s, c_start + r1_e
+            next_neg = (not negated) if kind == "NOT" else negated
+            new_sub, sub_rem, sub_unsafe = _transform_logical_criteria(
+                body, sub_abs_s, sub_abs_e, negated=next_neg
+            )
+            if sub_unsafe:
+                return body[start:end], removed_all, True
+            if sub_rem:
+                replacements.append((sub_abs_s, sub_abs_e, new_sub))
+                removed_all.extend(sub_rem)
+            continue
+        # Leaf sub-rule: walk trailing options after (TYPE, value)
+        tokens = [body[c_start + s:c_start + e].strip() for s, e in sub_spans]
+        idx = len(tokens)
+        while idx > 2 and (tokens[idx - 1] in RULE_TRAILING_OPTIONS
+                           or ("=" in tokens[idx - 1] and not tokens[idx - 1].startswith('"'))):
+            idx -= 1
+        opts = tokens[idx:]
+        removed = [t for t in opts if t in V5PLUS_ONLY_RULE_OPTIONS]
+        if not removed:
+            continue
+        if negated and "extended-matching" in removed:
+            return body[start:end], removed_all, True
+        kept = tokens[:idx] + [t for t in opts if t not in V5PLUS_ONLY_RULE_OPTIONS]
+        replacements.append((c_start, c_end, ",".join(kept)))
+        removed_all.extend(removed)
+
+    if not replacements:
+        return body[start:end], [], False
+    # Splice replacements right-to-left within body[start:end]
+    result = body[start:end]
+    for abs_s, abs_e, repl in reversed(replacements):
+        rs, re_ = abs_s - start, abs_e - start
+        result = result[:rs] + repl + result[re_:]
+    return result, removed_all, False
+
+
 def _expand_ruleset_for_v4(rs_name, available_rulesets, visited=None):
     """Expand an inline [Ruleset <rs_name>] tree into v4 external ruleset text.
 
     Recursively inlines nested `RULE-SET,<Inner>` referencing other local inline
     rulesets. Returns (converted_text, err, lost_matchers):
       - err is None on success, or a reason string when v4 cannot express the tree.
-      - lost_matchers is True if any v5+-only rule was commented out (narrowing
-        the ruleset, which makes negated NOT references unsafe to keep).
+      - lost_matchers is True if any v5+-only rule was commented out OR
+        `extended-matching` was stripped (narrowing matching scope, which makes
+        negated NOT references unsafe to preserve).
     """
     if visited is None:
         visited = set()
@@ -885,7 +954,8 @@ def _expand_ruleset_for_v4(rs_name, available_rulesets, visited=None):
             out.append(line)
             continue
         body, trailing = split_inline_comment(stripped)
-        tokens = _split_top_level_commas(body, track_parens=True)
+        spans = _split_top_level_comma_spans(body, track_parens=True)
+        tokens = [body[s:e].strip() for s, e in spans]
         rule_type = tokens[0].upper() if len(tokens) >= 2 else ""
         if rule_type in V5PLUS_ONLY_RULE_TYPES or _V5PLUS_NESTED_RULE_RE.search(body):
             out.append(comment_line(line))
@@ -899,6 +969,8 @@ def _expand_ruleset_for_v4(rs_name, available_rulesets, visited=None):
                     f"嵌套规则集 RULE-SET,{nested_target} 带附加选项"
                     f" ({', '.join(extra_opts)}) 无法等价展开到 v4 外部规则集"
                 ), False
+            if "extended-matching" in tokens[2:]:
+                lost_matchers = True
             if (nested_target.upper() not in BUILTIN_RULESETS
                     and nested_target in available_rulesets):
                 sub_text, err, sub_lost = _expand_ruleset_for_v4(
@@ -913,17 +985,40 @@ def _expand_ruleset_for_v4(rs_name, available_rulesets, visited=None):
             return None, f"嵌套规则集 RULE-SET,{nested_target} 无法等价展开到 v4 外部规则集", False
         if rule_type == "DOMAIN-SET":
             return None, f"嵌套 {tokens[0]} 无法等价展开到 v4 外部规则集", False
-        if rule_type in ("AND", "OR", "NOT") and _find_rule_ruleset_spans(body, require_policy=False):
-            return None, "规则集内含逻辑规则嵌套 RULE-SET，无法等价展开到 v4 外部规则集", False
+        if rule_type in ("AND", "OR", "NOT"):
+            if _find_rule_ruleset_spans(body, require_policy=False):
+                return None, "规则集内含逻辑规则嵌套 RULE-SET，无法等价展开到 v4 外部规则集", False
+            new_crit, sub_rem, sub_unsafe = _transform_logical_criteria(
+                body, spans[1][0], spans[1][1], negated=(rule_type == "NOT")
+            )
+            if sub_unsafe:
+                out.append(comment_line(line))
+                lost_matchers = True
+                continue
+            if sub_rem:
+                if "extended-matching" in sub_rem:
+                    lost_matchers = True
+                body = body[:spans[1][0]] + new_crit + body[spans[1][1]:]
+                tokens = _split_top_level_commas(body, track_parens=True)
         idx = len(tokens)
         while idx > 1 and (tokens[idx - 1] in RULE_TRAILING_OPTIONS
                            or ("=" in tokens[idx - 1] and not tokens[idx - 1].startswith('"'))):
             idx -= 1
         options = tokens[idx:]
-        if any(t in V5PLUS_ONLY_RULE_OPTIONS for t in options):
+        removed_top = [t for t in options if t in V5PLUS_ONLY_RULE_OPTIONS]
+        if removed_top:
+            if rule_type == "NOT" and "extended-matching" in removed_top:
+                out.append(comment_line(line))
+                lost_matchers = True
+                continue
+            if "extended-matching" in removed_top:
+                lost_matchers = True
             kept = tokens[:idx] + [t for t in options if t not in V5PLUS_ONLY_RULE_OPTIONS]
             indent = line[:len(line) - len(stripped)]
             out.append(indent + ",".join(kept) + trailing)
+        elif rule_type in ("AND", "OR", "NOT") and body != split_inline_comment(stripped)[0]:
+            indent = line[:len(line) - len(stripped)]
+            out.append(indent + body + trailing)
         else:
             out.append(line)
     return "\n".join(out) + ("\n" if out else ""), None, lost_matchers
@@ -1105,6 +1200,28 @@ def transform_rule_line(line, stats, filename, line_num, section):
         stats.add_change(filename, line_num, section, "注释", stripped)
         return comment_line(line)
 
+    # Process v5+ options inside AND/OR/NOT sub-rules (e.g.
+    # (RULE-SET,Office,extended-matching)). Under negative polarity (NOT),
+    # removing extended-matching expands the negated match set → comment rule.
+    indent = line[:len(line) - len(stripped)]
+    sub_removed = []
+    if rule_type in ("AND", "OR", "NOT"):
+        spans = _split_top_level_comma_spans(body, track_parens=True)
+        if len(spans) >= 3:
+            new_crit, sub_removed, sub_unsafe = _transform_logical_criteria(
+                body, spans[1][0], spans[1][1], negated=(rule_type == "NOT")
+            )
+            if sub_unsafe:
+                stats.count_commented(filename)
+                stats.add_change(
+                    filename, line_num, section, "注释",
+                    f"{stripped} (否定子规则含 extended-matching，移除会扩大否定范围)",
+                )
+                return comment_line(line)
+            if sub_removed:
+                body = body[:spans[1][0]] + new_crit + body[spans[1][1]:]
+                tokens = _split_top_level_commas(body, track_parens=True)
+
     # Strip v5+ only options after the policy, e.g.
     # RULE-SET,<url>,REJECT,extended-matching → RULE-SET,<url>,REJECT
     i = _rule_policy_index(tokens)
@@ -1112,14 +1229,25 @@ def transform_rule_line(line, stats, filename, line_num, section):
         return line
     options = tokens[i + 1:]
     removed = [t for t in options if t in V5PLUS_ONLY_RULE_OPTIONS]
-    if not removed:
+    if not removed and not sub_removed:
         return line
-    kept = tokens[:i + 1] + [t for t in options if t not in V5PLUS_ONLY_RULE_OPTIONS]
-    rule = ",".join(kept)
-    stats.count_params(filename, len(removed))
-    for opt in removed:
+    if removed:
+        if rule_type == "NOT" and "extended-matching" in removed:
+            stats.count_commented(filename)
+            stats.add_change(
+                filename, line_num, section, "注释",
+                f"{stripped} (否定规则含 extended-matching，移除会扩大否定范围)",
+            )
+            return comment_line(line)
+        kept = tokens[:i + 1] + [t for t in options if t not in V5PLUS_ONLY_RULE_OPTIONS]
+        rule = ",".join(kept)
+    else:
+        rule = body
+    all_removed = sub_removed + removed
+    stats.count_params(filename, len(all_removed))
+    for opt in all_removed:
         stats.add_change(filename, line_num, section, "移除参数", f"{opt} ({rule})")
-    return line[:len(line) - len(stripped)] + rule + trailing
+    return indent + rule + trailing
 
 
 def transform_general_line(line, stats, filename, line_num, section):
@@ -1213,6 +1341,69 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
     return joined
 
 
+def _fs_name_max(directory):
+    """Return filesystem maximum filename byte length for directory (default 255)."""
+    try:
+        val = os.pathconf(directory, "PC_NAME_MAX")
+        if val > 0:
+            return val
+    except (OSError, ValueError, AttributeError):
+        pass
+    return 255
+
+
+def _make_scoped_filename(root_name, item_name, fixed_suffix, used_names, max_bytes,
+                          strip_item_ext=True):
+    """Build a deterministic, length-bounded filename scoped to (root_name, item_name).
+
+    Caps readable slugs so root+item concatenation never exceeds filesystem
+    NAME_MAX (even with -deprecated backup suffix), while preserving an 8-char
+    SHA-256 digest for uniqueness. Returns None if even the bare digest+suffix
+    exceeds max_bytes.
+    """
+    root_stem = Path(root_name).stem
+    item_stem = Path(item_name).stem if (strip_item_ext and "." in item_name) else item_name
+    safe_root = re.sub(r'[^A-Za-z0-9._-]+', '-', root_stem).strip('.-') or "profile"
+    safe_item = re.sub(r'[^A-Za-z0-9._-]+', '-', item_stem).strip('.-') or "item"
+    digest = hashlib.sha256(f"{root_name}\0{item_name}".encode("utf-8")).hexdigest()[:8]
+
+    # Reserve room for optional collision counter (-99) and UTF-8 suffix bytes
+    suffix_bytes = len(fixed_suffix.encode("utf-8"))
+    bare_overhead = len(digest) + suffix_bytes + 4
+    if bare_overhead > max_bytes:
+        return None
+
+    def _build(counter_str):
+        tail = f"-{digest}{counter_str}{fixed_suffix}"
+        tail_bytes = len(tail.encode("utf-8"))
+        # Need room for "<r_part>-<i_part>" + tail
+        avail = max_bytes - tail_bytes - 1  # -1 for separator '-' between r_part and i_part
+        if avail < 2:
+            return f"{digest}{counter_str}{fixed_suffix}"
+        r_cap = min(len(safe_root), 48, max(1, avail // 2))
+        i_cap = min(len(safe_item), 48, avail - r_cap)
+        if i_cap < 1:
+            r_cap = max(1, avail - 1)
+            i_cap = 1
+        # Give any unused root budget to item (up to 48) and vice versa
+        if r_cap < avail - i_cap:
+            r_cap = min(len(safe_root), 48, avail - i_cap)
+        if i_cap < avail - r_cap:
+            i_cap = min(len(safe_item), 48, avail - r_cap)
+        r_part = safe_root[:r_cap].rstrip(".-") or "p"
+        i_part = safe_item[:i_cap].rstrip(".-") or "s"
+        return f"{r_part}-{i_part}{tail}"
+
+    cand = _build("")
+    suffix = 2
+    while cand in used_names:
+        cand = _build(f"-{suffix}")
+        if len(cand.encode("utf-8")) > max_bytes:
+            return None
+        suffix += 1
+    return cand
+
+
 def _section_is_loaded(loaded_set, section):
     """Return True if section is loaded (None means all sections, i.e. root)."""
     return loaded_set is None or section in loaded_set
@@ -1293,6 +1484,7 @@ class Pipeline:
             filename=basename,
             legacy=self.snell_legacy.get(basename),
         )
+        state.local_only_converted = state.converted
 
         # Populate cascade fields: split into mutable lines, sectionize, and
         # catalog owned proxy / group / WireGuard / inline Ruleset definitions.
@@ -1903,9 +2095,48 @@ class Pipeline:
                 if entries:
                     state.iog_sources[i] = entries
 
+    def _validate_include_other_groups(self, loaded_map, effective_deleted):
+        """Read-only check that every surviving include-other-group value can be
+        represented in Surge v4 syntax. Does not mutate lines so subsequent v5+
+        parsers (like _rewrite_references) never see v4-formatted quotes."""
+        for abs_path, loaded_set in loaded_map.items():
+            if not _section_is_loaded(loaded_set, "Proxy Group"):
+                continue
+            state = self.files[abs_path]
+            if state.is_abandoned:
+                continue
+            basename = os.path.basename(abs_path)
+            for i in sorted(state.iog_sources):
+                line = state.lines[i]
+                stripped = line.lstrip()
+                if not stripped or stripped.startswith("#") or _COMMENT_PREFIX_RE.match(stripped):
+                    continue
+                pgl = parse_proxy_group_line(line)
+                if pgl is None:
+                    continue
+                cached = state.iog_sources[i]
+                iog_idx = 0
+                for k, _ in pgl.options:
+                    if k.lower() == "include-other-group" and iog_idx < len(cached):
+                        orig_groups, was_quoted, had_v5_escape = cached[iog_idx]
+                        iog_idx += 1
+                        kept = [g for g in orig_groups if g not in effective_deleted]
+                        dropped = [g for g in orig_groups if g in effective_deleted]
+                        if (not dropped and not had_v5_escape) or not kept:
+                            continue
+                        try:
+                            format_include_other_groups(kept, was_quoted=was_quoted)
+                        except ValueError as exc:
+                            err_msg = f"{basename}:{i + 1} [{pgl.name}] {exc}"
+                            if err_msg not in self.stats.errors:
+                                self.stats.errors.append(err_msg)
+
     def _finalize_include_other_groups(self, loaded_map, effective_deleted):
-        """Validate and encode surviving include-other-group values ONCE for
-        Surge v4 after the global cascade fixpoint has fully converged."""
+        """Write surviving include-other-group values ONCE in Surge v4 syntax.
+
+        Must run STRICTLY AFTER _rewrite_references() so no v5+ parser ever
+        re-parses v4-serialized quotes (e.g. a trailing literal backslash
+        before closing '\"')."""
         for abs_path, loaded_set in loaded_map.items():
             if not _section_is_loaded(loaded_set, "Proxy Group"):
                 continue
@@ -2182,16 +2413,20 @@ class Pipeline:
             ):
                 break
 
-        # 5. Global fixpoint has converged: finalize include-other-group v4
-        # validation & writeback ONCE (order-independent, never re-decoded),
-        # validate v4 output invariants (no lost FINAL, no unrepresentable
-        # group names), materialize root-scoped rulesets + isolate shared
-        # sub-files that depend on them, then rewrite #!include / policy-path.
+        # 5. Global fixpoint has converged: enforce strict one-way v5+ → v4
+        # phase order so no v5+ parser ever re-parses v4-formatted quotes:
+        #   (a) read-only validation (include-other-group representability + FINAL)
+        #   (b) materialize root-scoped inline rulesets (.list)
+        #   (c) isolate EVERY root-dependent non-root sub-file (and its non-root
+        #       ancestors) with length-bounded root-scoped filenames
+        #   (d) rewrite #!include / policy-path while [Proxy Group] is still v5+
+        #   (e) finalize v4 include-other-group syntax LAST
         final_loaded = self._loaded_sections()
         self.emitting = self._emitting()
+        final_deleted = set()
         if self.emitting:
             final_deleted = self.global_deleted - self._live_names()
-            self._finalize_include_other_groups(final_loaded, final_deleted)
+            self._validate_include_other_groups(final_loaded, final_deleted)
             if had_initial_final and not self._has_live_final(final_loaded, use_original=False):
                 self.stats.errors.append(
                     "级联清理后 [Rule] 缺少可用的 FINAL 规则（原 FINAL 指向已删除的策略或已放弃的文件），"
@@ -2204,12 +2439,33 @@ class Pipeline:
             return
 
         if self.emitting:
+            root_abs = next(iter(self.files))
             root_scoped_files = self._materialize_rulesets(exportable_rulesets, final_loaded)
+            for abs_path in self.emitting:
+                if abs_path == root_abs:
+                    continue
+                state = self.files[abs_path]
+                loaded_set = final_loaded.get(abs_path)
+                has_pending_iog = any(
+                    _section_is_loaded(loaded_set, state.sections[idx])
+                    for idx in state.pending_iog_lines
+                )
+                if has_pending_iog or _serialize_lines(state.lines, state.original) != state.local_only_converted:
+                    root_scoped_files.add(abs_path)
             self._assign_root_scoped_subfiles(root_scoped_files, final_loaded)
+            if self.stats.errors:
+                self.emitting = set()
+                self.generated_rulesets = {}
+                self.output_relnames = {}
+                return
+
         self._rewrite_references(final_loaded)
+        if self.emitting:
+            self._finalize_include_other_groups(final_loaded, final_deleted)
 
         # 6. Convert commented-out nodes in emitted files (loaded [Proxy] only),
-        # then re-serialize converted content from mutated lines.
+        # re-serialize converted content from mutated lines, then validate ALL
+        # planned output paths against filesystem NAME_MAX before emit() writes.
         for state in self.files.values():
             if state.is_abandoned:
                 continue
@@ -2217,6 +2473,14 @@ class Pipeline:
                 if _section_is_loaded(final_loaded.get(state.abs_path), "Proxy"):
                     self._convert_commented_proxies(state)
             state.converted = _serialize_lines(state.lines, state.original)
+
+        if self.emitting or self.generated_rulesets:
+            self._validate_planned_output_paths()
+            if self.stats.errors:
+                self.emitting = set()
+                self.generated_rulesets = {}
+                self.output_relnames = {}
+                return
 
     def _convert_commented_proxies(self, state):
         """Give commented-out [Proxy] nodes the same transforms as live ones,
@@ -2315,8 +2579,9 @@ class Pipeline:
             return root_scoped_files
         root_abs = next(iter(self.files))
         root_path = Path(root_abs)
-        root_stem = re.sub(r'[^A-Za-z0-9._-]+', '-', root_path.stem).strip('.-') or "profile"
-        v4_dir = os.path.join(os.path.dirname(root_abs), V4_SUBDIR)
+        root_dir = os.path.dirname(root_abs)
+        v4_dir = os.path.join(root_dir, V4_SUBDIR)
+        scoped_max = min(_fs_name_max(root_dir), 255) - len("-deprecated")
         used_names = {os.path.basename(make_v4_filename(p)) for p in self.emitting}
         assigned = {}  # rs_name → bare .list filename
 
@@ -2339,15 +2604,15 @@ class Pipeline:
                     if target.upper() in BUILTIN_RULESETS or target not in exportable_rulesets:
                         continue
                     if target not in assigned:
-                        safe_rs = re.sub(r'[^A-Za-z0-9._-]+', '-', target).strip('.-') or "ruleset"
-                        digest = hashlib.sha256(
-                            f"{root_path.name}\0{target}".encode("utf-8")
-                        ).hexdigest()[:8]
-                        cand = f"{root_stem}-{safe_rs}-{digest}-ruleset-v4.list"
-                        suffix = 2
-                        while cand in used_names:
-                            cand = f"{root_stem}-{safe_rs}-{digest}-{suffix}-ruleset-v4.list"
-                            suffix += 1
+                        cand = _make_scoped_filename(
+                            root_path.name, target, "-ruleset-v4.list",
+                            used_names, scoped_max, strip_item_ext=False,
+                        )
+                        if cand is None:
+                            self.stats.errors.append(
+                                f"规则集 {target} 无法生成符合文件系统长度上限的导出文件名；已停止导出。"
+                            )
+                            return root_scoped_files
                         used_names.add(cand)
                         assigned[target] = cand
                         self.generated_rulesets[os.path.join(v4_dir, cand)] = (
@@ -2368,13 +2633,12 @@ class Pipeline:
 
     def _assign_root_scoped_subfiles(self, root_scoped_files, loaded_map):
         """Give root-dependent non-root sub-files (and any non-root ancestors
-        that include them) root-scoped v4 output filenames so multiple root
-        profiles sharing a sub-file never overwrite each other's rewrites."""
+        that include them) length-bounded root-scoped v4 output filenames so
+        multiple root profiles sharing a sub-file never overwrite each other."""
         if not root_scoped_files:
             return
         root_abs = next(iter(self.files))
         root_path = Path(root_abs)
-        root_stem = re.sub(r'[^A-Za-z0-9._-]+', '-', root_path.stem).strip('.-') or "profile"
 
         reverse_refs = {}
         for p in self.emitting:
@@ -2398,17 +2662,73 @@ class Pipeline:
         used_names |= {os.path.basename(p) for p in self.generated_rulesets}
         for sub_abs in sorted(all_scoped):
             sub_path = Path(sub_abs)
-            sub_stem = re.sub(r'[^A-Za-z0-9._-]+', '-', sub_path.stem).strip('.-') or "include"
-            digest = hashlib.sha256(
-                f"{root_path.name}\0{sub_path.name}".encode("utf-8")
-            ).hexdigest()[:8]
-            cand = f"{root_stem}-{sub_stem}-{digest}-v4{sub_path.suffix}"
-            suffix = 2
-            while cand in used_names:
-                cand = f"{root_stem}-{sub_stem}-{digest}-{suffix}-v4{sub_path.suffix}"
-                suffix += 1
+            scoped_max = min(_fs_name_max(os.path.dirname(sub_abs)), 255) - len("-deprecated")
+            cand = _make_scoped_filename(
+                root_path.name, sub_path.name, f"-v4{sub_path.suffix}",
+                used_names, scoped_max, strip_item_ext=True,
+            )
+            if cand is None:
+                self.stats.errors.append(
+                    f"子文件 {sub_path.name} 无法生成符合文件系统长度上限的隔离文件名；已停止导出。"
+                )
+                return
             used_names.add(cand)
             self.output_relnames[sub_abs] = cand
+
+    def _validate_planned_output_paths(self):
+        """Verify every planned output file (and any required -deprecated backup)
+        fits within filesystem NAME_MAX BEFORE emit() touches disk."""
+        root_abs = next(iter(self.files))
+        for abs_path in sorted(self.emitting):
+            state = self.files[abs_path]
+            if state.is_abandoned or abs_path not in self.reachable:
+                continue
+            out_path = self._output_path(abs_path)
+            name_max = _fs_name_max(os.path.dirname(abs_path))
+            out_name = os.path.basename(out_path)
+            out_bytes = len(out_name.encode("utf-8"))
+            if out_bytes > name_max:
+                self.stats.errors.append(
+                    f"输出文件名超出文件系统长度上限 ({out_bytes} > {name_max} 字节): {out_name}"
+                )
+                continue
+            if os.path.exists(out_path):
+                try:
+                    with open(out_path, "r", encoding="utf-8") as f:
+                        existing = f.read()
+                except OSError:
+                    existing = None
+                if existing != state.converted:
+                    p = Path(out_path)
+                    backup_name = p.stem + "-deprecated" + p.suffix
+                    backup_bytes = len(backup_name.encode("utf-8"))
+                    if backup_bytes > name_max:
+                        self.stats.errors.append(
+                            f"备份文件名超出文件系统长度上限 ({backup_bytes} > {name_max} 字节): {backup_name}"
+                        )
+        rs_name_max = _fs_name_max(os.path.dirname(root_abs))
+        for out_path, content in sorted(self.generated_rulesets.items()):
+            out_name = os.path.basename(out_path)
+            out_bytes = len(out_name.encode("utf-8"))
+            if out_bytes > rs_name_max:
+                self.stats.errors.append(
+                    f"规则集文件名超出文件系统长度上限 ({out_bytes} > {rs_name_max} 字节): {out_name}"
+                )
+                continue
+            if os.path.exists(out_path):
+                try:
+                    with open(out_path, "r", encoding="utf-8") as f:
+                        existing = f.read()
+                except OSError:
+                    existing = None
+                if existing != content:
+                    p = Path(out_path)
+                    backup_name = p.stem + "-deprecated" + p.suffix
+                    backup_bytes = len(backup_name.encode("utf-8"))
+                    if backup_bytes > rs_name_max:
+                        self.stats.errors.append(
+                            f"规则集备份文件名超出文件系统长度上限 ({backup_bytes} > {rs_name_max} 字节): {backup_name}"
+                        )
 
     def _cascade_single_file(self, state, loaded_set=None, is_global_proxy_file=True,
                              live_wg_sections=None, has_unexpanded_wg=False,
