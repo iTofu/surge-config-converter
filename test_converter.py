@@ -4000,3 +4000,160 @@ class TestSnellLegacyLoading:
         captured = capsys.readouterr()
         assert ("权限宽于 0600" in captured.err) is warned
         assert self.PSK not in captured.out + captured.err
+
+
+# --- T22: New v5+/v6 protocols, block-quic param, Tailscale/wildcard sections, multi-group include-other-group ---
+
+class TestV6ProtocolsAndParams:
+    @pytest.mark.parametrize("line", [
+        "MyTS = tailscale, section-name=myts",
+        "SG-TUIC5 = tuic-v5, 1.2.3.4, 443, uuid=00000000-0000-0000-0000-000000000000, password=pwd",
+        "US-VLESS = vless, 1.2.3.4, 443, username=00000000-0000-0000-0000-000000000000",
+        "JP-MASQUE = masque, 1.2.3.4, 443, username=u, password=p",
+        "EU-H2 = h2-connect, 1.2.3.4, 443, username=u, password=p",
+    ])
+    def test_new_v5plus_proxy_types_commented(self, line):
+        result = convert(f"[Proxy]\n{line}\n")
+        assert f"# [V5+] {line}" in result
+
+    def test_block_quic_proxy_param_removed(self):
+        result = convert("""
+            [Proxy]
+            US-SS = ss, 1.2.3.4, 8000, encrypt-method=aes-256-gcm, password=pwd, block-quic=on, tfo=true
+        """)
+        assert "block-quic" not in result
+        assert "tfo=true" in result
+        assert not result.splitlines()[1].startswith("# [V5+]")
+
+
+class TestTailscaleAndWildcardSections:
+    def test_tailscale_named_and_wildcard_sections_commented(self):
+        result = convert("""
+            [Proxy]
+            MyTS = tailscale, section-name=net1
+
+            [Tailscale net1]
+            interactive-login = true
+            hostname = demo-node
+
+            [Tailscale *]
+            #!include tunnels.dconf
+
+            [WireGuard *]
+            #!include tunnels.dconf
+
+            [Ruleset *]
+            #!include rulesets.dconf
+        """)
+        lines = result.splitlines()
+        assert "# [V5+] MyTS = tailscale, section-name=net1" in lines
+        assert "# [V5+] [Tailscale net1]" in lines
+        assert "# [V5+] interactive-login = true" in lines
+        assert "# [V5+] [Tailscale *]" in lines
+        assert "# [V5+] [WireGuard *]" in lines
+        assert "# [V5+] [Ruleset *]" in lines
+        assert lines.count("# [V5+] #!include tunnels.dconf") == 2
+
+    def test_concrete_wireguard_section_preserved(self):
+        result = convert("""
+            [Proxy]
+            OfficeWG = wireguard, section-name=office-wg
+
+            [WireGuard office-wg]
+            self-ip = 10.20.0.2
+            mtu = 1280
+        """)
+        assert "[WireGuard office-wg]" in result
+        assert "# [V5+]" not in result
+
+    def test_detached_tunnel_dconf_end_to_end(self, tmp_path):
+        (tmp_path / "tunnels.dconf").write_text(textwrap.dedent("""\
+            [Proxy]
+            DemoTS = tailscale, section-name=ABCD1234
+
+            [Tailscale ABCD1234]
+            interactive-login = true
+        """))
+        root = tmp_path / "profile.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            #!include tunnels.dconf
+
+            [Proxy Group]
+            TS = select, include-all-proxies=1, policy-regex-filter=(?i)ts, hidden=true
+
+            [WireGuard *]
+            #!include tunnels.dconf
+
+            [Tailscale *]
+            #!include tunnels.dconf
+        """))
+        out = convert_file(str(root))
+        assert out == str(tmp_path / "v4" / "profile-v4.conf")
+        root_v4 = (tmp_path / "v4" / "profile-v4.conf").read_text()
+        tunnels_v4 = (tmp_path / "v4" / "tunnels-v4.dconf").read_text()
+
+        assert "#!include tunnels-v4.dconf" in root_v4
+        assert "# [V5+] [WireGuard *]" in root_v4
+        assert "# [V5+] [Tailscale *]" in root_v4
+        # Commented #!include inside v5+ wildcard sections should NOT be rewritten
+        assert root_v4.count("# [V5+] #!include tunnels.dconf") == 2
+        assert "# [V5+] DemoTS = tailscale, section-name=ABCD1234" in tunnels_v4
+        assert "# [V5+] [Tailscale ABCD1234]" in tunnels_v4
+        assert "# [V5+] interactive-login = true" in tunnels_v4
+
+
+class TestMultiGroupIncludeOtherGroupCascade:
+    def test_partial_strip_keeps_surviving_groups(self, tmp_path):
+        (tmp_path / "provider.conf").write_text(textwrap.dedent("""\
+            #!MANAGED-CONFIG https://example.com/sub interval=86400
+            [Proxy]
+            P1 = anytls, 1.2.3.4, 443, password=pwd
+        """))
+        (tmp_path / "local-a.dconf").write_text("[Proxy]\nA1 = snell, 2.2.2.2, 8000, psk=a, version=4\n")
+        (tmp_path / "local-b.dconf").write_text("[Proxy]\nB1 = snell, 3.3.3.3, 8000, psk=b, version=4\n")
+        root = tmp_path / "main.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy Group]
+            Provider = smart, policy-path=provider.conf
+            GroupA = select, policy-path=local-a.dconf
+            GroupB = select, policy-path=local-b.dconf
+            AllNodes = select, include-other-group="Provider, GroupA, GroupB", hidden=true
+            Downstream = select, include-other-group=AllNodes
+        """))
+        convert_file(str(root))
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] Provider = url-test" in out
+        assert 'AllNodes = select, include-other-group="GroupA, GroupB", hidden=true' in out
+        assert "Downstream = select, include-other-group=AllNodes" in out
+
+    def test_all_groups_deleted_cascades_group_and_downstream(self, tmp_path):
+        (tmp_path / "p1.conf").write_text(
+            "#!MANAGED-CONFIG https://example.com/1\n[Proxy]\nN1 = anytls, 1.1.1.1, 443, password=p\n"
+        )
+        (tmp_path / "p2.conf").write_text(
+            "#!MANAGED-CONFIG https://example.com/2\n[Proxy]\nN2 = hysteria2, 2.2.2.2, 443, password=p\n"
+        )
+        root = tmp_path / "main.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy Group]
+            G1 = select, policy-path=p1.conf
+            G2 = select, policy-path=p2.conf
+            Merged = select, include-other-group="G1, G2"
+            Leaf = select, include-other-group=Merged
+
+            [Rule]
+            DOMAIN,example.com,Leaf
+            FINAL,DIRECT
+        """))
+        convert_file(str(root))
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] Merged = select" in out
+        assert "# [V5+ cascade] Leaf = select" in out
+        assert "# [V5+ cascade] DOMAIN,example.com,Leaf" in out
+
+    def test_has_effective_members_multi_group(self):
+        pgl = parse_proxy_group_line('All = select, include-other-group="G1, G2"')
+        assert has_effective_members(pgl, {"G1"}, set()) is True
+        assert has_effective_members(pgl, {"G1", "G2"}, set()) is False
+

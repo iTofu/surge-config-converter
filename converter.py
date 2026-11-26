@@ -41,7 +41,10 @@ from send2trash import send2trash
 
 
 # Proxy types not supported in Surge v4
-V5PLUS_ONLY_PROXY_TYPES = {"hysteria2", "hy2", "anytls", "tuic", "trust-tunnel"}
+V5PLUS_ONLY_PROXY_TYPES = {
+    "hysteria2", "hy2", "anytls", "tuic", "tuic-v5",
+    "trust-tunnel", "tailscale", "vless", "masque", "h2-connect",
+}
 
 # Snell versions above this have no v4 equivalent: v4 speaks up to version=4,
 # version=5 is down-converted to 4, version=6+ nodes are disabled like the
@@ -63,6 +66,22 @@ SNELL_LEGACY_FILENAME = "snell-legacy.ini"
 
 # Sections that should be entirely commented out in v4
 V5PLUS_ONLY_SECTIONS = {"Port Forwarding", "Body Rewrite"}
+# Section-name prefixes unsupported in v4 (e.g. [Tailscale my-net], [Tailscale *])
+V5PLUS_ONLY_SECTION_PREFIXES = ("Tailscale ",)
+# Wildcard named-section includes ([<Base> *]) are v5+/v6-only; concrete
+# [WireGuard <name>] remains supported in v4.
+V5PLUS_WILDCARD_SECTION_BASES = {"WireGuard", "Tailscale", "Ruleset"}
+
+
+def is_v5plus_only_section(section_name):
+    """Return True if the entire [section_name] section is unsupported in v4."""
+    if section_name in V5PLUS_ONLY_SECTIONS:
+        return True
+    if any(section_name.startswith(p) for p in V5PLUS_ONLY_SECTION_PREFIXES):
+        return True
+    if section_name.endswith(" *"):
+        return section_name[:-2] in V5PLUS_WILDCARD_SECTION_BASES
+    return False
 
 # General parameters not supported in v4
 V5PLUS_ONLY_GENERAL_PARAMS = {"udp-priority", "block-quic"}
@@ -80,7 +99,7 @@ _V5PLUS_NESTED_RULE_RE = re.compile(
 )
 
 # Proxy parameters to remove (v5+ only)
-V5PLUS_ONLY_PROXY_PARAMS = {"port-hopping", "port-hopping-interval", "ecn"}
+V5PLUS_ONLY_PROXY_PARAMS = {"port-hopping", "port-hopping-interval", "ecn", "block-quic"}
 
 # Cascade-cleanup tag prefix: distinguishes follow-on deletions from direct hits.
 CASCADE_TAG = "# [V5+ cascade] "
@@ -92,9 +111,27 @@ _COMMENT_PREFIX_RE = re.compile(r'^\s*(?:(?:#(?!!)|//|;)\s*)+')
 
 # Proxy types whose definition is "name = type, host, port, key=value...".
 # Only these are recognized inside comments; anything else stays verbatim.
-HOST_PORT_PROXY_TYPES = {
-    "http", "https", "socks5", "socks5-tls", "ss", "snell", "vmess", "trojan", "ssh",
-} | V5PLUS_ONLY_PROXY_TYPES
+HOST_PORT_PROXY_TYPES = (
+    {"http", "https", "socks5", "socks5-tls", "ss", "snell", "vmess", "trojan", "ssh"}
+    | (V5PLUS_ONLY_PROXY_TYPES - {"tailscale"})
+)
+
+
+def parse_include_other_groups(value):
+    """Parse an include-other-group option value into a list of group names.
+
+    Surge accepts a single name (GroupA or "GroupA") or a quoted
+    comma-separated list ("GroupA, GroupB").
+    """
+    raw = unquote(value.strip())
+    return [g.strip() for g in raw.split(",") if g.strip()]
+
+
+def format_include_other_groups(groups, was_quoted=False):
+    """Format surviving group names back into an include-other-group value."""
+    if len(groups) > 1 or was_quoted or any("," in g or " " in g for g in groups):
+        return '"' + ", ".join(groups) + '"'
+    return groups[0]
 
 
 def unquote(name):
@@ -161,8 +198,9 @@ def has_effective_members(pgl, deleted_names, abandoned_basenames):
     for key, value in pgl.options:
         if key == "include-all-proxies" and value.strip() in {"1", "true"}:
             return True
-        if key == "include-other-group" and unquote(value.strip()) not in deleted_names:
-            return True
+        if key == "include-other-group":
+            if any(g not in deleted_names for g in parse_include_other_groups(value)):
+                return True
         if key == "policy-path":
             if value.startswith("http://") or value.startswith("https://"):
                 return True
@@ -697,7 +735,7 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
         section_match = re.match(r'^\[(.+)\]$', stripped)
         if section_match:
             section_name = section_match.group(1)
-            if section_name in V5PLUS_ONLY_SECTIONS:
+            if is_v5plus_only_section(section_name):
                 in_v5plus_only_section = True
                 current_section = section_name
                 stats.count_commented(filename)
@@ -1206,16 +1244,31 @@ class Pipeline:
                     m for m in original_members
                     if unquote(m) not in state.deleted_names
                 ]
-                # include-other-group pointing at a deleted group is dead supply
+                # include-other-group pointing at deleted group(s) is dead supply;
+                # multi-group values ("G1, G2") strip only deleted entries.
                 original_options = list(pgl.options)
-                pgl.options = [
-                    (k, v) for k, v in original_options
-                    if not (k == "include-other-group"
-                            and unquote(v.strip()) in state.deleted_names)
-                ]
+                new_options = []
+                removed_opt_tokens = []
+                for k, v in original_options:
+                    if k == "include-other-group":
+                        sv = v.strip()
+                        was_quoted = len(sv) >= 2 and sv[0] == '"' and sv[-1] == '"'
+                        groups = parse_include_other_groups(sv)
+                        kept = [g for g in groups if g not in state.deleted_names]
+                        dropped = [g for g in groups if g in state.deleted_names]
+                        if not dropped:
+                            new_options.append((k, v))
+                        elif kept:
+                            new_options.append((k, format_include_other_groups(kept, was_quoted=was_quoted)))
+                            removed_opt_tokens.append(f"{k}:{', '.join(dropped)}")
+                        else:
+                            removed_opt_tokens.append(f"{k}={v}")
+                    else:
+                        new_options.append((k, v))
+                pgl.options = new_options
                 removed_tokens = (
                     [m for m in original_members if m not in pgl.members]
-                    + [f"{k}={v}" for k, v in original_options if (k, v) not in pgl.options]
+                    + removed_opt_tokens
                 )
                 if not removed_tokens:
                     continue  # D6: pre-existing empty groups left alone
