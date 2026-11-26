@@ -115,8 +115,9 @@ psk = <legacy-psk>
 |------|------|
 | `[Port Forwarding]` | 整段注释 |
 | `[Body Rewrite]` | 整段注释 |
-| `[Tailscale <name>]` / `[Tailscale *]` | 整段注释（iOS 5.20.0+ / Mac 6.7.0+） |
-| `[WireGuard *]` / `[Ruleset *]` | 整段注释（通配符 `#!include` 段为 v5+/v6 语法；具名 `[WireGuard <name>]` 保留） |
+| `[Tailscale <name>]` | 整段注释（iOS 5.20.0+ / Mac 6.7.0+） |
+| `[Ruleset <name>]` | 整段注释（内联规则集，Mac 5.3.1+）；若仍有活跃 `RULE-SET` 引用，导出为 `v4/` 下的独立外部规则集文件（`.list`）并改写引用 |
+| `[Tailscale *]` / `[WireGuard *]` / `[Ruleset *]` | 整段注释（通配符 `#!include` 段，iOS 5.22.0+ / Mac 6.9.0+）；本地非托管 `[WireGuard *]` 展开为具名 `[WireGuard <name>]` `#!include`，本地非托管 `[Ruleset *]` 按需导出为外部规则集文件，无法保留定义时级联清理受影响的 WireGuard 节点与 `RULE-SET` 规则 |
 
 ### 引用文件
 
@@ -137,6 +138,8 @@ psk = <legacy-psk>
 
 当某个 proxy 或 proxy group 因 v5+ 转换被注释或因托管配置放弃而消失时，引用它的其他配置行也会被清理：
 
+- **`underlying-proxy` 代理链**：当 `[Proxy]` 或 `[Proxy Group]` 的 `underlying-proxy` 指向已删除的节点或策略组时，整行注释并继续向上游策略组和规则级联
+- **失去定义的 WireGuard / 内联规则集**：当 `[WireGuard *]`、`[Ruleset *]` 或具名 `[WireGuard <name>]` 的来源为远端 URL、缺失文件或被放弃的托管配置而无法保留定义时，级联注释受影响的 `wireguard` 节点与 `RULE-SET` 规则
 - **Proxy Group 成员**：从成员列表中移除已删除的名称（含 `include-other-group` 的单组与逗号分隔多组值，仅剔除其中已删除项）；若 group 因此失去所有有效成员来源（显式成员 / `include-all-proxies` / `include-other-group` / 有效 `policy-path`），整行注释
 - **Rule 策略**：规则指向已删除的 group/proxy 时，整行注释
 - **`#!include`**：移除指向被放弃文件的条目；若列表清空，整行注释

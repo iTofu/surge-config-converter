@@ -22,6 +22,7 @@ from converter import (
     ProxyGroupLine,
     remove_proxy_params,
     unquote,
+    V5PLUS_ONLY_PROXY_PARAMS,
 )
 
 
@@ -4156,4 +4157,519 @@ class TestMultiGroupIncludeOtherGroupCascade:
         pgl = parse_proxy_group_line('All = select, include-other-group="G1, G2"')
         assert has_effective_members(pgl, {"G1"}, set()) is True
         assert has_effective_members(pgl, {"G1", "G2"}, set()) is False
+
+
+# --- T81: Round 1 fixes — quoted proxy params, wildcard expansion, underlying-proxy, header comments, include-other-group syntax ---
+
+class TestRemoveProxyParamsQuotedAndSpacing:
+    def test_quoted_password_containing_param_not_truncated(self):
+        line = 'US = ss, 1.2.3.4, 8000, encrypt-method=aes-256-gcm, password="left, block-quic=right", tfo=true'
+        result, removed = remove_proxy_params(line, V5PLUS_ONLY_PROXY_PARAMS)
+        assert result == line
+        assert removed == []
+
+    def test_quoted_password_kept_while_real_spaced_param_removed(self):
+        line = (
+            'US = ss, 1.2.3.4, 8000, encrypt-method=aes-256-gcm, '
+            'password="left, block-quic=right", block-quic = on, tfo=true # keep'
+        )
+        result, removed = remove_proxy_params(line, V5PLUS_ONLY_PROXY_PARAMS)
+        assert result == (
+            'US = ss, 1.2.3.4, 8000, encrypt-method=aes-256-gcm, '
+            'password="left, block-quic=right", tfo=true # keep'
+        )
+        assert removed == ["block-quic"]
+
+    def test_escaped_quote_in_password_and_inline_comment(self):
+        line = 'US = ss, 1.2.3.4, 8000, password="a\\"b, block-quic=right", block-quic = auto // note'
+        result, removed = remove_proxy_params(line, V5PLUS_ONLY_PROXY_PARAMS)
+        assert result == 'US = ss, 1.2.3.4, 8000, password="a\\"b, block-quic=right" // note'
+        assert removed == ["block-quic"]
+
+    def test_hash_in_lhs_proxy_name_preserved(self):
+        line = "Node #1 = ss, 1.2.3.4, 8000, password=pwd, block-quic = on"
+        result, removed = remove_proxy_params(line, V5PLUS_ONLY_PROXY_PARAMS)
+        assert result == "Node #1 = ss, 1.2.3.4, 8000, password=pwd"
+        assert removed == ["block-quic"]
+
+    def test_param_name_inside_inline_comment_untouched(self):
+        line = "US = ss, 1.2.3.4, 8000, password=pwd # block-quic=on"
+        result, removed = remove_proxy_params(line, V5PLUS_ONLY_PROXY_PARAMS)
+        assert result == line
+        assert removed == []
+
+    def test_convert_preserves_quoted_password_and_removes_spaced_block_quic(self):
+        result = convert("""
+            [Proxy]
+            US = ss, 1.2.3.4, 8000, encrypt-method=aes-256-gcm, password="left, block-quic=right", block-quic = on, tfo=true
+        """)
+        assert (
+            'US = ss, 1.2.3.4, 8000, encrypt-method=aes-256-gcm, '
+            'password="left, block-quic=right", tfo=true'
+        ) in result
+
+
+class TestWildcardIncludePreservationAndCascade:
+    WG_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    WG_PUB = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+
+    def test_local_wireguard_and_ruleset_wildcards_preserved_end_to_end(self, tmp_path):
+        (tmp_path / "tunnels.dconf").write_text(textwrap.dedent(f"""\
+            [Proxy]
+            OfficeWG = wireguard, section-name=office
+            MyTS = tailscale, section-name=ts1
+
+            [WireGuard office]
+            private-key = {self.WG_KEY}
+            self-ip = 10.20.0.2
+            mtu = 1280
+            peer = (public-key = {self.WG_PUB}, allowed-ips = "10.20.0.0/24", endpoint = 1.2.3.4:51820)
+
+            [Tailscale ts1]
+            interactive-login = true
+
+            [Ruleset OfficeSites]
+            DOMAIN-SUFFIX,corp.example
+            DOMAIN-WILDCARD,*corp.example
+            DOMAIN,cdn.corp.example,extended-matching
+            IP-CIDR,10.20.0.0/24,no-resolve
+        """))
+        root = tmp_path / "profile.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            #!include tunnels.dconf
+
+            [WireGuard *]
+            #!include tunnels.dconf
+
+            [Tailscale *]
+            #!include tunnels.dconf
+
+            [Ruleset *]
+            #!include tunnels.dconf
+
+            [Rule]
+            RULE-SET,OfficeSites,OfficeWG
+            FINAL,DIRECT
+        """))
+        out = convert_file(str(root))
+        assert out == str(tmp_path / "v4" / "profile-v4.conf")
+        root_v4 = (tmp_path / "v4" / "profile-v4.conf").read_text()
+        tunnels_v4 = (tmp_path / "v4" / "tunnels-v4.dconf").read_text()
+        rs_file = tmp_path / "v4" / "OfficeSites-ruleset-v4.list"
+
+        # Wildcard headers are commented; concrete [WireGuard office] is expanded and rewritten
+        assert "# [V5+] [WireGuard *]" in root_v4
+        assert "[WireGuard office]\n#!include tunnels-v4.dconf" in root_v4
+        assert "# [V5+] [Ruleset *]" in root_v4
+        # OfficeWG survives in tunnels-v4.dconf; Tailscale & inline Ruleset are commented
+        assert "\nOfficeWG = wireguard, section-name=office\n" in tunnels_v4
+        assert "# [V5+] MyTS = tailscale, section-name=ts1" in tunnels_v4
+        assert "# [V5+] [Ruleset OfficeSites]" in tunnels_v4
+        # Inline ruleset materialized into v4/*.list with v4 rule conversion applied
+        assert rs_file.exists()
+        rs_text = rs_file.read_text()
+        assert "DOMAIN-SUFFIX,corp.example" in rs_text
+        assert "# [V5+] DOMAIN-WILDCARD,*corp.example" in rs_text
+        assert "DOMAIN,cdn.corp.example\n" in rs_text
+        assert "extended-matching" not in rs_text
+        assert "IP-CIDR,10.20.0.0/24,no-resolve" in rs_text
+        # RULE-SET rewritten to exported .list file
+        assert "RULE-SET,OfficeSites-ruleset-v4.list,OfficeWG" in root_v4
+
+        # Second run is idempotent (no deprecated backup created)
+        stats2 = ConversionStats()
+        convert_file(str(root), stats2)
+        assert stats2.deprecated_files == []
+
+    def test_inline_ruleset_in_root_exported_and_unused_skipped(self, tmp_path):
+        root = tmp_path / "profile.conf"
+        root.write_text(textwrap.dedent("""\
+            [Ruleset UsedSet]
+            DOMAIN-SUFFIX,used.example
+
+            [Ruleset UnusedSet]
+            DOMAIN-SUFFIX,unused.example
+
+            [Rule]
+            RULE-SET,UsedSet,DIRECT
+            FINAL,DIRECT
+        """))
+        convert_file(str(root))
+        root_v4 = (tmp_path / "v4" / "profile-v4.conf").read_text()
+        assert "# [V5+] [Ruleset UsedSet]" in root_v4
+        assert "# [V5+] [Ruleset UnusedSet]" in root_v4
+        assert "RULE-SET,UsedSet-ruleset-v4.list,DIRECT" in root_v4
+        assert (tmp_path / "v4" / "UsedSet-ruleset-v4.list").read_text() == "DOMAIN-SUFFIX,used.example\n"
+        assert not (tmp_path / "v4" / "UnusedSet-ruleset-v4.list").exists()
+
+    def test_unexpandable_remote_wildcards_cascade_dangling_wg_and_ruleset(self, tmp_path):
+        root = tmp_path / "profile.conf"
+        root.write_text(textwrap.dedent(f"""\
+            [Proxy]
+            RemoteWG = wireguard, section-name=remote-wg
+            LocalWG = wireguard, section-name=local-wg
+
+            [WireGuard local-wg]
+            private-key = {self.WG_KEY}
+            self-ip = 10.20.0.2
+            mtu = 1280
+            peer = (public-key = {self.WG_PUB}, allowed-ips = "10.20.0.0/24", endpoint = 1.2.3.4:51820)
+
+            [WireGuard *]
+            #!include https://example.com/wg.conf
+
+            [Ruleset *]
+            #!include https://example.com/rs.conf
+
+            [Proxy Group]
+            OnlyRemote = select, RemoteWG
+            Both = select, RemoteWG, LocalWG
+
+            [Rule]
+            RULE-SET,RemoteSites,DIRECT
+            RULE-SET,SYSTEM,DIRECT
+            RULE-SET,LAN,DIRECT
+            RULE-SET,https://example.com/ext.list,DIRECT
+            DOMAIN,a.example,OnlyRemote
+            FINAL,Both
+        """))
+        convert_file(str(root))
+        out = (tmp_path / "v4" / "profile-v4.conf").read_text()
+        assert "# [V5+ cascade] RemoteWG = wireguard, section-name=remote-wg" in out
+        assert "\nLocalWG = wireguard, section-name=local-wg\n" in out
+        assert "# [V5+ cascade] OnlyRemote = select" in out
+        assert "Both = select, LocalWG" in out
+        assert "# [V5+ cascade] RULE-SET,RemoteSites,DIRECT" in out
+        assert "\nRULE-SET,SYSTEM,DIRECT\n" in out
+        assert "\nRULE-SET,LAN,DIRECT\n" in out
+        assert "\nRULE-SET,https://example.com/ext.list,DIRECT\n" in out
+        assert "# [V5+ cascade] DOMAIN,a.example,OnlyRemote" in out
+        assert "\nFINAL,Both\n" in out
+
+    def test_managed_wildcard_target_abandoned_and_cascades(self, tmp_path):
+        managed = tmp_path / "managed-tunnels.dconf"
+        managed.write_text(textwrap.dedent(f"""\
+            #!MANAGED-CONFIG https://example.com/tunnels.dconf interval=86400
+            [WireGuard office]
+            private-key = {self.WG_KEY}
+            self-ip = 10.20.0.2
+            mtu = 1280
+            peer = (public-key = {self.WG_PUB}, allowed-ips = "10.20.0.0/24", endpoint = 1.2.3.4:51820)
+
+            [Ruleset CorpSites]
+            DOMAIN-SUFFIX,corp.example
+        """))
+        root = tmp_path / "profile.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            OfficeWG = wireguard, section-name=office
+
+            [WireGuard *]
+            #!include managed-tunnels.dconf
+
+            [Ruleset *]
+            #!include managed-tunnels.dconf
+
+            [Rule]
+            RULE-SET,CorpSites,DIRECT
+            DOMAIN,corp.example,OfficeWG
+            FINAL,DIRECT
+        """))
+        stats = ConversionStats()
+        convert_file(str(root), stats)
+        out = (tmp_path / "v4" / "profile-v4.conf").read_text()
+        assert str(managed) in stats.abandoned_files
+        assert not (tmp_path / "v4" / "managed-tunnels-v4.dconf").exists()
+        assert not (tmp_path / "v4" / "CorpSites-ruleset-v4.list").exists()
+        assert "# [V5+ cascade] OfficeWG = wireguard, section-name=office" in out
+        assert "# [V5+ cascade] RULE-SET,CorpSites,DIRECT" in out
+        assert "# [V5+ cascade] DOMAIN,corp.example,OfficeWG" in out
+
+    def test_wireguard_only_wildcard_target_still_discovered_and_emitted(self, tmp_path):
+        (tmp_path / "wg-only.dconf").write_text(textwrap.dedent(f"""\
+            [WireGuard office]
+            private-key = {self.WG_KEY}
+            self-ip = 10.20.0.2
+            mtu = 1280
+            peer = (public-key = {self.WG_PUB}, allowed-ips = "10.20.0.0/24", endpoint = 1.2.3.4:51820)
+        """))
+        root = tmp_path / "profile.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            OfficeWG = wireguard, section-name=office
+
+            [WireGuard *]
+            #!include wg-only.dconf
+
+            [Rule]
+            FINAL,OfficeWG
+        """))
+        convert_file(str(root))
+        out = (tmp_path / "v4" / "profile-v4.conf").read_text()
+        assert "[WireGuard office]\n#!include wg-only-v4.dconf" in out
+        assert (tmp_path / "v4" / "wg-only-v4.dconf").exists()
+        assert "\nOfficeWG = wireguard, section-name=office\n" in out
+
+    def test_proxy_include_alone_does_not_load_wireguard_section(self, tmp_path):
+        """[Proxy] #!include loads only [Proxy]; if [WireGuard *] is unexpandable
+        (remote URL), a [WireGuard office] sitting inside the [Proxy] include
+        file does NOT satisfy OfficeWG."""
+        (tmp_path / "tunnels.dconf").write_text(textwrap.dedent(f"""\
+            [Proxy]
+            OfficeWG = wireguard, section-name=office
+
+            [WireGuard office]
+            private-key = {self.WG_KEY}
+            self-ip = 10.20.0.2
+            mtu = 1280
+            peer = (public-key = {self.WG_PUB}, allowed-ips = "10.20.0.0/24", endpoint = 1.2.3.4:51820)
+        """))
+        root = tmp_path / "profile.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            #!include tunnels.dconf
+
+            [WireGuard *]
+            #!include https://example.com/wg.conf
+
+            [Rule]
+            DOMAIN,corp.example,OfficeWG
+            FINAL,DIRECT
+        """))
+        convert_file(str(root))
+        tunnels_v4 = (tmp_path / "v4" / "tunnels-v4.dconf").read_text()
+        root_v4 = (tmp_path / "v4" / "profile-v4.conf").read_text()
+        assert "# [V5+ cascade] OfficeWG = wireguard, section-name=office" in tunnels_v4
+        assert "# [V5+ cascade] DOMAIN,corp.example,OfficeWG" in root_v4
+
+    def test_wildcard_headers_with_inline_comments_still_expand_and_export(self, tmp_path):
+        (tmp_path / "tunnels.dconf").write_text(textwrap.dedent(f"""\
+            [Proxy]
+            OfficeWG = wireguard, section-name=office
+
+            [WireGuard office] # tunnel body
+            private-key = {self.WG_KEY}
+            self-ip = 10.20.0.2
+            mtu = 1280
+            peer = (public-key = {self.WG_PUB}, allowed-ips = "10.20.0.0/24", endpoint = 1.2.3.4:51820)
+
+            [Ruleset OfficeSites] // inline rules
+            DOMAIN-SUFFIX,corp.example
+        """))
+        root = tmp_path / "profile.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy] # main proxies
+            #!include tunnels.dconf
+
+            [WireGuard *] # expand wg
+            #!include tunnels.dconf
+
+            [Ruleset *] ; export rs
+            #!include tunnels.dconf
+
+            [Rule]
+            RULE-SET,OfficeSites,OfficeWG
+            FINAL,DIRECT
+        """))
+        convert_file(str(root))
+        root_v4 = (tmp_path / "v4" / "profile-v4.conf").read_text()
+        assert "# [V5+] [WireGuard *] # expand wg" in root_v4
+        assert "[WireGuard office]\n#!include tunnels-v4.dconf" in root_v4
+        assert "# [V5+] [Ruleset *] ; export rs" in root_v4
+        assert "RULE-SET,OfficeSites-ruleset-v4.list,OfficeWG" in root_v4
+        assert (tmp_path / "v4" / "OfficeSites-ruleset-v4.list").exists()
+
+
+class TestUnderlyingProxyCascade:
+    def test_single_and_multi_hop_underlying_proxy_cascade(self, tmp_path):
+        root = tmp_path / "main.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            Entry = vless, 1.1.1.1, 443, username=00000000-0000-0000-0000-000000000000
+            Mid = snell, 2.2.2.2, 8000, psk=a, version=4, underlying-proxy=Entry
+            Exit = trojan, 3.3.3.3, 443, password=b, underlying-proxy = Mid # chain
+            Safe = ss, 4.4.4.4, 8388, encrypt-method=aes-256-gcm, password="x, underlying-proxy=Entry"
+
+            [Proxy Group]
+            ChainOnly = select, Exit
+            Mixed = select, Exit, Safe
+
+            [Rule]
+            DOMAIN,chain.example,ChainOnly
+            DOMAIN,exit.example,Exit
+            FINAL,Mixed
+        """))
+        convert_file(str(root))
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+] Entry = vless" in out
+        assert "# [V5+ cascade] Mid = snell" in out
+        assert "# [V5+ cascade] Exit = trojan" in out
+        assert "\nSafe = ss," in out
+        assert "# [V5+ cascade] ChainOnly = select" in out
+        assert "Mixed = select, Safe" in out
+        assert "# [V5+ cascade] DOMAIN,chain.example,ChainOnly" in out
+        assert "# [V5+ cascade] DOMAIN,exit.example,Exit" in out
+        assert "\nFINAL,Mixed\n" in out
+
+    def test_group_and_cross_file_underlying_proxy_cascade(self, tmp_path):
+        (tmp_path / "entry.dconf").write_text(
+            "[Proxy]\nEntry = vless, 1.1.1.1, 443, username=00000000-0000-0000-0000-000000000000\n"
+        )
+        (tmp_path / "exit.dconf").write_text(
+            "[Proxy]\n"
+            "ExitViaGroup = snell, 2.2.2.2, 8000, psk=a, version=4, underlying-proxy=EntryGroup\n"
+            "OK = snell, 3.3.3.3, 8000, psk=b, version=4\n"
+        )
+        root = tmp_path / "main.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            #!include entry.dconf, exit.dconf
+
+            [Proxy Group]
+            EntryGroup = select, Entry
+            ChainedGroup = select, OK, underlying-proxy=Entry
+
+            [Rule]
+            DOMAIN,a.example,ExitViaGroup
+            DOMAIN,b.example,ChainedGroup
+            FINAL,OK
+        """))
+        convert_file(str(root))
+        main_v4 = (tmp_path / "v4" / "main-v4.conf").read_text()
+        exit_v4 = (tmp_path / "v4" / "exit-v4.dconf").read_text()
+        assert "# [V5+ cascade] EntryGroup = select" in main_v4
+        assert "# [V5+ cascade] ChainedGroup = select, OK, underlying-proxy=Entry" in main_v4
+        assert "# [V5+ cascade] ExitViaGroup = snell" in exit_v4
+        assert "# [V5+ cascade] DOMAIN,a.example,ExitViaGroup" in main_v4
+        assert "# [V5+ cascade] DOMAIN,b.example,ChainedGroup" in main_v4
+        assert "\nFINAL,OK\n" in main_v4
+
+
+class TestSectionHeaderInlineComments:
+    def test_v5_named_and_wildcard_headers_with_inline_comments(self):
+        result = convert("""
+            [Proxy] # 代理列表
+            MyTS = tailscale, section-name=office
+
+            [Tailscale office] # 说明
+            interactive-login = true
+
+            [WireGuard *] ; note
+            #!include tunnels.dconf
+
+            [Ruleset *] // note
+            #!include rulesets.dconf
+
+            [Ruleset Custom] # inline ruleset
+            DOMAIN-SUFFIX,a.example
+        """)
+        lines = result.splitlines()
+        assert "[Proxy] # 代理列表" in lines
+        assert "# [V5+] MyTS = tailscale, section-name=office" in lines
+        assert "# [V5+] [Tailscale office] # 说明" in lines
+        assert "# [V5+] interactive-login = true" in lines
+        assert "# [V5+] [WireGuard *] ; note" in lines
+        assert "# [V5+] [Ruleset *] // note" in lines
+        assert "# [V5+] [Ruleset Custom] # inline ruleset" in lines
+        assert "# [V5+] DOMAIN-SUFFIX,a.example" in lines
+
+    def test_compute_sections_handles_inline_comments(self):
+        lines = [
+            "[Proxy] # proxies",
+            "A = snell, 1.1.1.1, 8000, psk=x, version=4",
+            "# [V5+] [Tailscale office] # 说明",
+            "# [V5+] interactive-login = true",
+            "[Rule] // rules",
+            "FINAL,DIRECT",
+        ]
+        assert compute_sections(lines) == [
+            "Proxy", "Proxy", "Tailscale office", "Tailscale office", "Rule", "Rule"
+        ]
+
+    def test_non_space_hash_after_bracket_not_header(self):
+        from converter import parse_section_header
+        assert parse_section_header("[Tailscale office]#not-comment") is None
+        assert parse_section_header("[Tailscale office] # comment") == "Tailscale office"
+
+
+class TestIncludeOtherGroupSyntaxAndComments:
+    def test_inline_comment_full_cascade(self, tmp_path):
+        root = tmp_path / "main.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            P1 = anytls, 1.1.1.1, 443, password=p
+            P2 = hysteria2, 2.2.2.2, 443, password=p
+
+            [Proxy Group]
+            G1 = select, P1
+            G2 = select, P2
+            Merged = select, include-other-group="G1,G2" # 说明
+            Leaf = select, include-other-group=Merged
+
+            [Rule]
+            FINAL,Leaf
+        """))
+        convert_file(str(root))
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] Merged = select # 说明" in out
+        assert "# [V5+ cascade] Leaf = select" in out
+        assert "# [V5+ cascade] FINAL,Leaf" in out
+
+    def test_inline_comment_partial_strip_preserves_comment(self, tmp_path):
+        root = tmp_path / "main.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            P1 = anytls, 1.1.1.1, 443, password=p
+            OK = snell, 2.2.2.2, 8000, psk=a, version=4
+
+            [Proxy Group]
+            G1 = select, P1
+            G2 = select, OK
+            Merged = select, include-other-group="G1,G2" # 说明
+
+            [Rule]
+            FINAL,Merged
+        """))
+        convert_file(str(root))
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert 'Merged = select, include-other-group="G2" # 说明' in out
+        assert "\nFINAL,Merged\n" in out
+
+    def test_escaped_backslash_group_name_matched_and_reencoded(self, tmp_path):
+        root = tmp_path / "main.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            P1 = vless, 1.1.1.1, 443, username=00000000-0000-0000-0000-000000000000
+            OK = snell, 2.2.2.2, 8000, psk=a, version=4
+
+            [Proxy Group]
+            Gone\\Team = select, P1
+            Keep\\Team = select, OK
+            G2 = select, OK
+            DropGone = select, include-other-group="Gone\\\\Team,G2" # drop escaped
+            KeepEsc = select, include-other-group="Gone\\\\Team,Keep\\\\Team"
+            AllGone = select, include-other-group="Gone\\\\Team" // dead
+
+            [Rule]
+            DOMAIN,dead.example,AllGone
+            FINAL,DropGone
+        """))
+        convert_file(str(root))
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] Gone\\Team = select" in out
+        assert 'DropGone = select, include-other-group="G2" # drop escaped' in out
+        assert 'KeepEsc = select, include-other-group="Keep\\\\Team"' in out
+        assert "# [V5+ cascade] AllGone = select // dead" in out
+        assert "# [V5+ cascade] DOMAIN,dead.example,AllGone" in out
+        assert "\nFINAL,DropGone\n" in out
+
+    def test_parse_include_other_groups_direct_helpers(self):
+        from converter import format_include_other_groups, parse_include_other_groups
+        assert parse_include_other_groups('"G1,G2" # 说明') == ["G1", "G2"]
+        assert parse_include_other_groups('"Gone\\\\Team,G2"') == ["Gone\\Team", "G2"]
+        assert parse_include_other_groups('"A\\"B, G2"') == ['A"B', "G2"]
+        assert format_include_other_groups(["Keep\\Team"], was_quoted=True) == '"Keep\\\\Team"'
+        assert format_include_other_groups(['A"B'], was_quoted=True) == '"A\\"B"'
+
 
