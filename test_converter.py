@@ -2029,8 +2029,11 @@ class TestMultiLevelCascade:
 # --- T36: FINAL rule cascade ---
 
 class TestFinalRuleCascade:
-    def test_final_rule_policy_cascade_deleted(self, tmp_path):
-        """FINAL,GroupName where GroupName gets cascade-deleted."""
+    def test_final_rule_policy_cascade_deleted_blocks_broken_emit(self, tmp_path):
+        """When cascading removes the sole FINAL rule, refuse to emit an
+        unloadable v4 profile and report the missing FINAL explicitly."""
+        from converter import Pipeline
+
         main = tmp_path / "main.conf"
         main.write_text(
             "[Proxy]\n"
@@ -2042,13 +2045,20 @@ class TestFinalRuleCascade:
             "[Rule]\n"
             "FINAL,OnlyV5\n"
         )
-        convert_file(str(main), ConversionStats(), {str(main): None})
-        out = (tmp_path / "v4" / "main-v4.conf").read_text()
-        assert "# [V5+ cascade] OnlyV5 = select" in out
-        assert "# [V5+ cascade] FINAL,OnlyV5" in out
+        stats = ConversionStats()
+        pipeline = Pipeline(stats, {str(main): None})
+        result = pipeline.run(str(main))
+        assert result is None
+        assert not (tmp_path / "v4" / "main-v4.conf").exists()
+        assert any("FINAL" in e for e in stats.errors)
+        root_lines = pipeline.files[str(main)].lines
+        assert "# [V5+ cascade] OnlyV5 = select" in root_lines
+        assert "# [V5+ cascade] FINAL,OnlyV5" in root_lines
 
     def test_final_rule_with_dns_failed_cascade(self, tmp_path):
         """FINAL,GroupName,dns-failed — trailing option must not confuse policy extraction."""
+        from converter import Pipeline
+
         main = tmp_path / "main.conf"
         main.write_text(
             "[Proxy]\n"
@@ -2060,9 +2070,12 @@ class TestFinalRuleCascade:
             "[Rule]\n"
             "FINAL,OnlyV5,dns-failed\n"
         )
-        convert_file(str(main), ConversionStats(), {str(main): None})
-        out = (tmp_path / "v4" / "main-v4.conf").read_text()
-        assert "# [V5+ cascade] FINAL,OnlyV5,dns-failed" in out
+        stats = ConversionStats()
+        pipeline = Pipeline(stats, {str(main): None})
+        result = pipeline.run(str(main))
+        assert result is None
+        assert any("FINAL" in e for e in stats.errors)
+        assert "# [V5+ cascade] FINAL,OnlyV5,dns-failed" in pipeline.files[str(main)].lines
 
 
 # --- T37: Snell version regex boundary ---
@@ -2537,6 +2550,8 @@ class TestCrossFileDirectHitCascade:
             "[Proxy]\n"
             "JP = anytls, 1.2.3.4, 443, password=pwd\n"
             "HK = trojan, 5.6.7.8, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
             "#!include groups.dconf\n"
         )
         stats = ConversionStats()
@@ -2561,6 +2576,8 @@ class TestCrossFileDirectHitCascade:
         main.write_text(
             "[Proxy]\n"
             "JP = anytls, 1.2.3.4, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
             "#!include groups.dconf\n"
         )
         stats = ConversionStats()
@@ -3229,6 +3246,8 @@ class TestCascadeDetailCompleteness:
             "[Proxy]\n"
             "JP = anytls, 1.2.3.4, 443, password=pwd\n"
             "HK = trojan, 5.6.7.8, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
             "#!include groups.dconf\n"
         )
         stats = ConversionStats()
@@ -3246,6 +3265,8 @@ class TestCascadeDetailCompleteness:
             "[Proxy]\n"
             "JP = anytls, 1.2.3.4, 443, password=pwd\n"
             "HK = trojan, 5.6.7.8, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
             "#!include groups.dconf\n"
         )
         stats = ConversionStats()
@@ -3525,8 +3546,8 @@ class TestAbandonedNameCollision:
         assert "FINAL,Wrap" in out
 
     def test_included_file_groups_stay_live(self, tmp_path):
-        """Counterpart: a file pulled in by #!include IS textually merged, so
-        its group definitions do shield the same name."""
+        """Counterpart: a file pulled in by [Proxy Group] #!include loads its
+        [Proxy Group] definitions, so they shield the same name."""
         managed = tmp_path / "managed.conf"
         managed.write_text(
             "#!MANAGED-CONFIG https://x.com/m.conf interval=3600\n"
@@ -3551,6 +3572,7 @@ class TestAbandonedNameCollision:
             "OK = trojan, 9.9.9.9, 443, password=pwd\n"
             "\n"
             "[Proxy Group]\n"
+            "#!include managed.conf, nodes.conf\n"
             "Wrap = select, G, DIRECT\n"
             "\n"
             "[Rule]\n"
@@ -4256,7 +4278,9 @@ class TestWildcardIncludePreservationAndCascade:
         assert out == str(tmp_path / "v4" / "profile-v4.conf")
         root_v4 = (tmp_path / "v4" / "profile-v4.conf").read_text()
         tunnels_v4 = (tmp_path / "v4" / "tunnels-v4.dconf").read_text()
-        rs_file = tmp_path / "v4" / "OfficeSites-ruleset-v4.list"
+        rs_files = list((tmp_path / "v4").glob("profile-OfficeSites-*-ruleset-v4.list"))
+        assert len(rs_files) == 1
+        rs_file = rs_files[0]
 
         # Wildcard headers are commented; concrete [WireGuard office] is expanded and rewritten
         assert "# [V5+] [WireGuard *]" in root_v4
@@ -4266,8 +4290,7 @@ class TestWildcardIncludePreservationAndCascade:
         assert "\nOfficeWG = wireguard, section-name=office\n" in tunnels_v4
         assert "# [V5+] MyTS = tailscale, section-name=ts1" in tunnels_v4
         assert "# [V5+] [Ruleset OfficeSites]" in tunnels_v4
-        # Inline ruleset materialized into v4/*.list with v4 rule conversion applied
-        assert rs_file.exists()
+        # Inline ruleset materialized into root-scoped v4/*.list with v4 rule conversion applied
         rs_text = rs_file.read_text()
         assert "DOMAIN-SUFFIX,corp.example" in rs_text
         assert "# [V5+] DOMAIN-WILDCARD,*corp.example" in rs_text
@@ -4275,7 +4298,7 @@ class TestWildcardIncludePreservationAndCascade:
         assert "extended-matching" not in rs_text
         assert "IP-CIDR,10.20.0.0/24,no-resolve" in rs_text
         # RULE-SET rewritten to exported .list file
-        assert "RULE-SET,OfficeSites-ruleset-v4.list,OfficeWG" in root_v4
+        assert f"RULE-SET,{rs_file.name},OfficeWG" in root_v4
 
         # Second run is idempotent (no deprecated backup created)
         stats2 = ConversionStats()
@@ -4299,9 +4322,11 @@ class TestWildcardIncludePreservationAndCascade:
         root_v4 = (tmp_path / "v4" / "profile-v4.conf").read_text()
         assert "# [V5+] [Ruleset UsedSet]" in root_v4
         assert "# [V5+] [Ruleset UnusedSet]" in root_v4
-        assert "RULE-SET,UsedSet-ruleset-v4.list,DIRECT" in root_v4
-        assert (tmp_path / "v4" / "UsedSet-ruleset-v4.list").read_text() == "DOMAIN-SUFFIX,used.example\n"
-        assert not (tmp_path / "v4" / "UnusedSet-ruleset-v4.list").exists()
+        used_files = list((tmp_path / "v4").glob("profile-UsedSet-*-ruleset-v4.list"))
+        assert len(used_files) == 1
+        assert f"RULE-SET,{used_files[0].name},DIRECT" in root_v4
+        assert used_files[0].read_text() == "DOMAIN-SUFFIX,used.example\n"
+        assert list((tmp_path / "v4").glob("*UnusedSet*")) == []
 
     def test_unexpandable_remote_wildcards_cascade_dangling_wg_and_ruleset(self, tmp_path):
         root = tmp_path / "profile.conf"
@@ -4474,11 +4499,12 @@ class TestWildcardIncludePreservationAndCascade:
         """))
         convert_file(str(root))
         root_v4 = (tmp_path / "v4" / "profile-v4.conf").read_text()
+        rs_files = list((tmp_path / "v4").glob("profile-OfficeSites-*-ruleset-v4.list"))
+        assert len(rs_files) == 1
         assert "# [V5+] [WireGuard *] # expand wg" in root_v4
         assert "[WireGuard office]\n#!include tunnels-v4.dconf" in root_v4
         assert "# [V5+] [Ruleset *] ; export rs" in root_v4
-        assert "RULE-SET,OfficeSites-ruleset-v4.list,OfficeWG" in root_v4
-        assert (tmp_path / "v4" / "OfficeSites-ruleset-v4.list").exists()
+        assert f"RULE-SET,{rs_files[0].name},OfficeWG" in root_v4
 
 
 class TestUnderlyingProxyCascade:
@@ -4608,13 +4634,15 @@ class TestIncludeOtherGroupSyntaxAndComments:
             Leaf = select, include-other-group=Merged
 
             [Rule]
-            FINAL,Leaf
+            DOMAIN,dead.example,Leaf
+            FINAL,DIRECT
         """))
         convert_file(str(root))
         out = (tmp_path / "v4" / "main-v4.conf").read_text()
         assert "# [V5+ cascade] Merged = select # 说明" in out
         assert "# [V5+ cascade] Leaf = select" in out
-        assert "# [V5+ cascade] FINAL,Leaf" in out
+        assert "# [V5+ cascade] DOMAIN,dead.example,Leaf" in out
+        assert "\nFINAL,DIRECT\n" in out
 
     def test_inline_comment_partial_strip_preserves_comment(self, tmp_path):
         root = tmp_path / "main.conf"
@@ -4636,7 +4664,7 @@ class TestIncludeOtherGroupSyntaxAndComments:
         assert 'Merged = select, include-other-group="G2" # 说明' in out
         assert "\nFINAL,Merged\n" in out
 
-    def test_escaped_backslash_group_name_matched_and_reencoded(self, tmp_path):
+    def test_escaped_backslash_group_name_matched_and_reencoded_for_v4(self, tmp_path):
         root = tmp_path / "main.conf"
         root.write_text(textwrap.dedent("""\
             [Proxy]
@@ -4649,6 +4677,7 @@ class TestIncludeOtherGroupSyntaxAndComments:
             G2 = select, OK
             DropGone = select, include-other-group="Gone\\\\Team,G2" # drop escaped
             KeepEsc = select, include-other-group="Gone\\\\Team,Keep\\\\Team"
+            BothKeep = select, include-other-group="Keep\\\\Team,G2"
             AllGone = select, include-other-group="Gone\\\\Team" // dead
 
             [Rule]
@@ -4659,7 +4688,10 @@ class TestIncludeOtherGroupSyntaxAndComments:
         out = (tmp_path / "v4" / "main-v4.conf").read_text()
         assert "# [V5+ cascade] Gone\\Team = select" in out
         assert 'DropGone = select, include-other-group="G2" # drop escaped' in out
-        assert 'KeepEsc = select, include-other-group="Keep\\\\Team"' in out
+        # v4-readable: single backslash-bearing name emitted unquoted (no v5.21+ \\ escape)
+        assert "KeepEsc = select, include-other-group=Keep\\Team\n" in out
+        # v4-readable multi-group: literal single backslash without v5.21+ \\ escape
+        assert 'BothKeep = select, include-other-group="Keep\\Team, G2"\n' in out
         assert "# [V5+ cascade] AllGone = select // dead" in out
         assert "# [V5+ cascade] DOMAIN,dead.example,AllGone" in out
         assert "\nFINAL,DropGone\n" in out
@@ -4669,7 +4701,295 @@ class TestIncludeOtherGroupSyntaxAndComments:
         assert parse_include_other_groups('"G1,G2" # 说明') == ["G1", "G2"]
         assert parse_include_other_groups('"Gone\\\\Team,G2"') == ["Gone\\Team", "G2"]
         assert parse_include_other_groups('"A\\"B, G2"') == ['A"B', "G2"]
-        assert format_include_other_groups(["Keep\\Team"], was_quoted=True) == '"Keep\\\\Team"'
-        assert format_include_other_groups(['A"B'], was_quoted=True) == '"A\\"B"'
+        assert format_include_other_groups(["Keep\\Team"], was_quoted=True) == "Keep\\Team"
+        assert format_include_other_groups(["Keep\\Team", "G2"], was_quoted=True) == '"Keep\\Team, G2"'
+        with pytest.raises(ValueError):
+            format_include_other_groups(['A"B'], was_quoted=True)
+        with pytest.raises(ValueError):
+            format_include_other_groups(["HK, Fast"], was_quoted=True)
+
+
+# --- T82: Round 2 fixes — root-scoped rulesets, section-scoped includes, paren passwords, rule trees, builtin precedence, WG fields, FINAL guard, rule whitespace, v4 encoding ---
+
+class TestRound2Fixes:
+    WG_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    WG_PUB = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+
+    def test_two_profiles_same_dir_same_ruleset_name_do_not_overwrite(self, tmp_path):
+        ios = tmp_path / "ios.conf"
+        mac = tmp_path / "mac.conf"
+        ios.write_text(textwrap.dedent("""\
+            [Ruleset Shared]
+            DOMAIN-SUFFIX,ios.example
+
+            [Rule]
+            RULE-SET,Shared,DIRECT
+            FINAL,DIRECT
+        """))
+        mac.write_text(textwrap.dedent("""\
+            [Ruleset Shared]
+            DOMAIN-SUFFIX,mac.example
+
+            [Rule]
+            RULE-SET,Shared,DIRECT
+            FINAL,DIRECT
+        """))
+        stats_ios = ConversionStats()
+        stats_mac = ConversionStats()
+        convert_file(str(ios), stats_ios)
+        convert_file(str(mac), stats_mac)
+
+        assert stats_mac.deprecated_files == []
+        ios_v4 = (tmp_path / "v4" / "ios-v4.conf").read_text()
+        mac_v4 = (tmp_path / "v4" / "mac-v4.conf").read_text()
+        ios_lists = list((tmp_path / "v4").glob("ios-Shared-*-ruleset-v4.list"))
+        mac_lists = list((tmp_path / "v4").glob("mac-Shared-*-ruleset-v4.list"))
+        assert len(ios_lists) == 1 and len(mac_lists) == 1
+        assert ios_lists[0] != mac_lists[0]
+        assert f"RULE-SET,{ios_lists[0].name},DIRECT" in ios_v4
+        assert f"RULE-SET,{mac_lists[0].name},DIRECT" in mac_v4
+        assert ios_lists[0].read_text() == "DOMAIN-SUFFIX,ios.example\n"
+        assert mac_lists[0].read_text() == "DOMAIN-SUFFIX,mac.example\n"
+
+    def test_unloaded_subfile_group_does_not_kill_live_underlying_proxy(self, tmp_path):
+        (tmp_path / "catalog.dconf").write_text(textwrap.dedent("""\
+            [Proxy]
+            Exit = snell, 2.2.2.2, 8000, psk=a, version=4, underlying-proxy=Entry
+            V5Dead = vless, 1.1.1.1, 443, username=00000000-0000-0000-0000-000000000000
+
+            [Proxy Group]
+            Entry = select, V5Dead
+        """))
+        main = tmp_path / "main.conf"
+        main.write_text(textwrap.dedent("""\
+            [Proxy]
+            OK = snell, 3.3.3.3, 8000, psk=b, version=4
+            #!include catalog.dconf
+
+            [Proxy Group]
+            Entry = select, OK
+
+            [Rule]
+            FINAL,Exit
+        """))
+        out = convert_file(str(main))
+        assert out is not None
+        cat_v4 = (tmp_path / "v4" / "catalog-v4.dconf").read_text()
+        assert "\nExit = snell, 2.2.2.2, 8000, psk=a, version=4, underlying-proxy=Entry\n" in "\n" + cat_v4
+        assert "# [V5+ cascade] Exit" not in cat_v4
+        assert "\nFINAL,Exit\n" in (tmp_path / "v4" / "main-v4.conf").read_text()
+
+    def test_unloaded_subfile_ruleset_does_not_dirty_clean_profile_or_abandon_managed(self, tmp_path):
+        (tmp_path / "catalog.dconf").write_text(textwrap.dedent("""\
+            [Proxy]
+            OK = snell, 2.2.2.2, 8000, psk=a, version=4
+
+            [Ruleset Dormant]
+            DOMAIN-SUFFIX,dormant.example
+        """))
+        managed = tmp_path / "sub.conf"
+        managed.write_text(textwrap.dedent("""\
+            #!MANAGED-CONFIG https://example.com/sub.conf interval=86400
+            [Proxy]
+            M1 = snell, 3.3.3.3, 8000, psk=b, version=4
+        """))
+        main = tmp_path / "main.conf"
+        main.write_text(textwrap.dedent("""\
+            [Proxy]
+            #!include catalog.dconf
+
+            [Proxy Group]
+            Sub = select, policy-path=sub.conf
+
+            [Rule]
+            FINAL,Sub
+        """))
+        stats = ConversionStats()
+        result = convert_file(str(main), stats)
+        assert result is None
+        assert stats.abandoned_files == []
+        assert not (tmp_path / "v4").exists()
+
+    def test_unquoted_password_with_literal_paren_does_not_swallow_options(self, tmp_path):
+        line = "Safe = trojan, 192.0.2.10, 443, password=left(, ecn=true, block-quic=on"
+        cleaned, removed = remove_proxy_params(line, V5PLUS_ONLY_PROXY_PARAMS)
+        assert cleaned == "Safe = trojan, 192.0.2.10, 443, password=left("
+        assert set(removed) == {"ecn", "block-quic"}
+
+        root = tmp_path / "main.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            Entry = vless, 1.1.1.1, 443, username=00000000-0000-0000-0000-000000000000
+            Exit = snell, 2.2.2.2, 8000, psk=left(, version=4, underlying-proxy=Entry
+            Safe = trojan, 192.0.2.10, 443, password=left(, ecn=true, block-quic=on
+
+            [Rule]
+            DOMAIN,a.example,Exit
+            FINAL,Safe
+        """))
+        convert_file(str(root))
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] Exit = snell" in out
+        assert "# [V5+ cascade] DOMAIN,a.example,Exit" in out
+        assert "Safe = trojan, 192.0.2.10, 443, password=left(\n" in out
+
+    def test_nested_ruleset_expanded_and_logical_ruleset_rewritten(self, tmp_path):
+        root = tmp_path / "profile.conf"
+        root.write_text(textwrap.dedent("""\
+            [Ruleset Inner]
+            DOMAIN-SUFFIX,inner.example
+            DOMAIN-WILDCARD ,*.skip.example
+
+            [Ruleset Outer]
+            RULE-SET,Inner
+            IP-CIDR,10.0.0.0/24,no-resolve
+
+            [Ruleset Office]
+            DOMAIN-SUFFIX,office.example
+
+            [Ruleset BadNested]
+            RULE-SET,https://example.com/remote.list
+
+            [Rule]
+            RULE-SET,Outer,DIRECT
+            AND,((PROTOCOL,TCP),(RULE-SET,Office)),REJECT
+            AND,((PROTOCOL,TCP),(RULE-SET,BadNested)),REJECT
+            FINAL,DIRECT
+        """))
+        stats = ConversionStats()
+        convert_file(str(root), stats)
+        out = (tmp_path / "v4" / "profile-v4.conf").read_text()
+        outer_files = list((tmp_path / "v4").glob("profile-Outer-*-ruleset-v4.list"))
+        office_files = list((tmp_path / "v4").glob("profile-Office-*-ruleset-v4.list"))
+        assert len(outer_files) == 1 and len(office_files) == 1
+        assert list((tmp_path / "v4").glob("*Inner*")) == []
+        assert list((tmp_path / "v4").glob("*BadNested*")) == []
+
+        outer_text = outer_files[0].read_text()
+        assert "DOMAIN-SUFFIX,inner.example" in outer_text
+        assert "# [V5+] DOMAIN-WILDCARD ,*.skip.example" in outer_text
+        assert "IP-CIDR,10.0.0.0/24,no-resolve" in outer_text
+        assert "RULE-SET,Inner" not in outer_text
+
+        assert f"RULE-SET,{outer_files[0].name},DIRECT" in out
+        assert f"AND,((PROTOCOL,TCP),(RULE-SET,{office_files[0].name})),REJECT" in out
+        assert "# [V5+ cascade] AND,((PROTOCOL,TCP),(RULE-SET,BadNested)),REJECT" in out
+
+    def test_builtin_lan_and_system_precedence_over_inline_ruleset(self, tmp_path):
+        root = tmp_path / "profile.conf"
+        root.write_text(textwrap.dedent("""\
+            [Ruleset LAN]
+            DOMAIN-SUFFIX,fake-lan.example
+
+            [Ruleset SYSTEM]
+            DOMAIN-SUFFIX,fake-sys.example
+
+            [Rule]
+            RULE-SET,LAN,REJECT
+            RULE-SET,SYSTEM,DIRECT
+            AND,((PROTOCOL,TCP),(RULE-SET,LAN)),REJECT
+            FINAL,DIRECT
+        """))
+        convert_file(str(root))
+        out = (tmp_path / "v4" / "profile-v4.conf").read_text()
+        assert "# [V5+] [Ruleset LAN]" in out
+        assert "# [V5+] [Ruleset SYSTEM]" in out
+        assert "\nRULE-SET,LAN,REJECT\n" in out
+        assert "\nRULE-SET,SYSTEM,DIRECT\n" in out
+        assert "\nAND,((PROTOCOL,TCP),(RULE-SET,LAN)),REJECT\n" in out
+        assert list((tmp_path / "v4").glob("*.list")) == []
+
+    def test_incomplete_wireguard_section_after_abandoned_or_remote_include_cascades(self, tmp_path):
+        managed = tmp_path / "managed-wg.dconf"
+        managed.write_text(textwrap.dedent(f"""\
+            #!MANAGED-CONFIG https://example.com/wg.dconf interval=86400
+            [WireGuard office]
+            private-key = {self.WG_KEY}
+            self-ip = 10.20.0.2
+            peer = (public-key = {self.WG_PUB}, allowed-ips = "10.20.0.0/24", endpoint = 1.2.3.4:51820)
+        """))
+        root = tmp_path / "profile.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            OfficeWG = wireguard, section-name=office
+            RemoteWG = wireguard, section-name=remote
+
+            [WireGuard office]
+            mtu = 1280
+            #!include managed-wg.dconf
+
+            [WireGuard remote]
+            mtu = 1280
+            #!include https://example.com/remote-wg.conf
+
+            [Rule]
+            DOMAIN,corp.example,OfficeWG
+            DOMAIN,rem.example,RemoteWG
+            FINAL,DIRECT
+        """))
+        convert_file(str(root))
+        out = (tmp_path / "v4" / "profile-v4.conf").read_text()
+        assert "# [V5+ cascade] [WireGuard office]" in out
+        assert "# [V5+ cascade] mtu = 1280" in out
+        assert "# [V5+ cascade] OfficeWG = wireguard, section-name=office" in out
+        assert "# [V5+ cascade] [WireGuard remote]" in out
+        assert "# [V5+ cascade] RemoteWG = wireguard, section-name=remote" in out
+        assert "# [V5+ cascade] DOMAIN,corp.example,OfficeWG" in out
+        assert "# [V5+ cascade] DOMAIN,rem.example,RemoteWG" in out
+
+    def test_missing_final_after_underlying_proxy_cascade_stops_emit_and_exits(self, tmp_path, monkeypatch):
+        from converter import main as converter_main
+
+        root = tmp_path / "main.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            Entry = vless, 1.1.1.1, 443, username=00000000-0000-0000-0000-000000000000
+            Exit = snell, 2.2.2.2, 8000, psk=a, version=4, underlying-proxy=Entry
+
+            [Rule]
+            FINAL,Exit
+        """))
+        stats = ConversionStats()
+        result = convert_file(str(root), stats)
+        assert result is None
+        assert not (tmp_path / "v4" / "main-v4.conf").exists()
+        assert any("FINAL" in e for e in stats.errors)
+
+        monkeypatch.setattr("sys.argv", ["converter.py", str(root)])
+        with pytest.raises(SystemExit) as exc:
+            converter_main()
+        assert exc.value.code == 1
+
+    def test_rule_type_with_space_before_comma_downgraded(self):
+        result = convert("""
+            [Rule]
+            DOMAIN-WILDCARD ,*.example.test,DIRECT
+            HOSTNAME-TYPE , IPv4 , DIRECT
+            FINAL,DIRECT
+        """)
+        assert "# [V5+] DOMAIN-WILDCARD ,*.example.test,DIRECT" in result
+        assert "# [V5+] HOSTNAME-TYPE , IPv4 , DIRECT" in result
+
+    def test_v4_unrepresentable_surviving_group_name_reports_error_and_stops(self, tmp_path):
+        root = tmp_path / "main.conf"
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            V5 = vless, 1.1.1.1, 443, username=00000000-0000-0000-0000-000000000000
+            OK = snell, 2.2.2.2, 8000, psk=a, version=4
+
+            [Proxy Group]
+            Gone = select, V5
+            "A\\"B" = select, OK
+            Merged = select, include-other-group="Gone,A\\"B"
+
+            [Rule]
+            FINAL,Merged
+        """))
+        stats = ConversionStats()
+        result = convert_file(str(root), stats)
+        assert result is None
+        assert not (tmp_path / "v4" / "main-v4.conf").exists()
+        assert any('A"B' in e for e in stats.errors)
+
 
 

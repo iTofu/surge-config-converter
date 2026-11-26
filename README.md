@@ -116,15 +116,15 @@ psk = <legacy-psk>
 | `[Port Forwarding]` | 整段注释 |
 | `[Body Rewrite]` | 整段注释 |
 | `[Tailscale <name>]` | 整段注释（iOS 5.20.0+ / Mac 6.7.0+） |
-| `[Ruleset <name>]` | 整段注释（内联规则集，Mac 5.3.1+）；若仍有活跃 `RULE-SET` 引用，导出为 `v4/` 下的独立外部规则集文件（`.list`）并改写引用 |
-| `[Tailscale *]` / `[WireGuard *]` / `[Ruleset *]` | 整段注释（通配符 `#!include` 段，iOS 5.22.0+ / Mac 6.9.0+）；本地非托管 `[WireGuard *]` 展开为具名 `[WireGuard <name>]` `#!include`，本地非托管 `[Ruleset *]` 按需导出为外部规则集文件，无法保留定义时级联清理受影响的 WireGuard 节点与 `RULE-SET` 规则 |
+| `[Ruleset <name>]` | 整段注释（内联规则集，Mac 5.3.1+）；若仍有活跃 `RULE-SET`（含 `AND`/`OR`/`NOT` 逻辑规则内嵌与本地嵌套规则集）引用，按根配置隔离命名导出为 `v4/<根名>-<规则集>-<hash>-ruleset-v4.list` 并改写引用；内置 `LAN` / `SYSTEM` 始终优先 |
+| `[Tailscale *]` / `[WireGuard *]` / `[Ruleset *]` | 整段注释（通配符 `#!include` 段，iOS 5.22.0+ / Mac 6.9.0+）；本地非托管 `[WireGuard *]` 展开为具名 `[WireGuard <name>]` `#!include`，本地非托管 `[Ruleset *]` 按需导出为外部规则集文件，无法保留或缺少 WireGuard 必需字段时级联清理受影响段落、节点与规则 |
 
 ### 引用文件
 
-- `#!include` 和 `policy-path` 引用的本地文件会被递归转换
-- 只要配置里有任何内容需要转换，它实际加载的每个本地文件都产出 `-v4` 副本，无需转换的原样复制；引用一律改写为 `-v4` 名，保证 `v4/` 内没有悬空引用
-- 仅被未加载段落提及的文件（如 `policy-path` 导入文件里 `[Proxy]` 以外的引用）不算加载，不产出
-- HTTP/HTTPS URL 不处理
+- `#!include` 严格遵循 Surge 分段加载语义（`[S]` 下的 `#!include` 仅加载目标文件的 `[S]` 段），`policy-path` 仅加载 `[Proxy]` 段；子文件未加载段中的内容不触发转换、不参与名称登记与级联
+- 只要配置实际加载的段内有任何内容需要转换，它实际加载的每个本地文件都产出 `-v4` 副本，无需转换的原样复制；引用一律改写为 `-v4` 名，保证 `v4/` 内没有悬空引用
+- 仅被未加载段落提及的文件不算加载，不产出
+- HTTP/HTTPS URL 不处理（具名 `[WireGuard <name>]` 中的远端 `#!include` 属 Mac 6.0.0+ 语法，v4 不可用）
 
 ### 托管配置（Managed Config）
 
@@ -140,8 +140,8 @@ psk = <legacy-psk>
 
 - **`underlying-proxy` 代理链**：当 `[Proxy]` 或 `[Proxy Group]` 的 `underlying-proxy` 指向已删除的节点或策略组时，整行注释并继续向上游策略组和规则级联
 - **失去定义的 WireGuard / 内联规则集**：当 `[WireGuard *]`、`[Ruleset *]` 或具名 `[WireGuard <name>]` 的来源为远端 URL、缺失文件或被放弃的托管配置而无法保留定义时，级联注释受影响的 `wireguard` 节点与 `RULE-SET` 规则
-- **Proxy Group 成员**：从成员列表中移除已删除的名称（含 `include-other-group` 的单组与逗号分隔多组值，仅剔除其中已删除项）；若 group 因此失去所有有效成员来源（显式成员 / `include-all-proxies` / `include-other-group` / 有效 `policy-path`），整行注释
-- **Rule 策略**：规则指向已删除的 group/proxy 时，整行注释
+- **Proxy Group 成员**：从成员列表中移除已删除的名称（含 `include-other-group` 的单组与逗号分隔多组值，仅剔除其中已删除项，并按 Surge v4 可读取格式写回；若存活组名含 `"` 或 `,` 等 v4 无法表示的字符则报错中止）；若 group 因此失去所有有效成员来源（显式成员 / `include-all-proxies` / `include-other-group` / 有效 `policy-path`），整行注释
+- **Rule 策略**：规则指向已删除的 group/proxy 时，整行注释；若级联后 `[Rule]` 失去唯一的 `FINAL` 兜底规则，明确报错提示指定替代策略并停止导出，避免写出无法加载的配置
 - **`#!include`**：移除指向被放弃文件的条目；若列表清空，整行注释
 - **`policy-path`**：移除指向被放弃文件的选项；若 group 因此失去所有成员来源，整行注释
 
