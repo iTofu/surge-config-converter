@@ -5237,3 +5237,112 @@ class TestRound3Regressions:
             S5 = snell, 1.2.3.4, 443, psk=abc, version="5", shadow-tls-version="3"
         """)
         assert result.splitlines()[1] == "S5 = snell, 1.2.3.4, 443, psk=abc, version=4, shadow-tls-version=2"
+
+
+# --- T92: Round-4 Codex review regression suite (4 P1 fixes) ---
+
+class TestRound4Regressions:
+    def test_include_other_group_sees_external_policy_name_prefix_after_source_filter(self, tmp_path):
+        """P1: source group filters policy-path nodes then applies
+        external-policy-name-prefix; parent include-other-group filters on the
+        prefixed names."""
+        (tmp_path / "pool.dconf").write_text(
+            "[Proxy]\n"
+            "Stay = trojan, 1.1.1.1, 443, password=p\n"
+            "DropByFilter = trojan, 2.2.2.2, 443, password=p\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "DeadV6 = anytls, 3.3.3.3, 443, password=p\n"
+            "[Proxy Group]\n"
+            "Source = select, policy-path=pool.dconf, policy-regex-filter=^Stay$, external-policy-name-prefix=Ext-\n"
+            "Upper = select, DeadV6, include-other-group=Source, policy-regex-filter=^Ext-Stay$\n"
+            "[Rule]\n"
+            "FINAL,Upper\n"
+        )
+        stats = ConversionStats()
+        res = convert_file(str(main), stats, {str(main): None})
+        assert res is not None and not stats.errors
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "Upper = select, include-other-group=Source, policy-regex-filter=^Ext-Stay$" in out
+        assert "FINAL,Upper" in out
+
+    def test_shared_subgroup_diamond_dag_memoized_linear_time(self, tmp_path):
+        """P1: 28-group diamond DAG sharing sub-groups via include-other-group
+        must finish in milliseconds (O(V+E)), not exponential seconds."""
+        import time
+        lines = [
+            "[Proxy]",
+            "Node = trojan, 1.1.1.1, 443, password=p",
+            "[Proxy Group]",
+            "L0A = select, Node",
+            "L0B = select, Node",
+        ]
+        for lvl in range(1, 14):
+            prev = f'"L{lvl - 1}A, L{lvl - 1}B"'
+            lines.append(f"L{lvl}A = select, include-other-group={prev}")
+            lines.append(f"L{lvl}B = select, include-other-group={prev}")
+        lines += ["[Rule]", "FINAL,L13A"]
+        main = tmp_path / "diamond.conf"
+        main.write_text("\n".join(lines) + "\n")
+
+        t0 = time.monotonic()
+        stats = ConversionStats()
+        res = convert_file(str(main), stats, {str(main): None})
+        elapsed = time.monotonic() - t0
+        assert res is None and not stats.errors
+        assert elapsed < 1.0, f"diamond DAG took too long: {elapsed:.3f}s"
+
+    def test_non_darwin_regex_fallback_marks_unicode_divergent_shorthand_unverifiable(self, tmp_path, monkeypatch):
+        """P1: when native ICU is unavailable, ^\\w+$ against non-ASCII combining
+        mark `e\\u0301` must fail closed as unverifiable (not falsely drop the group)."""
+        import converter as conv_mod
+        monkeypatch.setattr(conv_mod.sys, "platform", "linux")
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Fast = anytls, 1.1.1.1, 443, password=p\n"
+            "cafe\u0301 = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            r"Words = select, include-all-proxies=1, policy-regex-filter=^\w+$" + "\n"
+            "[Rule]\n"
+            "FINAL,Words\n"
+        )
+        stats = ConversionStats()
+        res = convert_file(str(main), stats, {str(main): None})
+        assert res is None
+        assert any("ICU" in e and "policy-regex-filter" in e for e in stats.errors)
+        assert not any("FINAL" in e for e in stats.errors)
+
+    def test_existing_output_symlink_with_matching_content_replaced_by_regular_file(self, tmp_path):
+        """P1: existing symlink at v4/edge-v4.dconf pointing to external cache
+        with identical content must still be backed up and materialized as a
+        self-contained regular file inside v4/."""
+        ext_cache = tmp_path / "ext_cache"
+        ext_cache.mkdir()
+        cached_file = ext_cache / "edge.dconf"
+        src = tmp_path / "edge.dconf"
+        src_text = "[Proxy]\nKeep = trojan, 1.1.1.1, 443, password=p\n"
+        src.write_text(src_text)
+        cached_file.write_text(src_text)
+
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[General]\nudp-priority = true\n"
+            "[Proxy]\n#!include edge.dconf\n"
+            "[Rule]\nFINAL,Keep\n"
+        )
+        v4 = tmp_path / "v4"
+        v4.mkdir()
+        (v4 / "edge-v4.dconf").symlink_to(cached_file)
+
+        stats = ConversionStats()
+        res = convert_file(str(main), stats, {str(main): None})
+        assert res is not None and not stats.errors
+        out_edge = v4 / "edge-v4.dconf"
+        assert not out_edge.is_symlink()
+        assert out_edge.is_file()
+        assert out_edge.read_text() == src_text
+        assert (v4 / "edge-v4-deprecated.dconf").is_symlink()
+        assert cached_file.read_text() == src_text

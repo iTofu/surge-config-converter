@@ -475,36 +475,78 @@ class _ICURegex:
 
 
 class _UnverifiableRegex:
-    """Sentinel for a policy-regex-filter pattern that could not be compiled."""
+    """Sentinel for a policy-regex-filter pattern that cannot be verified with
+    guaranteed Surge/ICU semantics in the current environment."""
 
     def __init__(self, pattern):
         self.pattern = pattern
 
+    def match_set(self, names):
+        return set(names), bool(names)
+
+
+# Metasequences whose behavior diverges from Python stdlib `re` on non-ASCII
+# Unicode text (e.g. ICU \w includes combining marks Mn like U+0301) or which
+# are ICU-specific.
+_ICU_ONLY_SYNTAX_RE = re.compile(r'\\[pPXN]|\[:|[+*?]\+')
+_ICU_UNICODE_SHORTHAND_RE = re.compile(r'\\[wWdDsSbB]')
+
+
+class _ExactRegexMatcher:
+    """Authoritative Surge/ICU regex matcher (macOS libicucore)."""
+
+    def __init__(self, pattern, engine):
+        self.pattern = pattern
+        self._engine = engine
+
+    def match_set(self, names):
+        return {n for n in names if self._engine.search(n)}, False
+
+
+class _FallbackRegexMatcher:
+    """Conservative stdlib `re` matcher used only when native ICU is unavailable.
+
+    Only evaluates patterns + candidate name sets where Python stdlib `re` is
+    guaranteed equivalent to ICU; marks Unicode-divergent cases (e.g. \\w or
+    case-insensitive matching on non-ASCII names, or ICU-only syntax) as
+    unverifiable so we fail closed with a clear diagnostic rather than falsely
+    dropping a live Surge group.
+    """
+
+    def __init__(self, pattern, compiled):
+        self.pattern = pattern
+        self._compiled = compiled
+        self._icu_only = bool(_ICU_ONLY_SYNTAX_RE.search(pattern))
+        self._has_unicode_shorthand = bool(_ICU_UNICODE_SHORTHAND_RE.search(pattern))
+        self._ignorecase = bool(compiled.flags & re.IGNORECASE)
+
+    def match_set(self, names):
+        if not names:
+            return set(), False
+        if self._icu_only:
+            return set(names), True
+        has_non_ascii = any(not n.isascii() for n in names)
+        if has_non_ascii and (self._has_unicode_shorthand or self._ignorecase):
+            return set(names), True
+        return {n for n in names if self._compiled.search(n)}, False
+
 
 def _compile_surge_regex(pattern):
     """Compile a Surge policy-regex-filter using Surge's native ICU engine on
-    macOS (falling back to optional `regex` / stdlib `re` elsewhere).
+    macOS, or a semantics-guarded stdlib fallback elsewhere.
 
-    Returns a matcher with `.search(text) -> bool`, or `_UnverifiableRegex` if
-    the pattern cannot be validated in the current environment.
+    Returns a matcher with `.match_set(names) -> (matched_set, unverifiable)`.
     """
     if sys.platform == "darwin" and _ICURegex._load_lib() is not None:
         try:
-            return _ICURegex(pattern)
+            return _ExactRegexMatcher(pattern, _ICURegex(pattern))
         except (ValueError, RuntimeError):
             return _UnverifiableRegex(pattern)
     try:
-        import regex as regex_mod
-        compiled = regex_mod.compile(pattern)
-        return compiled
-    except ImportError:
-        pass
-    except Exception:
-        return _UnverifiableRegex(pattern)
-    try:
-        return re.compile(pattern)
+        compiled = re.compile(pattern)
     except re.error:
         return _UnverifiableRegex(pattern)
+    return _FallbackRegexMatcher(pattern, compiled)
 
 
 @dataclass
@@ -549,7 +591,7 @@ class _GroupRecordIR:
         return self.dirty or any(opt.iog_had_v5_escape for opt in self.options)
 
     def compiled_regex_filter(self):
-        """Return matcher with .search(), _UnverifiableRegex, or None (no filter)."""
+        """Return matcher with .match_set(names), or None (no filter)."""
         if self._regex_cached:
             return self._regex_matcher
         self._regex_cached = True
@@ -563,6 +605,14 @@ class _GroupRecordIR:
                 return self._regex_matcher
         self._regex_matcher = None
         return None
+
+    def external_policy_name_prefix(self):
+        """Return decoded external-policy-name-prefix (applied to policy-path
+        nodes AFTER this group's policy-regex-filter per Surge docs), or ''."""
+        for opt in self.initial_options or self.options:
+            if opt.key.lower() == "external-policy-name-prefix":
+                return unquote(opt.raw_value.strip())
+        return ""
 
     def has_effective_members(self, deleted_names, abandoned_paths=None, base_dir=None,
                               emptied_policy_paths=None, global_proxies_emptied=False,
@@ -1135,10 +1185,11 @@ def _output_unchanged(output_path, planned_content, is_binary=False):
     """Single source of truth for whether an existing output path already holds
     planned_content (shared by preflight backup checks and emit()).
 
-    Broken symlinks always return False so they are backed up/replaced rather
-    than skipped or silently followed.
+    Symlinks (both live and dangling) ALWAYS return False so output directories
+    never retain symlinks to external files and always materialize self-contained
+    regular copies via the normal backup flow.
     """
-    if not os.path.exists(output_path):
+    if os.path.islink(output_path) or not os.path.exists(output_path):
         return False
     try:
         if is_binary:
@@ -1942,34 +1993,45 @@ class Pipeline:
         return index
 
     def _group_member_supply(self, state, rec, group_index, global_deleted,
-                             global_proxies, use_initial, visited=None):
-        """Recursively compute (known_members, has_unknown_supply, unverifiable_patterns)
-        for a [Proxy Group] either BEFORE conversion (use_initial=True) or AFTER
-        current deletions (use_initial=False).
+                             global_proxies, use_initial, visited=None, memo=None):
+        """Recursively compute (known_members, has_unknown_supply,
+        unverifiable_patterns, hit_cycle) for a [Proxy Group] either BEFORE
+        conversion (use_initial=True) or AFTER current deletions (use_initial=False).
 
-        Per Surge semantics, explicit static members are unfiltered while
-        dynamically imported members (include-all-proxies, policy-path,
-        include-other-group) are filtered by the group's policy-regex-filter.
+        Per Surge semantics:
+          - Explicit static members are unfiltered.
+          - policy-path proxies are filtered by this group's policy-regex-filter
+            FIRST, then prefixed with external-policy-name-prefix before being
+            exposed to parent include-other-group consumers.
+          - include-all-proxies and include-other-group members are filtered by
+            this group's policy-regex-filter.
+        Memoizes acyclic subgraphs in `memo` to keep shared-subgroup DAGs O(V+E).
         """
         if visited is None:
             visited = set()
         visit_key = (state.abs_path, id(rec))
+        if memo is not None and visit_key in memo:
+            m_known, m_unk, m_unv = memo[visit_key]
+            return m_known, m_unk, m_unv, False
         if visit_key in visited:
-            return set(), False, []
+            return frozenset(), False, (), True
         visited = visited | {visit_key}
 
         base_dir = os.path.dirname(state.abs_path)
         matcher = rec.compiled_regex_filter()
+        prefix = rec.external_policy_name_prefix()
         unverifiable = []
-        is_unverifiable = isinstance(matcher, _UnverifiableRegex)
 
         def _filter_names(names):
-            if matcher is None or is_unverifiable:
-                return set(names)
-            return {n for n in names if matcher.search(n)}
+            if not names:
+                return set(), False
+            if matcher is None:
+                return set(names), False
+            return matcher.match_set(names)
 
         known = set()
         has_unknown = False
+        hit_cycle = False
 
         # 1. Explicit static members (unfiltered by policy-regex-filter)
         if use_initial:
@@ -1977,8 +2039,10 @@ class Pipeline:
         else:
             known |= {unquote(m) for m in rec.members if unquote(m) not in global_deleted}
 
-        # 2. Dynamic imported sources (filtered by policy-regex-filter)
-        raw_dynamic = set()
+        # 2. Dynamic imported sources: separate policy-path (gets prefix after filter)
+        #    from include-all-proxies / include-other-group.
+        pp_dynamic = set()
+        other_dynamic = set()
         opts = (rec.initial_options or rec.options) if use_initial else rec.options
         for opt in opts:
             kl = opt.key.lower()
@@ -1986,7 +2050,7 @@ class Pipeline:
                 if self._root_has_remote_proxy_include():
                     has_unknown = True
                 else:
-                    raw_dynamic |= set(global_proxies)
+                    other_dynamic |= set(global_proxies)
             elif kl == "policy-path" and opt.policy_path is not None:
                 if opt.policy_path.startswith(("http://", "https://")):
                     has_unknown = True
@@ -1997,9 +2061,9 @@ class Pipeline:
                         if ref_abs not in self.abandoned_files:
                             has_unknown = True
                     elif use_initial:
-                        raw_dynamic |= st.initial_proxies
+                        pp_dynamic |= st.initial_proxies
                     elif not st.is_abandoned:
-                        raw_dynamic |= (st.owned_proxies - st.self_deleted_proxies)
+                        pp_dynamic |= (st.owned_proxies - st.self_deleted_proxies)
             elif kl == "include-other-group" and opt.iog_groups is not None:
                 groups = (opt.initial_iog_groups if opt.initial_iog_groups is not None else opt.iog_groups) if use_initial else opt.iog_groups
                 for g in groups:
@@ -2012,47 +2076,59 @@ class Pipeline:
                     for sub_state, _, sub_rec in targets:
                         if not use_initial and sub_rec.commented_out:
                             continue
-                        sub_known, sub_unk, sub_unv = self._group_member_supply(
+                        sub_known, sub_unk, sub_unv, sub_cycle = self._group_member_supply(
                             sub_state, sub_rec, group_index, global_deleted,
-                            global_proxies, use_initial, visited=visited,
+                            global_proxies, use_initial, visited=visited, memo=memo,
                         )
-                        raw_dynamic |= sub_known
+                        other_dynamic |= sub_known
                         has_unknown = has_unknown or sub_unk
+                        hit_cycle = hit_cycle or sub_cycle
                         unverifiable.extend(sub_unv)
 
-        if is_unverifiable and raw_dynamic:
+        pp_matched, pp_unv = _filter_names(pp_dynamic)
+        other_matched, other_unv = _filter_names(other_dynamic)
+        if (pp_unv or other_unv) and matcher is not None:
             unverifiable.append((os.path.basename(state.abs_path), rec.name, matcher.pattern))
 
-        known |= _filter_names(raw_dynamic)
-        return known, has_unknown, unverifiable
+        if prefix:
+            known |= {prefix + n for n in pp_matched}
+        else:
+            known |= pp_matched
+        known |= other_matched
+
+        res = (frozenset(known), has_unknown, tuple(dict.fromkeys(unverifiable)))
+        if memo is not None and not hit_cycle:
+            memo[visit_key] = res
+        return res[0], res[1], res[2], hit_cycle
 
     def _group_lost_all_members(self, state, rec, initial_group_index, current_group_index,
-                                global_deleted, initial_global_proxies, current_global_proxies):
+                                global_deleted, initial_global_proxies, current_global_proxies,
+                                initial_memo=None, current_memo=None):
         """Return (had_initial, has_current, unverifiable_error_list) for rec.
 
-        If a group's policy-regex-filter could not be compiled AND the group
-        has no surviving explicit member AND its unfiltered dynamic pool shrank
-        during conversion, returns a diagnostic error so conversion fails closed
-        instead of exporting a potentially empty group.
+        If a group's policy-regex-filter cannot be verified with Surge/ICU
+        semantics AND the group has no surviving explicit member AND its
+        unfiltered dynamic pool shrank during conversion, returns a diagnostic
+        error so conversion fails closed instead of misclassifying the group.
         """
-        init_known, init_unk, _ = self._group_member_supply(
-            state, rec, initial_group_index, set(), initial_global_proxies, use_initial=True
+        init_known, init_unk, _, _ = self._group_member_supply(
+            state, rec, initial_group_index, set(), initial_global_proxies,
+            use_initial=True, memo=initial_memo,
         )
-        cur_known, cur_unk, cur_unv = self._group_member_supply(
-            state, rec, current_group_index, global_deleted, current_global_proxies, use_initial=False
+        cur_known, cur_unk, cur_unv, _ = self._group_member_supply(
+            state, rec, current_group_index, global_deleted, current_global_proxies,
+            use_initial=False, memo=current_memo,
         )
         had_initial = init_unk or bool(init_known)
         has_current = cur_unk or bool(cur_known)
 
         unv_errors = []
         if cur_unv:
-            # Only error when no surviving explicit member guarantees non-emptiness
-            # and the unfiltered dynamic pool actually lost members.
             surviving_explicit = [m for m in rec.members if unquote(m) not in global_deleted]
             if not surviving_explicit and not cur_unk and has_current and init_known != cur_known:
                 for fname, gname, pat in cur_unv:
                     unv_errors.append(
-                        f"{fname} [{gname}] 无法验证 policy-regex-filter 正则 {pat!r}，"
+                        f"{fname} [{gname}] 无法按 Surge ICU 正则语义验证 policy-regex-filter={pat!r}，"
                         "动态代理池已删减且无法确认剩余匹配成员；已停止导出。"
                     )
         return had_initial, has_current, unv_errors
@@ -2386,6 +2462,7 @@ class Pipeline:
             if st is not None:
                 initial_global_proxies |= st.initial_proxies
         initial_group_index = self._build_group_index(initial_loaded, include_abandoned=True)
+        initial_group_memo = {}
 
         def _record_loaded(loaded_map, global_proxy_files):
             ever_global_proxy.update(global_proxy_files)
@@ -2438,6 +2515,7 @@ class Pipeline:
             global_del_now = self.global_deleted - self._live_names()
             cur_global_proxies = self._current_global_proxies(global_proxy_files)
             cur_group_index = self._build_group_index(loaded_map, include_abandoned=False)
+            cur_group_memo = {}
             for abs_path, loaded_set in loaded_map.items():
                 state = self.files[abs_path]
                 if state.is_abandoned:
@@ -2446,6 +2524,7 @@ class Pipeline:
                     self._strip_abandoned_policy_paths(
                         state, global_del_now, initial_group_index, cur_group_index,
                         initial_global_proxies, cur_global_proxies,
+                        initial_memo=initial_group_memo, current_memo=cur_group_memo,
                     )
             if not root_state.is_abandoned:
                 self._strip_abandoned_includes(root_state)
@@ -2463,6 +2542,7 @@ class Pipeline:
                 changed = False
                 loaded_map, global_proxy_files = self._loaded_state()
                 _record_loaded(loaded_map, global_proxy_files)
+                cur_group_memo = {}
                 for abs_path, loaded_set in loaded_map.items():
                     state = self.files[abs_path]
                     if state.is_abandoned:
@@ -2484,9 +2564,12 @@ class Pipeline:
                         has_unexpanded_wg=has_unexpanded_wg,
                         dead_rulesets=dead_rulesets,
                         has_unexpanded_rs=has_unexpanded_rs,
+                        initial_memo=initial_group_memo,
+                        current_memo=cur_group_memo,
                     )
                     if mutated:
                         changed = True
+                        cur_group_memo.clear()
 
             # 3b. Withdraw names defined only in previously-loaded unreachable subtrees
             self.reachable = set(self._loaded_sections())
@@ -2681,7 +2764,8 @@ class Pipeline:
                              current_group_index=None, initial_global_proxies=None,
                              current_global_proxies=None, live_wg_sections=None,
                              has_unexpanded_wg=False, dead_rulesets=None,
-                             has_unexpanded_rs=False):
+                             has_unexpanded_rs=False, initial_memo=None,
+                             current_memo=None):
         """Fixpoint over loaded sections: cascade deleted proxies/groups through
         underlying-proxy, dead WireGuard sections, unified effective-member
         ProxyGroup evaluation (including recursive include-other-group and
@@ -2743,6 +2827,8 @@ class Pipeline:
                         )
                         changed = True
                         mutated_any = True
+                        if current_memo is not None:
+                            current_memo.clear()
                         continue
                     if extract_proxy_type(line) == "wireguard":
                         wg_sec = extract_proxy_option(line, "section-name")
@@ -2757,6 +2843,8 @@ class Pipeline:
                             )
                             changed = True
                             mutated_any = True
+                            if current_memo is not None:
+                                current_memo.clear()
                     continue
 
                 if section != "Proxy Group" or i not in state.group_records:
@@ -2784,6 +2872,8 @@ class Pipeline:
                     )
                     changed = True
                     mutated_any = True
+                    if current_memo is not None:
+                        current_memo.clear()
                     continue
 
                 orig_members = list(rec.members)
@@ -2812,6 +2902,7 @@ class Pipeline:
                 had_initial, has_current, unv_errors = self._group_lost_all_members(
                     state, rec, initial_group_index, current_group_index,
                     global_deleted, initial_global_proxies, current_global_proxies,
+                    initial_memo=initial_memo, current_memo=current_memo,
                 )
                 for err in unv_errors:
                     if err not in self.stats.errors:
@@ -2825,6 +2916,8 @@ class Pipeline:
                     self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", rec.name)
                     changed = True
                     mutated_any = True
+                    if current_memo is not None:
+                        current_memo.clear()
                 elif removed_tokens:
                     rec.dirty = True
                     self.stats.add_change(
@@ -2833,6 +2926,8 @@ class Pipeline:
                     )
                     changed = True
                     mutated_any = True
+                    if current_memo is not None:
+                        current_memo.clear()
 
         # Post-fixpoint: comment out loaded [Rule] lines whose policy or RULE-SET is dead
         if not _section_is_loaded(loaded_set, "Rule"):
@@ -2871,7 +2966,8 @@ class Pipeline:
 
     def _strip_abandoned_policy_paths(self, state, global_deleted, initial_group_index,
                                       current_group_index, initial_global_proxies,
-                                      current_global_proxies):
+                                      current_global_proxies, initial_memo=None,
+                                      current_memo=None):
         if not self.abandoned_files:
             return
         base_dir = os.path.dirname(state.abs_path)
@@ -2893,9 +2989,12 @@ class Pipeline:
                 continue
             rec.options = new_opts
             rec.dirty = True
+            if current_memo is not None:
+                current_memo.clear()
             had_initial, has_current, unv_errors = self._group_lost_all_members(
                 state, rec, initial_group_index, current_group_index,
                 global_deleted, initial_global_proxies, current_global_proxies,
+                initial_memo=initial_memo, current_memo=current_memo,
             )
             for err in unv_errors:
                 if err not in self.stats.errors:
@@ -2910,6 +3009,8 @@ class Pipeline:
                 deleted_name = unquote(rec.name)
                 state.self_deleted_groups.add(deleted_name)
                 self.global_deleted.add(deleted_name)
+                if current_memo is not None:
+                    current_memo.clear()
                 self.stats.count_commented(basename)
                 self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", rec.name)
 
