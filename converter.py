@@ -76,6 +76,10 @@ def is_v5plus_only_section(section_name):
     """Return True if section_name is v5+/v6-only and unsupported in v4.
 
     Concrete [WireGuard <name>] sections are valid in v4 and return False.
+    Scope boundary: [WireGuard *], [Ruleset *], and [Ruleset <name>] are
+    commented out at the section level only (matching [Port Forwarding] and
+    [Body Rewrite]); wildcard expansion and cross-section ruleset/wireguard
+    consumer chasing are intentionally out of scope.
     """
     if section_name in V5PLUS_ONLY_SECTIONS:
         return True
@@ -150,18 +154,47 @@ def _preserve_indent(original_line, new_content):
     return indent + new_content
 
 
+def _split_inline_comment(text):
+    """Split off a trailing Surge inline comment (`;`, `#`, or `//` preceded by
+    whitespace, outside double quotes).
+
+    Returns `(body, comment_suffix)` where `body + comment_suffix == text`, so
+    rewritten lines preserve any trailing comment verbatim. URLs like `https://`
+    are untouched because `//` follows `:` rather than whitespace.
+    """
+    in_quote = False
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and in_quote and i + 1 < n:
+            i += 2
+            continue
+        if ch == '"':
+            in_quote = not in_quote
+        elif not in_quote and i > 0 and text[i - 1].isspace():
+            if ch in ";#" or (ch == "/" and i + 1 < n and text[i + 1] == "/"):
+                j = i - 1
+                while j > 0 and text[j - 1].isspace():
+                    j -= 1
+                return text[:j], text[j:]
+        i += 1
+    return text, ""
+
+
 def compute_sections(lines, default_section=None):
     """Return a list parallel to lines where each entry is the section name
     the line belongs to (or default_section before any header appears).
 
     Also recognizes section headers that the direct-hit pass commented out
-    (e.g. "# [V5+] [Port Forwarding]") so that the commented section body is
-    not attributed to the preceding section.
+    (e.g. "# [V5+] [Port Forwarding]") and optional trailing inline comments
+    (e.g. "[Ruleset Custom] ; note") so section attribution stays accurate.
     """
     result = []
     current = default_section
     for line in lines:
-        m = re.match(r'^(?:# \[V5\+\] )?\[(.+)\]$', line.strip())
+        head, _ = _split_inline_comment(line.strip())
+        m = re.match(r'^(?:# \[V5\+\] )?\[(.+)\]$', head.strip())
         if m:
             current = m.group(1)
         result.append(current)
@@ -195,17 +228,21 @@ def format_include_other_group(groups, orig_value=""):
 
 
 def extract_proxy_option(line, key):
-    """Extract the unquoted value of a key=value option from a [Proxy] line, or None."""
+    """Extract the effective (last-wins) unquoted value of a key=value option
+    from a [Proxy] line, ignoring any trailing Surge inline comment. Returns
+    None if the option is absent."""
     if "=" not in line:
         return None
     _, rest = line.split("=", 1)
+    rest_body, _ = _split_inline_comment(rest)
     key_lower = key.lower()
-    for tok in _split_top_level_commas(rest)[1:]:
+    result = None
+    for tok in _split_top_level_commas(rest_body)[1:]:
         if "=" in tok and not tok.startswith('"'):
             k, v = tok.split("=", 1)
             if k.strip().lower() == key_lower:
-                return unquote(v.strip())
-    return None
+                result = unquote(v.strip())
+    return result
 
 
 def has_effective_members(pgl, deleted_names, abandoned_basenames):
@@ -373,8 +410,9 @@ class ProxyGroupLine:
     """Structured representation of a Surge Proxy Group definition line."""
     name: str
     group_type: str
-    members: list      # raw tokens, quotes preserved
-    options: list      # ordered list of (key, value) tuples
+    members: list             # raw tokens, quotes preserved
+    options: list             # ordered list of (key, value) tuples
+    inline_comment: str = ""  # trailing inline comment (e.g. " ; note"), preserved on rewrite
 
 
 @dataclass
@@ -416,7 +454,8 @@ def parse_proxy_group_line(line):
     if not name:
         return None
 
-    tokens = _split_top_level_commas(rest)
+    rest_body, inline_comment = _split_inline_comment(rest)
+    tokens = _split_top_level_commas(rest_body)
     if not tokens or not tokens[0]:
         return None
 
@@ -432,7 +471,10 @@ def parse_proxy_group_line(line):
         else:
             members.append(token)
 
-    return ProxyGroupLine(name=name, group_type=group_type, members=members, options=options)
+    return ProxyGroupLine(
+        name=name, group_type=group_type, members=members,
+        options=options, inline_comment=inline_comment,
+    )
 
 
 def format_proxy_group_line(pgl):
@@ -440,7 +482,7 @@ def format_proxy_group_line(pgl):
     parts = [pgl.group_type]
     parts.extend(pgl.members)
     parts.extend(f"{k}={v}" for k, v in pgl.options)
-    return f"{pgl.name} = " + ", ".join(parts)
+    return f"{pgl.name} = " + ", ".join(parts) + pgl.inline_comment
 
 
 # Known trailing options that can follow the policy in a rule line
@@ -529,18 +571,53 @@ def extract_rule_policy(line):
 def remove_proxy_params(line, params_to_remove):
     """Remove specific key=value parameters from a proxy line.
 
-    Returns (modified_line, list_of_removed_param_names).
+    Scans top-level commas outside double quotes (and before any trailing inline
+    comment) so quoted values such as `password="alpha, block-quic=literal"` are
+    never truncated. Returns (modified_line, list_of_removed_param_names).
     """
+    if "=" not in line or not params_to_remove:
+        return line, []
+    lhs, rhs = line.split("=", 1)
+    rhs_body, comment_suffix = _split_inline_comment(rhs)
+
+    commas = []
+    in_quote = False
+    n = len(rhs_body)
+    i = 0
+    while i < n:
+        ch = rhs_body[i]
+        if ch == "\\" and in_quote and i + 1 < n:
+            i += 2
+            continue
+        if ch == '"':
+            in_quote = not in_quote
+        elif not in_quote and ch == ",":
+            commas.append(i)
+        i += 1
+
+    if not commas:
+        return line, []
+
     removed = []
-    for param in params_to_remove:
-        # Match param=value where value can be quoted or unquoted
-        # Handle: param=value, param="value", param='value'
-        pattern = r',\s*' + re.escape(param) + r'\s*=\s*["\']?[^,]*["\']?'
-        new_line, n = re.subn(pattern, '', line)
-        if n > 0:
-            line = new_line
-            removed.append(param)
-    return line, removed
+    kept_chunks = [rhs_body[: commas[0]]]
+    for idx, start in enumerate(commas):
+        end = commas[idx + 1] if idx + 1 < len(commas) else n
+        seg = rhs_body[start:end]
+        token = seg[1:].strip()
+        matched_param = None
+        if "=" in token and not token.startswith('"'):
+            key = token.split("=", 1)[0].strip()
+            if key in params_to_remove:
+                matched_param = key
+        if matched_param is not None:
+            if matched_param not in removed:
+                removed.append(matched_param)
+        else:
+            kept_chunks.append(seg)
+
+    if not removed:
+        return line, []
+    return lhs + "=" + "".join(kept_chunks) + comment_suffix, removed
 
 
 def v5plus_only_proxy_reason(line):
@@ -762,8 +839,9 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
     for line_num, line in enumerate(lines, 1):
         stripped = line.strip()
 
-        # Detect section headers
-        section_match = re.match(r'^\[(.+)\]$', stripped)
+        # Detect section headers (allowing trailing inline comments like `[Ruleset X] ; note`)
+        header_body, _ = _split_inline_comment(stripped)
+        section_match = re.match(r'^\[(.+)\]$', header_body.strip())
         if section_match:
             section_name = section_match.group(1)
             if is_v5plus_only_section(section_name):
@@ -1274,6 +1352,10 @@ class Pipeline:
                 if section == "Proxy":
                     if "=" not in line:
                         continue
+                    # Static file-level cascade for v4 [Proxy]-level underlying-proxy.
+                    # Scope boundary: does not resolve per-group external-policy-modifier
+                    # overrides (which would require cloning shared policy-path files and
+                    # break the 1-to-1 output layout).
                     underlying = extract_proxy_option(line, "underlying-proxy")
                     if underlying and underlying in state.deleted_names:
                         state.lines[i] = CASCADE_TAG + stripped
@@ -1295,27 +1377,9 @@ class Pipeline:
                 if pgl is None:
                     continue
 
-                # Group-level underlying-proxy pointing at a deleted proxy/group
-                dead_relay = None
-                for k, v in pgl.options:
-                    if k.lower() == "underlying-proxy":
-                        relay = unquote(v.strip())
-                        if relay in state.deleted_names:
-                            dead_relay = relay
-                            break
-                if dead_relay is not None:
-                    state.lines[i] = CASCADE_TAG + stripped
-                    deleted_name = unquote(pgl.name)
-                    state.deleted_names.add(deleted_name)
-                    state.self_deleted.add(deleted_name)
-                    state.self_deleted_groups.add(deleted_name)
-                    self.stats.count_commented(basename)
-                    self.stats.add_change(
-                        basename, i + 1, "Proxy Group", "级联注释",
-                        f"{pgl.name} (underlying-proxy={dead_relay})")
-                    changed = True
-                    continue
-
+                # Note: group-level underlying-proxy is a Surge iOS 5.22+ / Mac 6.9+
+                # feature (not v4 syntax) and is intentionally not rewritten or
+                # cascaded here; only v4 [Proxy]-level underlying-proxy is handled above.
                 original_members = list(pgl.members)
                 pgl.members = [
                     m for m in original_members
@@ -1369,6 +1433,9 @@ class Pipeline:
 
         # Post-fixpoint: comment out Rule lines whose policy is now deleted.
         # Rules are leaf nodes — no secondary cascade can come from here.
+        # Per existing converter contract (see TestFinalRuleCascade), a FINAL
+        # rule targeting a deleted policy is commented with CASCADE_TAG and
+        # still emitted for user review rather than aborting export.
         for i, line in enumerate(state.lines):
             if state.sections[i] != "Rule":
                 continue

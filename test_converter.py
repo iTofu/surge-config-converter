@@ -4059,6 +4059,21 @@ class TestV5V6ProtocolsAndParams:
         assert "S2 = snell, 2.3.4.5, 443, psk=k, version=4\n" in out
         assert "# S3 = ss, 3.4.5.6, 443, encrypt-method=aes-256-gcm, password=p\n" in out
 
+    def test_proxy_param_removal_preserves_quoted_values_and_inline_comment(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            'Keep = ss, 1.2.3.4, 443, encrypt-method=aes-256-gcm, password="alpha, block-quic=literal", tfo=true\n'
+            'Both = ss, 2.3.4.5, 443, encrypt-method=aes-256-gcm, password="alpha, block-quic=literal", block-quic=on, tfo=true ; note\n'
+            '# Commented = ss, 3.4.5.6, 443, encrypt-method=aes-256-gcm, password="alpha, block-quic=literal", tfo=true\n'
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert 'Keep = ss, 1.2.3.4, 443, encrypt-method=aes-256-gcm, password="alpha, block-quic=literal", tfo=true\n' in out
+        assert 'Both = ss, 2.3.4.5, 443, encrypt-method=aes-256-gcm, password="alpha, block-quic=literal", tfo=true ; note\n' in out
+        assert '# Commented = ss, 3.4.5.6, 443, encrypt-method=aes-256-gcm, password="alpha, block-quic=literal", tfo=true\n' in out
+
 
 class TestV5V6Sections:
     def test_tailscale_wildcard_wireguard_and_ruleset_sections_commented_concrete_wg_kept(self, tmp_path):
@@ -4098,6 +4113,25 @@ class TestV5V6Sections:
         assert "# [V5+] DOMAIN-WILDCARD,*foo.example,Good\n" in out
         assert "\nFINAL,Good\n" in out
 
+    def test_section_header_with_inline_comment_still_commented(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Good = trojan, 1.2.3.4, 443, password=p\n"
+            "[Ruleset Custom] ; inline note\n"
+            "DOMAIN-SUFFIX,example.com\n"
+            "[WireGuard *] # wildcard note\n"
+            "#!include tunnel.dconf\n"
+            "[Rule] // rule note\n"
+            "FINAL,Good\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+] [Ruleset Custom] ; inline note\n# [V5+] DOMAIN-SUFFIX,example.com\n" in out
+        assert "# [V5+] [WireGuard *] # wildcard note\n# [V5+] #!include tunnel.dconf\n" in out
+        assert "\n[Rule] // rule note\nFINAL,Good\n" in out
+
 
 class TestMultiGroupIncludeOtherGroup:
     def test_partial_removal_keeps_remaining_groups_and_quotes(self, tmp_path):
@@ -4124,6 +4158,24 @@ class TestMultiGroupIncludeOtherGroup:
         assert 'AllThree = select, include-other-group="GA, GB"\n' in out
         assert 'TwoToOne = select, include-other-group="GA"\n' in out
         assert 'Untouched = select, include-other-group="GA, GB"\n' in out
+
+    def test_multi_group_iog_preserves_inline_comment(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Dead = anytls, 1.1.1.1, 443, password=p\n"
+            "Good = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            "GDead = select, Dead\n"
+            "GA = select, Good\n"
+            'Pool = select, include-other-group="GA, GDead" ; keep comment\n'
+            "[Rule]\n"
+            "FINAL,Pool\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert 'Pool = select, include-other-group="GA" ; keep comment\n' in out
 
     def test_all_included_groups_deleted_cascades_group_or_drops_option(self, tmp_path):
         main = tmp_path / "main.conf"
@@ -4175,7 +4227,7 @@ class TestUnderlyingProxyCascade:
         assert "Main = select, Good, AliveChain\n" in out
         assert "# [V5+ cascade] DOMAIN,c.example,OnlyChained\n" in out
 
-    def test_cross_file_and_group_underlying_proxy_cascade(self, tmp_path):
+    def test_cross_file_underlying_proxy_cascade(self, tmp_path):
         res = tmp_path / "res.dconf"
         res.write_text(
             "[Proxy]\n"
@@ -4191,8 +4243,7 @@ class TestUnderlyingProxyCascade:
             "[Proxy Group]\n"
             "DeadGroup = select, Dead\n"
             "LiveGroup = select, Good\n"
-            "RelayGroup = select, Good, underlying-proxy=DeadGroup\n"
-            "All = select, Good, ResDead, ResKeep, RelayGroup\n"
+            "All = select, Good, ResDead, ResKeep\n"
             "[Rule]\n"
             "FINAL,All\n"
         )
@@ -4202,8 +4253,29 @@ class TestUnderlyingProxyCascade:
         out_main = (tmp_path / "v4" / "main-v4.conf").read_text()
         assert "# [V5+ cascade] ResDead = http, 3.3.3.3, 80, underlying-proxy=DeadGroup\n" in out_res
         assert "ResKeep = http, 4.4.4.4, 80, underlying-proxy=LiveGroup\n" in out_res
-        assert "# [V5+ cascade] RelayGroup = select, Good, underlying-proxy=DeadGroup\n" in out_main
         assert "All = select, Good, ResKeep\n" in out_main
+
+    def test_underlying_proxy_inline_comment_and_duplicate_last_wins(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Dead = anytls, 1.1.1.1, 443, password=p\n"
+            "Good = trojan, 2.2.2.2, 443, password=p\n"
+            "DeadComment = http, 3.3.3.3, 80, underlying-proxy=Dead ; inline note\n"
+            "KeepLastWins = http, 4.4.4.4, 80, underlying-proxy=Dead, underlying-proxy=Good\n"
+            "DropLastWins = http, 5.5.5.5, 80, underlying-proxy=Good, underlying-proxy=Dead\n"
+            "[Proxy Group]\n"
+            "Main = select, Good, DeadComment, KeepLastWins, DropLastWins\n"
+            "[Rule]\n"
+            "FINAL,Main\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] DeadComment = http, 3.3.3.3, 80, underlying-proxy=Dead ; inline note\n" in out
+        assert "KeepLastWins = http, 4.4.4.4, 80, underlying-proxy=Dead, underlying-proxy=Good\n" in out
+        assert "# [V5+ cascade] DropLastWins = http, 5.5.5.5, 80, underlying-proxy=Good, underlying-proxy=Dead\n" in out
+        assert "Main = select, Good, KeepLastWins\n" in out
 
 
 class TestTailscaleRealWorldIntegration:

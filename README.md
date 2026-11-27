@@ -114,8 +114,8 @@ psk = <legacy-psk>
 | `[Port Forwarding]` | 整段注释 |
 | `[Body Rewrite]` | 整段注释 |
 | `[Tailscale <name>]` / `[Tailscale *]` | 整段注释 |
-| `[WireGuard *]` | 整段注释（具名 `[WireGuard <name>]` 为 v4 合法语法，保留） |
-| `[Ruleset <name>]` / `[Ruleset *]` | 整段注释 |
+| `[WireGuard *]` | 整段注释（具名 `[WireGuard <name>]` 为 v4 合法语法，保留；不做通配符自动展开或跨段引用追踪） |
+| `[Ruleset <name>]` / `[Ruleset *]` | 整段注释（仅整段注释，不做内联规则集展开或跨段 `RULE-SET` 追踪） |
 
 ### 引用文件
 
@@ -136,9 +136,9 @@ psk = <legacy-psk>
 
 当某个 proxy 或 proxy group 因 v5+ 转换被注释或因托管配置放弃而消失时，引用它的其他配置行也会被清理：
 
-- **Proxy 链式代理**：`[Proxy]`（及 `[Proxy Group]`）的 `underlying-proxy` 指向已删除的 proxy/group 时，整行注释并继续传播
+- **Proxy 链式代理**：`[Proxy]` 行的 `underlying-proxy` 指向已删除的 proxy/group 时（重复声明按 Surge 语义取末项），整行注释并继续传播。按文件级静态声明处理，不解析 `policy-path` 组上的 `external-policy-modifier` 覆写，也不转换 Surge iOS 5.22+ 才引入的策略组级 `underlying-proxy`
 - **Proxy Group 成员**：从成员列表中移除已删除的名称（支持单组及逗号分隔的多组 `include-other-group="A, B"` 逐项剔除）；若 group 因此失去所有结构化成员来源（显式成员 / `include-all-proxies` / 有效 `include-other-group` / 未放弃的 `policy-path`），整行注释（不模拟运行时 `policy-regex-filter` 正则求值，非托管 `policy-path` 即使节点被注释也保留并改写为 `-v4`）
-- **Rule 策略**：规则指向已删除的 group/proxy 时，整行注释
+- **Rule 策略**：规则指向已删除的 group/proxy 时，整行注释（含 `FINAL` 规则，仍正常输出供人工核对，不阻断导出）
 - **`#!include`**：移除指向被放弃文件的条目；若列表清空，整行注释
 - **`policy-path`**：移除指向被放弃文件的选项；若 group 因此失去所有成员来源，整行注释
 
