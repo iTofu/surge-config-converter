@@ -5346,3 +5346,96 @@ class TestRound4Regressions:
         assert out_edge.read_text() == src_text
         assert (v4 / "edge-v4-deprecated.dconf").is_symlink()
         assert cached_file.read_text() == src_text
+
+
+# --- T93: Round-5 Codex review regression suite (2 P1 fixes) ---
+
+class TestRound5Regressions:
+    def test_fallback_regex_marks_scoped_ignorecase_and_non_ascii_pattern_unverifiable(self, tmp_path, monkeypatch):
+        """P1: non-macOS fallback must treat scoped `(?i:...)` against non-ASCII
+        names (Straße) AND non-ASCII pattern (`straße`) against ASCII names
+        (STRASSE) as unverifiable rather than falsely dropping a live group."""
+        import converter as conv_mod
+        monkeypatch.setattr(conv_mod.sys, "platform", "linux")
+
+        # Case A: scoped inline (?i:...) against non-ASCII candidate name
+        d1 = tmp_path / "scoped_i"
+        d1.mkdir()
+        m1 = d1 / "main.conf"
+        m1.write_text(
+            "[Proxy]\n"
+            "Old = anytls, 1.1.1.1, 443, password=p\n"
+            "Straße = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            "Street = select, include-all-proxies=1, policy-regex-filter=(?i:^(Old|strasse)$)\n"
+            "[Rule]\n"
+            "FINAL,Street\n"
+        )
+        s1 = ConversionStats()
+        assert convert_file(str(m1), s1, {str(m1): None}) is None
+        assert any("ICU" in e and "policy-regex-filter" in e for e in s1.errors)
+        assert not any("FINAL" in e for e in s1.errors)
+
+        # Case B: non-ASCII pattern against pure ASCII candidate name
+        d2 = tmp_path / "pattern_u"
+        d2.mkdir()
+        m2 = d2 / "main.conf"
+        m2.write_text(
+            "[Proxy]\n"
+            "Old = anytls, 1.1.1.1, 443, password=p\n"
+            "STRASSE = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            "Street = select, include-all-proxies=1, policy-regex-filter=(?i)^(Old|straße)$\n"
+            "[Rule]\n"
+            "FINAL,Street\n"
+        )
+        s2 = ConversionStats()
+        assert convert_file(str(m2), s2, {str(m2): None}) is None
+        assert any("ICU" in e and "policy-regex-filter" in e for e in s2.errors)
+        assert not any("FINAL" in e for e in s2.errors)
+
+        # Case C: ASCII-written non-ASCII octal escape (\337 == ß) vs ASCII STRASSE
+        d3 = tmp_path / "octal_u"
+        d3.mkdir()
+        m3 = d3 / "main.conf"
+        m3.write_text(
+            "[Proxy]\n"
+            "Old = anytls, 1.1.1.1, 443, password=p\n"
+            "STRASSE = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            r"Street = select, include-all-proxies=1, policy-regex-filter=(?i)^(Old|stra\337e)$" + "\n"
+            "[Rule]\n"
+            "FINAL,Street\n"
+        )
+        s3 = ConversionStats()
+        assert convert_file(str(m3), s3, {str(m3): None}) is None
+        assert any("ICU" in e and "policy-regex-filter" in e for e in s3.errors)
+        assert not any("FINAL" in e for e in s3.errors)
+
+    def test_transient_unverifiable_regex_cleared_when_fixpoint_empties_group(self, tmp_path, monkeypatch):
+        """P1: transient unverifiable regex during intermediate cascade iteration
+        must NOT block export when subsequent cascade empties the group cleanly."""
+        import converter as conv_mod
+        monkeypatch.setattr(conv_mod.sys, "platform", "linux")
+
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Fast = anytls, 1.1.1.1, 443, password=p\n"
+            "Relay = anytls, 2.2.2.2, 443, password=p\n"
+            "Cafe\u0301 = trojan, 3.3.3.3, 443, password=p, underlying-proxy=RelayGroup\n"
+            "[Proxy Group]\n"
+            "RelayGroup = select, Relay\n"
+            r"Words = select, include-all-proxies=1, policy-regex-filter=^\w+$" + "\n"
+            "[Rule]\n"
+            "DOMAIN,w.example,Words\n"
+            "FINAL,DIRECT\n"
+        )
+        stats = ConversionStats()
+        res = convert_file(str(main), stats, {str(main): None})
+        assert res is not None
+        assert not stats.errors
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] Words = select" in out
+        assert "# [V5+ cascade] DOMAIN,w.example,Words" in out
+        assert "\nFINAL,DIRECT\n" in out

@@ -485,11 +485,19 @@ class _UnverifiableRegex:
         return set(names), bool(names)
 
 
-# Metasequences whose behavior diverges from Python stdlib `re` on non-ASCII
-# Unicode text (e.g. ICU \w includes combining marks Mn like U+0301) or which
-# are ICU-specific.
-_ICU_ONLY_SYNTAX_RE = re.compile(r'\\[pPXN]|\[:|[+*?]\+')
-_ICU_UNICODE_SHORTHAND_RE = re.compile(r'\\[wWdDsSbB]')
+# Syntax guards for the non-macOS stdlib `re` fallback whitelist:
+#  - _ICU_ONLY_OR_NON_ASCII_ESCAPE_RE catches ICU-specific tokens (\p/\P/\X/\N,
+#    POSIX [:...:], possessive quantifiers) and hex/Unicode escapes that can
+#    introduce non-ASCII codepoints into an otherwise ASCII pattern string.
+#  - _NON_ASCII_UNSAFE_REGEX_RE rejects any inline/scoped flags `(?`, escapes
+#    `\`, character classes `[`, or `.` whenever either pattern or candidate
+#    names contain non-ASCII characters (only plain literal/anchor/alternation
+#    is guaranteed 100% identical to ICU without a native ICU engine).
+_ICU_ONLY_OR_NON_ASCII_ESCAPE_RE = re.compile(
+    r'\\[pPXN]|\[[^\]]*\[|[+*?}]\+|\\u[0-9a-fA-F]{4}|\\U[0-9a-fA-F]{8}'
+    r'|\\x[89a-fA-F][0-9a-fA-F]|\\(?:0[0-7]{1,3}|[2-7][0-7]{2})|\(\?[a-zA-Z-]*x'
+)
+_NON_ASCII_UNSAFE_REGEX_RE = re.compile(r'\(\?|\\|\[|\.')
 
 
 class _ExactRegexMatcher:
@@ -504,31 +512,38 @@ class _ExactRegexMatcher:
 
 
 class _FallbackRegexMatcher:
-    """Conservative stdlib `re` matcher used only when native ICU is unavailable.
+    """Strict whitelist stdlib `re` matcher used only when native ICU is unavailable.
 
-    Only evaluates patterns + candidate name sets where Python stdlib `re` is
-    guaranteed equivalent to ICU; marks Unicode-divergent cases (e.g. \\w or
-    case-insensitive matching on non-ASCII names, or ICU-only syntax) as
-    unverifiable so we fail closed with a clear diagnostic rather than falsely
-    dropping a live Surge group.
+    Only verifies:
+      1. Pure 7-bit ASCII patterns (no ICU-only syntax or non-ASCII escapes)
+         evaluated against pure 7-bit ASCII candidate names (where stdlib `re`
+         and ICU are identical, including local `(?i:...)` flags and `\\w`), OR
+      2. Non-ASCII patterns/names using strictly plain literal/anchor/alternation
+         syntax (no flags, no escapes, no character classes, no `.`).
+    Everything else is marked unverifiable so conversion fails closed with a
+    targeted diagnostic instead of misclassifying a live Surge group.
     """
 
     def __init__(self, pattern, compiled):
         self.pattern = pattern
         self._compiled = compiled
-        self._icu_only = bool(_ICU_ONLY_SYNTAX_RE.search(pattern))
-        self._has_unicode_shorthand = bool(_ICU_UNICODE_SHORTHAND_RE.search(pattern))
-        self._ignorecase = bool(compiled.flags & re.IGNORECASE)
+        self._pattern_ascii_safe = (
+            pattern.isascii() and not _ICU_ONLY_OR_NON_ASCII_ESCAPE_RE.search(pattern)
+        )
+        self._non_ascii_literal_safe = (
+            not _ICU_ONLY_OR_NON_ASCII_ESCAPE_RE.search(pattern)
+            and not _NON_ASCII_UNSAFE_REGEX_RE.search(pattern)
+        )
 
     def match_set(self, names):
         if not names:
             return set(), False
-        if self._icu_only:
-            return set(names), True
-        has_non_ascii = any(not n.isascii() for n in names)
-        if has_non_ascii and (self._has_unicode_shorthand or self._ignorecase):
-            return set(names), True
-        return {n for n in names if self._compiled.search(n)}, False
+        all_names_ascii = all(n.isascii() for n in names)
+        if self._pattern_ascii_safe and all_names_ascii:
+            return {n for n in names if self._compiled.search(n)}, False
+        if self._non_ascii_literal_safe:
+            return {n for n in names if self._compiled.search(n)}, False
+        return set(names), True
 
 
 def _compile_surge_regex(pattern):
@@ -2597,10 +2612,10 @@ class Pipeline:
             ):
                 break
 
-        # 5. Global fixpoint converged: check FINAL invariant, rewrite references
-        #    (root #!include, policy-path IR, local RULE-SET / DOMAIN-SET), then
-        #    render modified [Proxy Group] IR ONCE to v4.
-        final_loaded = self._loaded_sections()
+        # 5. Global fixpoint converged: check FINAL invariant and post-convergence
+        #    unverifiable-regex diagnostics on surviving groups only, rewrite
+        #    references, then render modified [Proxy Group] IR ONCE to v4.
+        final_loaded, final_global_proxy_files = self._loaded_state()
         self.emitting = self._emitting()
         if self.emitting:
             if had_initial_final and not self._has_live_final(final_loaded, use_original=False):
@@ -2608,6 +2623,10 @@ class Pipeline:
                     "级联清理后 [Rule] 缺少可用的 FINAL 规则（原 FINAL 指向已删除的策略或已放弃的文件），"
                     "请为 v4 指定替代兜底策略；已停止导出。"
                 )
+            self._check_converged_unverifiable_regexes(
+                final_loaded, final_global_proxy_files,
+                initial_group_index, initial_global_proxies, initial_group_memo,
+            )
             self._rewrite_references(final_loaded)
             self._render_group_records(final_loaded)
 
@@ -2631,6 +2650,35 @@ class Pipeline:
             if self.stats.errors:
                 self.emitting = set()
                 self.ruleset_files.clear()
+
+    def _check_converged_unverifiable_regexes(self, final_loaded, final_global_proxy_files,
+                                              initial_group_index, initial_global_proxies,
+                                              initial_group_memo):
+        """After the cascade fixpoint has converged, report unverifiable
+        policy-regex-filter diagnostics ONLY for surviving, emitted groups whose
+        final state still depends on an unverifiable filter."""
+        final_global_deleted = self.global_deleted - self._live_names()
+        final_global_proxies = self._current_global_proxies(final_global_proxy_files)
+        final_group_index = self._build_group_index(final_loaded, include_abandoned=False)
+        final_group_memo = {}
+        for abs_path, loaded_set in final_loaded.items():
+            if not _section_is_loaded(loaded_set, "Proxy Group"):
+                continue
+            state = self.files[abs_path]
+            if state.is_abandoned:
+                continue
+            for idx in sorted(state.group_records):
+                rec = state.group_records[idx]
+                if rec.commented_out:
+                    continue
+                _, _, unv_errors = self._group_lost_all_members(
+                    state, rec, initial_group_index, final_group_index,
+                    final_global_deleted, initial_global_proxies, final_global_proxies,
+                    initial_memo=initial_group_memo, current_memo=final_group_memo,
+                )
+                for err in unv_errors:
+                    if err not in self.stats.errors:
+                        self.stats.errors.append(err)
 
     def _render_group_records(self, loaded_map):
         """Render dirty or v5-escape-bearing [Proxy Group] IR records ONCE into
@@ -2899,14 +2947,11 @@ class Pipeline:
                         new_opts.append(opt)
                 rec.options = new_opts
 
-                had_initial, has_current, unv_errors = self._group_lost_all_members(
+                had_initial, has_current, _ = self._group_lost_all_members(
                     state, rec, initial_group_index, current_group_index,
                     global_deleted, initial_global_proxies, current_global_proxies,
                     initial_memo=initial_memo, current_memo=current_memo,
                 )
-                for err in unv_errors:
-                    if err not in self.stats.errors:
-                        self.stats.errors.append(err)
 
                 if had_initial and not has_current:
                     rec.dirty = True
@@ -2991,14 +3036,11 @@ class Pipeline:
             rec.dirty = True
             if current_memo is not None:
                 current_memo.clear()
-            had_initial, has_current, unv_errors = self._group_lost_all_members(
+            had_initial, has_current, _ = self._group_lost_all_members(
                 state, rec, initial_group_index, current_group_index,
                 global_deleted, initial_global_proxies, current_global_proxies,
                 initial_memo=initial_memo, current_memo=current_memo,
             )
-            for err in unv_errors:
-                if err not in self.stats.errors:
-                    self.stats.errors.append(err)
             if not (had_initial and not has_current):
                 self.stats.add_change(
                     basename, i + 1, "Proxy Group",
