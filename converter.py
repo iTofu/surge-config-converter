@@ -227,6 +227,41 @@ def format_include_other_group(groups, orig_value=""):
     return joined
 
 
+def _proxy_comma_positions(text):
+    """Return indices of commas outside double quotes (handling `\\"` escapes).
+
+    Unlike `_split_top_level_commas`, parentheses inside proxy values (such as
+    passwords like `password=example(`) are treated as ordinary literals.
+    """
+    commas = []
+    in_quote = False
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and in_quote and i + 1 < n:
+            i += 2
+            continue
+        if ch == '"':
+            in_quote = not in_quote
+        elif not in_quote and ch == ",":
+            commas.append(i)
+        i += 1
+    return commas
+
+
+def _split_proxy_commas(text):
+    """Split a [Proxy] RHS by commas outside double quotes (with `\\"` escapes)."""
+    commas = _proxy_comma_positions(text)
+    parts = []
+    start = 0
+    for pos in commas:
+        parts.append(text[start:pos].strip())
+        start = pos + 1
+    parts.append(text[start:].strip())
+    return parts
+
+
 def extract_proxy_option(line, key):
     """Extract the effective (last-wins) unquoted value of a key=value option
     from a [Proxy] line, ignoring any trailing Surge inline comment. Returns
@@ -237,7 +272,7 @@ def extract_proxy_option(line, key):
     rest_body, _ = _split_inline_comment(rest)
     key_lower = key.lower()
     result = None
-    for tok in _split_top_level_commas(rest_body)[1:]:
+    for tok in _split_proxy_commas(rest_body)[1:]:
         if "=" in tok and not tok.startswith('"'):
             k, v = tok.split("=", 1)
             if k.strip().lower() == key_lower:
@@ -397,7 +432,7 @@ def extract_proxy_type(line):
     Proxy names may contain '#' (e.g. "Node #1"); commented lines are
     rejected by the explicit prefix check, not by the name character class.
     """
-    if line.lstrip().startswith("#"):
+    if line.lstrip().startswith(("#", ";", "//")):
         return None
     m = re.match(r'^[^=]+=\s*(\w[\w-]*)', line)
     if m:
@@ -444,7 +479,7 @@ def parse_proxy_group_line(line):
     (comment, section header, empty line, etc.).
     """
     stripped = line.lstrip()
-    if not stripped or stripped.startswith("#") or stripped.startswith("["):
+    if not stripped or stripped.startswith(("#", ";", "//")) or stripped.startswith("["):
         return None
     if "=" not in line:
         return None
@@ -561,15 +596,16 @@ def _rule_policy_index(tokens):
 def extract_rule_policy(line):
     """Return the policy target from a rule line, or None if not a rule."""
     stripped = line.lstrip()
-    if not stripped or stripped.startswith("#") or stripped.startswith("["):
+    if not stripped or stripped.startswith(("#", ";", "//")) or stripped.startswith("["):
         return None
-    tokens = _split_top_level_commas(stripped)
+    body, _ = _split_inline_comment(stripped)
+    tokens = _split_top_level_commas(body)
     i = _rule_policy_index(tokens)
     return tokens[i] if i > 0 else None
 
 
 def remove_proxy_params(line, params_to_remove):
-    """Remove specific key=value parameters from a proxy line.
+    """Remove specific key=value parameters from a proxy line (case-insensitive).
 
     Scans top-level commas outside double quotes (and before any trailing inline
     comment) so quoted values such as `password="alpha, block-quic=literal"` are
@@ -580,24 +616,12 @@ def remove_proxy_params(line, params_to_remove):
     lhs, rhs = line.split("=", 1)
     rhs_body, comment_suffix = _split_inline_comment(rhs)
 
-    commas = []
-    in_quote = False
-    n = len(rhs_body)
-    i = 0
-    while i < n:
-        ch = rhs_body[i]
-        if ch == "\\" and in_quote and i + 1 < n:
-            i += 2
-            continue
-        if ch == '"':
-            in_quote = not in_quote
-        elif not in_quote and ch == ",":
-            commas.append(i)
-        i += 1
-
+    commas = _proxy_comma_positions(rhs_body)
     if not commas:
         return line, []
 
+    params_lower = {p.lower() for p in params_to_remove}
+    n = len(rhs_body)
     removed = []
     kept_chunks = [rhs_body[: commas[0]]]
     for idx, start in enumerate(commas):
@@ -606,9 +630,9 @@ def remove_proxy_params(line, params_to_remove):
         token = seg[1:].strip()
         matched_param = None
         if "=" in token and not token.startswith('"'):
-            key = token.split("=", 1)[0].strip()
-            if key in params_to_remove:
-                matched_param = key
+            key_lower = token.split("=", 1)[0].strip().lower()
+            if key_lower in params_lower:
+                matched_param = key_lower
         if matched_param is not None:
             if matched_param not in removed:
                 removed.append(matched_param)
@@ -707,14 +731,16 @@ def is_proxy_definition(body):
     name = type, host, port[, key=value...] with a known host/port type.
 
     Used to tell commented-out nodes from free-form comment text, so it
-    rejects anything it cannot fully account for.
+    rejects anything it cannot fully account for. Strips any trailing Surge
+    inline comment on the RHS before validating tokens.
     """
     if "=" not in body:
         return False
     name, rest = body.split("=", 1)
     if not name.strip():
         return False
-    tokens = _split_top_level_commas(rest)
+    rest_body, _ = _split_inline_comment(rest)
+    tokens = _split_proxy_commas(rest_body)
     if len(tokens) < 3 or tokens[0].lower() not in HOST_PORT_PROXY_TYPES:
         return False
     host, port = tokens[1], tokens[2]
@@ -749,7 +775,7 @@ def transform_proxy_group_line(line, stats, filename, line_num, section):
     happens later in Pipeline._rewrite_references, once every sub-file's
     final converted/abandoned status is known.
     """
-    if line.startswith("#"):
+    if line.lstrip().startswith(("#", ";", "//")):
         return line
 
     modified = line
@@ -768,7 +794,7 @@ def transform_proxy_group_line(line, stats, filename, line_num, section):
 def transform_rule_line(line, stats, filename, line_num, section):
     """Transform a single line in [Rule] section."""
     stripped = line.lstrip()
-    if stripped.startswith("#"):
+    if stripped.startswith(("#", ";", "//")):
         return line
 
     for rule_type in V5PLUS_ONLY_RULE_TYPES:
@@ -786,7 +812,8 @@ def transform_rule_line(line, stats, filename, line_num, section):
 
     # Strip v5+ only options after the policy, e.g.
     # RULE-SET,<url>,REJECT,extended-matching → RULE-SET,<url>,REJECT
-    tokens = _split_top_level_commas(stripped)
+    rule_body, inline_cmt = _split_inline_comment(stripped)
+    tokens = _split_top_level_commas(rule_body)
     i = _rule_policy_index(tokens)
     if i == 0:
         return line
@@ -799,13 +826,13 @@ def transform_rule_line(line, stats, filename, line_num, section):
     stats.count_params(filename, len(removed))
     for opt in removed:
         stats.add_change(filename, line_num, section, "移除参数", f"{opt} ({rule})")
-    return line[:len(line) - len(stripped)] + rule
+    return line[:len(line) - len(stripped)] + rule + inline_cmt
 
 
 def transform_general_line(line, stats, filename, line_num, section):
     """Transform a single line in [General] section."""
     stripped = line.lstrip()
-    if stripped.startswith("#"):
+    if stripped.startswith(("#", ";", "//")):
         return line
 
     for param in V5PLUS_ONLY_GENERAL_PARAMS:
@@ -872,8 +899,7 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
         # Commented-out nodes ("#", ";" or "//" in [Proxy]) never decide
         # whether a file needs conversion; they are rewritten only in files
         # that get emitted anyway (Pipeline._convert_commented_proxies).
-        if stripped.startswith("#") or (
-                current_section == "Proxy" and _COMMENT_PREFIX_RE.match(line)):
+        if stripped.startswith(("#", ";", "//")):
             result.append(line)
             continue
 
@@ -996,7 +1022,7 @@ class Pipeline:
             if stripped.startswith("#!include"):
                 for entry in parse_include_list(line) or []:
                     self._discover_ref(base_dir, entry, state.sections[i])
-            elif state.sections[i] == "Proxy Group" and not stripped.startswith("#"):
+            elif state.sections[i] == "Proxy Group" and not stripped.startswith(("#", ";", "//")):
                 pgl = parse_proxy_group_line(line)
                 if pgl is None:
                     continue
@@ -1015,8 +1041,20 @@ class Pipeline:
         if os.path.isfile(abs_path):
             self.discover(abs_path, default_section=default_section)
 
-    def _pending_change(self, state):
-        """True if the file's working lines differ from its original content."""
+    def _pending_change(self, state, mode="full"):
+        """True if the file's loaded section(s) differ from its original content.
+
+        When a file is imported solely via policy-path ("proxy" mode), Surge
+        loads ONLY its [Proxy] section, so changes inside unloaded sections
+        (e.g. [Ruleset ...]) must not trigger profile emission.
+        """
+        if mode == "proxy":
+            orig_lines = state.original.splitlines()
+            return any(
+                cur != orig
+                for cur, orig, sec in zip(state.lines, orig_lines, state.sections)
+                if sec == "Proxy"
+            )
         return _serialize_lines(state.lines, state.original) != state.original
 
     def _live_local_refs(self, state):
@@ -1045,7 +1083,7 @@ class Pipeline:
                         refs.append((
                             os.path.normpath(os.path.join(base_dir, entry)),
                             "include", state.sections[i]))
-            elif state.sections[i] == "Proxy Group" and not stripped.startswith("#"):
+            elif state.sections[i] == "Proxy Group" and not stripped.startswith(("#", ";", "//")):
                 pgl = parse_proxy_group_line(line)
                 if pgl is None:
                     continue
@@ -1143,7 +1181,7 @@ class Pipeline:
         overwrites, so it is abandoned BEFORE any rewrite happens.
         """
         reachable = self._reachable_modes()
-        if not any(self._pending_change(self.files[p]) for p in reachable):
+        if not any(self._pending_change(self.files[p], mode) for p, mode in reachable.items()):
             return set()
         return set(reachable)
 
@@ -1313,7 +1351,7 @@ class Pipeline:
                 return line, notes
             return _preserve_indent(line, format_include_list(new_entries)), notes
 
-        if section == "Proxy Group" and not stripped.startswith("#"):
+        if section == "Proxy Group" and not stripped.startswith(("#", ";", "//")):
             pgl = parse_proxy_group_line(line)
             if pgl is None:
                 return line, notes
@@ -1439,7 +1477,7 @@ class Pipeline:
         for i, line in enumerate(state.lines):
             if state.sections[i] != "Rule":
                 continue
-            if line.lstrip().startswith("#"):
+            if line.lstrip().startswith(("#", ";", "//")):
                 continue
             policy = extract_rule_policy(line)
             if policy is None:
@@ -1463,7 +1501,7 @@ class Pipeline:
         for i, line in enumerate(state.lines):
             if state.sections[i] != "Proxy Group":
                 continue
-            if line.lstrip().startswith("#"):
+            if line.lstrip().startswith(("#", ";", "//")):
                 continue
             pgl = parse_proxy_group_line(line)
             if pgl is None:
@@ -1588,6 +1626,7 @@ class Pipeline:
             # Not part of the output: nothing in the profile needs conversion.
             if abs_path not in self.emitting:
                 self.processed_files[abs_path] = None
+                self.stats.discard_file(os.path.basename(abs_path))
                 if abs_path == root_abs:
                     root_output = None
                 continue

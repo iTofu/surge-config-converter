@@ -4327,3 +4327,101 @@ class TestTailscaleRealWorldIntegration:
         assert "# [V5+] [WireGuard *]" in out_main
         assert "# [V5+] [Tailscale *]" in out_main
         assert not (tmp_path / "v4" / "managed-v4.conf").exists()
+
+
+class TestRound2Fixes:
+    def test_semicolon_and_slash_commented_groups_do_not_discover_policy_path(self, tmp_path):
+        (tmp_path / "dormant.dconf").write_text(
+            "[Proxy]\nNewNode = vless, 1.1.1.1, 443, username=u\n"
+        )
+        (tmp_path / "live.conf").write_text(
+            "#!MANAGED-CONFIG https://example.com/sub\n"
+            "[Proxy]\nLiveNode = trojan, 2.2.2.2, 443, password=p\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy Group]\n"
+            "; Disabled1 = select, policy-path=dormant.dconf ; note\n"
+            "// Disabled2 = select, policy-path=dormant.dconf // note\n"
+            "Live = select, policy-path=live.conf\n"
+            "[Rule]\n"
+            "FINAL,Live\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is None
+        assert not stats.abandoned_files
+        assert stats.lines_commented == 0 and not stats.changes
+        assert not (tmp_path / "v4").exists()
+
+    def test_unloaded_section_in_policy_path_only_file_does_not_trigger_emission(self, tmp_path):
+        (tmp_path / "nodes.dconf").write_text(
+            "[Proxy]\nGood = trojan, 1.1.1.1, 443, password=p\n"
+            "[Ruleset Ignored]\nDOMAIN,example.com\n"
+        )
+        (tmp_path / "live.conf").write_text(
+            "#!MANAGED-CONFIG https://example.com/sub\n"
+            "[Proxy]\nLiveNode = trojan, 2.2.2.2, 443, password=p\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy Group]\n"
+            "Nodes = select, policy-path=nodes.dconf\n"
+            "Live = select, policy-path=live.conf\n"
+            "[Rule]\n"
+            "FINAL,Live\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is None
+        assert not stats.abandoned_files
+        assert stats.lines_commented == 0 and not stats.changes
+        assert not (tmp_path / "v4").exists()
+
+    def test_underlying_proxy_extracted_past_paren_and_escaped_quote_passwords(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Dead = anytls, 1.1.1.1, 443, password=p\n"
+            "Good = trojan, 2.2.2.2, 443, password=p\n"
+            "ParenPwd = http, 3.3.3.3, 80, password=example(, underlying-proxy=Dead\n"
+            r'EscQuotePwd = http, 4.4.4.4, 80, password="a\"b", underlying-proxy=Dead' + "\n"
+            "[Proxy Group]\n"
+            "Main = select, Good, ParenPwd, EscQuotePwd\n"
+            "[Rule]\n"
+            "FINAL,Main\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] ParenPwd = http, 3.3.3.3, 80, password=example(, underlying-proxy=Dead\n" in out
+        assert '# [V5+ cascade] EscQuotePwd = http, 4.4.4.4, 80, password="a\\"b", underlying-proxy=Dead\n' in out
+        assert "Main = select, Good\n" in out
+
+    def test_rule_with_inline_comment_cascades_and_keeps_comment(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "New = vless, 1.1.1.1, 443, username=u\n"
+            "[Rule]\n"
+            "DOMAIN,example.test,New ; inline note\n"
+            "FINAL,DIRECT\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] DOMAIN,example.test,New ; inline note\n" in out
+        assert "FINAL,DIRECT\n" in out
+
+    def test_commented_proxy_with_comma_in_inline_comment_and_mixed_case_block_quic(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "LiveMixed = ss, 1.1.1.1, 443, encrypt-method=aes-256-gcm, password=p, Block-Quic=on, tfo=true\n"
+            "# Dormant = ss, 2.2.2.2, 443, encrypt-method=aes-256-gcm, password=p, block-quic=on ; primary, backup\n"
+            "# DormantMixed = ss, 3.3.3.3, 443, encrypt-method=aes-256-gcm, password=p, Block-Quic=off ; a, b\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "LiveMixed = ss, 1.1.1.1, 443, encrypt-method=aes-256-gcm, password=p, tfo=true\n" in out
+        assert "# Dormant = ss, 2.2.2.2, 443, encrypt-method=aes-256-gcm, password=p ; primary, backup\n" in out
+        assert "# DormantMixed = ss, 3.3.3.3, 443, encrypt-method=aes-256-gcm, password=p ; a, b\n" in out
