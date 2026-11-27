@@ -2598,20 +2598,51 @@ class Pipeline:
 
     def _differs_from_standalone_root(self, state, loaded_set):
         """Return True if converting state.abs_path standalone as a root
-        profile would emit different bytes to its bare v4/<stem>-v4.<ext> path
-        than this root would — requiring this root to isolate its sub-file copy."""
-        standalone = Pipeline(
-            ConversionStats(),
-            snell_legacy=self.snell_legacy,
-            _check_standalone=False,
-        )
-        if standalone.discover(state.abs_path, default_section=None) is None:
-            return False
-        standalone.analyze()
-        if standalone.stats.errors or state.abs_path not in standalone.emitting:
-            return False
+        profile under ANY --snell-legacy configuration (current, empty, or
+        overriding Snell v6+ nodes in its standalone closure) would emit
+        different bytes to its bare v4/<stem>-v4.<ext> path than this root
+        would — requiring this root to isolate its sub-file copy."""
         preview = self._preview_subfile_bare_output(state, loaded_set)
-        return standalone.files[state.abs_path].converted != preview
+
+        def _standalone_run(legacy_table):
+            p = Pipeline(
+                ConversionStats(),
+                snell_legacy=legacy_table,
+                _check_standalone=False,
+            )
+            if p.discover(state.abs_path, default_section=None) is None:
+                return None
+            p.analyze()
+            return p
+
+        # 1. Check with current snell_legacy table
+        first = _standalone_run(self.snell_legacy)
+        if first is None:
+            return False
+        if not first.stats.errors and state.abs_path in first.emitting:
+            if first.files[state.abs_path].converted != preview:
+                return True
+
+        # 2. Check with empty snell_legacy (next CLI run may omit --snell-legacy)
+        if self.snell_legacy:
+            empty_run = _standalone_run({})
+            if empty_run is not None and not empty_run.stats.errors and state.abs_path in empty_run.emitting:
+                if empty_run.files[state.abs_path].converted != preview:
+                    return True
+
+        # 3. Check with synthetic snell_legacy probe covering every file in the
+        #    standalone closure (next CLI run may pass --snell-legacy or a
+        #    different override file, changing Snell v6+ availability/fields)
+        probe_legacy = {
+            os.path.basename(p): {"port": "0", "psk": "__snell_legacy_probe__"}
+            for p in first.files
+        }
+        probe_run = _standalone_run(probe_legacy)
+        if probe_run is not None and not probe_run.stats.errors and state.abs_path in probe_run.emitting:
+            if probe_run.files[state.abs_path].converted != preview:
+                return True
+
+        return False
 
     def _convert_commented_proxies(self, state):
         """Give commented-out [Proxy] nodes the same transforms as live ones,

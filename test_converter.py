@@ -5764,6 +5764,100 @@ class TestRound6Fixes:
         assert "RULE-SET,Office,OK" in scoped[0].read_text()
 
 
+class TestRound7Fixes:
+    """Regression tests for Round 7 finding:
+    Two CLI invocations with different --snell-legacy settings (enabled vs empty,
+    empty vs enabled, or two distinct override files) must never overwrite an
+    earlier root's referenced sub-file copy.
+    """
+
+    def _run_cli(self, monkeypatch, *argv):
+        from converter import main as converter_main
+        monkeypatch.setattr("sys.argv", ["converter.py", *argv])
+        converter_main()
+
+    def test_different_snell_legacy_between_importing_root_and_standalone_both_orders(
+        self, tmp_path, monkeypatch
+    ):
+        shared_text = textwrap.dedent("""\
+            [Proxy]
+            Entry = snell, 1.1.1.1, 6000, psk=FAKE-V6, version=6
+            OK = snell, 3.3.3.3, 8000, psk=FAKE-OK, version=4
+
+            [Rule]
+            FINAL,OK
+        """)
+        root_a_text = textwrap.dedent("""\
+            [Proxy]
+            Outer = snell, 8.8.8.8, 8000, psk=FAKE-OUTER, version=4, underlying-proxy=Entry
+            #!include shared.conf
+
+            [Rule]
+            FINAL,Outer
+        """)
+        legacy_a_text = "[shared.conf]\nport = 7000\npsk = FAKE-LEGACY-A\n"
+        legacy_b_text = "[shared.conf]\nport = 7001\npsk = FAKE-LEGACY-B\n"
+
+        # Case 1: root-a with --snell-legacy, then shared standalone WITHOUT --snell-legacy
+        d1 = tmp_path / "enabled_then_empty"
+        d1.mkdir()
+        (d1 / "shared.conf").write_text(shared_text)
+        (d1 / "root-a.conf").write_text(root_a_text)
+        ini_a1 = d1 / "enabled.ini"
+        ini_a1.write_text(legacy_a_text)
+        ini_a1.chmod(0o600)
+
+        self._run_cli(monkeypatch, "--snell-legacy", str(ini_a1), str(d1 / "root-a.conf"))
+        self._run_cli(monkeypatch, str(d1 / "shared.conf"))
+
+        scoped1 = list((d1 / "v4").glob("root-a-shared-*-v4.conf"))
+        assert len(scoped1) == 1
+        assert f"#!include {scoped1[0].name}" in (d1 / "v4" / "root-a-v4.conf").read_text()
+        assert "Entry = snell, 1.1.1.1, 7000, psk=FAKE-LEGACY-A, version=4" in scoped1[0].read_text()
+        assert "# [V5+] Entry = snell, 1.1.1.1, 6000" in (d1 / "v4" / "shared-v4.conf").read_text()
+
+        # Case 2: root-a WITHOUT --snell-legacy, then shared standalone WITH --snell-legacy
+        d2 = tmp_path / "empty_then_enabled"
+        d2.mkdir()
+        (d2 / "shared.conf").write_text(shared_text)
+        (d2 / "root-a.conf").write_text(
+            "[Proxy]\nDead = anytls, 2.2.2.2, 443, password=pwd\n#!include shared.conf\n[Rule]\nFINAL,OK\n"
+        )
+        ini_a2 = d2 / "enabled.ini"
+        ini_a2.write_text(legacy_a_text)
+        ini_a2.chmod(0o600)
+
+        self._run_cli(monkeypatch, str(d2 / "root-a.conf"))
+        self._run_cli(monkeypatch, "--snell-legacy", str(ini_a2), str(d2 / "shared.conf"))
+
+        scoped2 = list((d2 / "v4").glob("root-a-shared-*-v4.conf"))
+        assert len(scoped2) == 1
+        assert f"#!include {scoped2[0].name}" in (d2 / "v4" / "root-a-v4.conf").read_text()
+        assert "# [V5+] Entry = snell, 1.1.1.1, 6000" in scoped2[0].read_text()
+        assert "Entry = snell, 1.1.1.1, 7000, psk=FAKE-LEGACY-A, version=4" in (d2 / "v4" / "shared-v4.conf").read_text()
+
+        # Case 3: root-a with legacy A, then shared standalone with legacy B
+        d3 = tmp_path / "legacy_a_then_b"
+        d3.mkdir()
+        (d3 / "shared.conf").write_text(shared_text)
+        (d3 / "root-a.conf").write_text(root_a_text)
+        ini_a3 = d3 / "a.ini"
+        ini_b3 = d3 / "b.ini"
+        ini_a3.write_text(legacy_a_text)
+        ini_b3.write_text(legacy_b_text)
+        ini_a3.chmod(0o600)
+        ini_b3.chmod(0o600)
+
+        self._run_cli(monkeypatch, "--snell-legacy", str(ini_a3), str(d3 / "root-a.conf"))
+        self._run_cli(monkeypatch, "--snell-legacy", str(ini_b3), str(d3 / "shared.conf"))
+
+        scoped3 = list((d3 / "v4").glob("root-a-shared-*-v4.conf"))
+        assert len(scoped3) == 1
+        assert "7000, psk=FAKE-LEGACY-A" in scoped3[0].read_text()
+        assert "7001, psk=FAKE-LEGACY-B" in (d3 / "v4" / "shared-v4.conf").read_text()
+
+
+
 
 
 
