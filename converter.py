@@ -1479,9 +1479,10 @@ class Pipeline:
     shared dict — this is what makes cross-file cascade cleanup possible.
     """
 
-    def __init__(self, stats, processed_files=None, snell_legacy=None):
+    def __init__(self, stats, processed_files=None, snell_legacy=None, _check_standalone=True):
         self.stats = stats
         self.snell_legacy = snell_legacy or {}  # source basename → {field: value}
+        self._check_standalone = _check_standalone
         self.files = {}  # abs_path → FileState (insertion order = discovery order)
         self.processed_files = processed_files if processed_files is not None else {}
         self.abandoned_files = set()    # absolute paths of managed files we refused
@@ -2528,6 +2529,13 @@ class Pipeline:
                         and self._has_convertible_commented_proxy(state)):
                     root_scoped_files.add(abs_path)
                     continue
+                # (e) converting abs_path standalone as its own root profile
+                #     would emit different bytes to bare v4/<stem>-v4.<ext>
+                #     (e.g. parent shadowed a deleted proxy name, or standalone
+                #     runs cascades/rulesets on sections this root did not load)
+                if self._check_standalone and self._differs_from_standalone_root(state, loaded_set):
+                    root_scoped_files.add(abs_path)
+                    continue
             self._assign_root_scoped_subfiles(root_scoped_files, final_loaded)
             if self.stats.errors:
                 self.emitting = set()
@@ -2550,7 +2558,7 @@ class Pipeline:
                     self._convert_commented_proxies(state)
             state.converted = _serialize_lines(state.lines, state.original)
 
-        if self.emitting or self.generated_rulesets:
+        if self._check_standalone and (self.emitting or self.generated_rulesets):
             self._validate_planned_output_paths()
             if self.stats.errors:
                 self.emitting = set()
@@ -2568,6 +2576,42 @@ class Pipeline:
                 if transform_commented_proxy_line(line, dummy, basename, i + 1, "Proxy") != line:
                     return True
         return False
+
+    def _preview_subfile_bare_output(self, state, loaded_set):
+        """Compute the exact bytes state would emit if kept at its bare
+        <stem>-v4.<ext> filename (without mutating state.lines)."""
+        lines = list(state.lines)
+        base_dir = os.path.dirname(state.abs_path)
+        basename = os.path.basename(state.abs_path)
+        for i, line in enumerate(lines):
+            if _section_is_loaded(loaded_set, state.sections[i]):
+                new_line, _ = self._rewrite_line_refs(line, state.sections[i], base_dir)
+                lines[i] = new_line
+        if _section_is_loaded(loaded_set, "Proxy"):
+            dummy = ConversionStats()
+            for i, line in enumerate(lines):
+                if state.sections[i] == "Proxy":
+                    lines[i] = transform_commented_proxy_line(
+                        line, dummy, basename, i + 1, "Proxy"
+                    )
+        return _serialize_lines(lines, state.original)
+
+    def _differs_from_standalone_root(self, state, loaded_set):
+        """Return True if converting state.abs_path standalone as a root
+        profile would emit different bytes to its bare v4/<stem>-v4.<ext> path
+        than this root would — requiring this root to isolate its sub-file copy."""
+        standalone = Pipeline(
+            ConversionStats(),
+            snell_legacy=self.snell_legacy,
+            _check_standalone=False,
+        )
+        if standalone.discover(state.abs_path, default_section=None) is None:
+            return False
+        standalone.analyze()
+        if standalone.stats.errors or state.abs_path not in standalone.emitting:
+            return False
+        preview = self._preview_subfile_bare_output(state, loaded_set)
+        return standalone.files[state.abs_path].converted != preview
 
     def _convert_commented_proxies(self, state):
         """Give commented-out [Proxy] nodes the same transforms as live ones,

@@ -4788,10 +4788,14 @@ class TestRound2Fixes:
         """))
         out = convert_file(str(main))
         assert out is not None
-        cat_v4 = (tmp_path / "v4" / "catalog-v4.dconf").read_text()
+        scoped_cats = list((tmp_path / "v4").glob("main-catalog-*-v4.dconf"))
+        assert len(scoped_cats) == 1
+        cat_v4 = scoped_cats[0].read_text()
         assert "\nExit = snell, 2.2.2.2, 8000, psk=a, version=4, underlying-proxy=Entry\n" in "\n" + cat_v4
         assert "# [V5+ cascade] Exit" not in cat_v4
-        assert "\nFINAL,Exit\n" in (tmp_path / "v4" / "main-v4.conf").read_text()
+        main_v4 = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert f"#!include {scoped_cats[0].name}" in main_v4
+        assert "\nFINAL,Exit\n" in main_v4
 
     def test_unloaded_subfile_ruleset_does_not_dirty_clean_profile_or_abandon_managed(self, tmp_path):
         (tmp_path / "catalog.dconf").write_text(textwrap.dedent("""\
@@ -5660,6 +5664,105 @@ class TestRound5Fixes:
         assert "extended-matching" not in rs_text
         assert f"\nRULE-SET,{rs_files[0].name},DIRECT\n" in out
         assert "# [V5+ cascade] NOT,((RULE-SET,CompoundNarrowed)),REJECT" in out
+
+
+class TestRound6Fixes:
+    """Regression tests for Round 6 finding:
+    A standalone-valid profile imported as a sub-file by another root must not
+    collide with its own bare v4/<name>-v4.<ext> output when converted as root
+    (in either conversion order).
+    """
+
+    def test_imported_profile_then_converted_standalone_and_reverse_order(self, tmp_path):
+        shared_content = textwrap.dedent("""\
+            [Proxy]
+            Entry = vless, 1.1.1.1, 443, username=00000000-0000-0000-0000-000000000000
+            Exit = snell, 2.2.2.2, 8000, psk=a, version=4, underlying-proxy=Entry
+            OK = snell, 3.3.3.3, 8000, psk=b, version=4
+
+            [Rule]
+            FINAL,OK
+        """)
+        root_a_content = textwrap.dedent("""\
+            [Proxy]
+            Entry = snell, 9.9.9.9, 8000, psk=z, version=4
+            Outer = snell, 8.8.8.8, 8000, psk=y, version=4, underlying-proxy=Exit
+            #!include shared.conf
+
+            [Rule]
+            FINAL,Outer
+        """)
+
+        # Order 1: convert root-a first, then shared standalone
+        d1 = tmp_path / "order1"
+        d1.mkdir()
+        shared1 = d1 / "shared.conf"
+        root_a1 = d1 / "root-a.conf"
+        shared1.write_text(shared_content)
+        root_a1.write_text(root_a_content)
+
+        convert_file(str(root_a1))
+        convert_file(str(shared1))
+
+        a1_out = (d1 / "v4" / "root-a-v4.conf").read_text()
+        shared1_standalone = (d1 / "v4" / "shared-v4.conf").read_text()
+        scoped_shared1 = list((d1 / "v4").glob("root-a-shared-*-v4.conf"))
+        assert len(scoped_shared1) == 1
+        assert f"#!include {scoped_shared1[0].name}" in a1_out
+        assert "\nExit = snell, 2.2.2.2" in scoped_shared1[0].read_text()
+        assert "# [V5+ cascade] Exit = snell" in shared1_standalone
+
+        # Order 2: convert shared standalone first, then root-a
+        d2 = tmp_path / "order2"
+        d2.mkdir()
+        shared2 = d2 / "shared.conf"
+        root_a2 = d2 / "root-a.conf"
+        shared2.write_text(shared_content)
+        root_a2.write_text(root_a_content)
+
+        convert_file(str(shared2))
+        convert_file(str(root_a2))
+
+        a2_out = (d2 / "v4" / "root-a-v4.conf").read_text()
+        shared2_standalone = (d2 / "v4" / "shared-v4.conf").read_text()
+        scoped_shared2 = list((d2 / "v4").glob("root-a-shared-*-v4.conf"))
+        assert len(scoped_shared2) == 1
+        assert f"#!include {scoped_shared2[0].name}" in a2_out
+        assert "\nExit = snell, 2.2.2.2" in scoped_shared2[0].read_text()
+        assert "# [V5+ cascade] Exit = snell" in shared2_standalone
+
+    def test_imported_profile_with_unloaded_ruleset_section_isolated_from_standalone(self, tmp_path):
+        shared = tmp_path / "shared.conf"
+        shared.write_text(textwrap.dedent("""\
+            [Proxy]
+            OK = snell, 1.1.1.1, 8000, psk=a, version=4
+
+            [Ruleset Office]
+            DOMAIN,office.example.test
+
+            [Rule]
+            RULE-SET,Office,OK
+            FINAL,DIRECT
+        """))
+        root_a = tmp_path / "root-a.conf"
+        root_a.write_text(textwrap.dedent("""\
+            [Proxy]
+            Dead = anytls, 2.2.2.2, 443, password=pwd
+            #!include shared.conf
+
+            [Rule]
+            FINAL,OK
+        """))
+        convert_file(str(root_a))
+        convert_file(str(shared))
+
+        a_out = (tmp_path / "v4" / "root-a-v4.conf").read_text()
+        scoped = list((tmp_path / "v4").glob("root-a-shared-*-v4.conf"))
+        assert len(scoped) == 1
+        assert f"#!include {scoped[0].name}" in a_out
+        assert "RULE-SET,shared-Office-" in (tmp_path / "v4" / "shared-v4.conf").read_text()
+        assert "RULE-SET,Office,OK" in scoped[0].read_text()
+
 
 
 
