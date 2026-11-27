@@ -29,6 +29,7 @@ import argparse
 import configparser
 import ctypes
 import errno
+import hashlib
 import os
 import re
 import stat
@@ -2213,16 +2214,19 @@ class Pipeline:
     def _group_member_supply(self, state, rec, group_index, global_deleted,
                              global_proxies, use_initial, visited=None, memo=None):
         """Recursively compute:
-          (definite_items, uncertain_items, has_unknown_supply,
-           unverifiable_patterns, hit_cycle)
+          (definite_names, uncertain_names, has_unknown_supply,
+           unverifiable_patterns, supply_sig, hit_cycle)
         for a [Proxy Group] either BEFORE conversion (use_initial=True) or
         AFTER current deletions (use_initial=False).
 
-        Each item in `definite_items` / `uncertain_items` is a flat 3-tuple:
-          (origin_tag, last_unv_group_key, exposed_name)
-        preserving both member certainty (Kleene 3-valued logic across nested
-        filters) and leaf source provenance (explicit / policy-path / global)
-        without exponential blowup in shared-subgroup diamond DAGs.
+        - `definite_names` / `uncertain_names` are pure `frozenset[str]` using
+          Kleene 3-valued propagation across nested `policy-regex-filter`s.
+        - `supply_sig` is a 16-byte BLAKE2b Merkle DAG digest over every
+          post-filter contributing source feeding this group (explicit members,
+          contributing `include-all-proxies` / `policy-path` proxies, and each
+          contributing `include-other-group` child's key, kept names, and own
+          `supply_sig`). Any removal or mutation of a contributing path at any
+          nesting depth changes `supply_sig` while keeping diamond DAGs O(V+E).
 
         Per Surge semantics:
           - Explicit static members are unfiltered.
@@ -2236,67 +2240,75 @@ class Pipeline:
             visited = set()
         visit_key = (state.abs_path, id(rec))
         if memo is not None and visit_key in memo:
-            m_def, m_unc, m_unk, m_unv = memo[visit_key]
-            return m_def, m_unc, m_unk, m_unv, False
+            m_def, m_unc, m_unk, m_unv, m_sig = memo[visit_key]
+            return m_def, m_unc, m_unk, m_unv, m_sig, False
         if visit_key in visited:
-            return frozenset(), frozenset(), False, (), True
+            cyc_sig = hashlib.blake2b(
+                f"CYCLE:{state.abs_path}:{id(rec)}".encode("utf-8"), digest_size=16
+            ).digest()
+            return frozenset(), frozenset(), False, (), cyc_sig, True
         visited = visited | {visit_key}
 
         base_dir = os.path.dirname(state.abs_path)
         matcher = rec.compiled_regex_filter()
         prefix = rec.external_policy_name_prefix()
 
+        def _eval_names(names):
+            if not names:
+                return set(), set()
+            if matcher is None:
+                return set(names), set()
+            return matcher.match_set(names)
+
         definite = set()
         uncertain = set()
         has_unknown = False
         hit_cycle = False
         unverifiable = []
+        self_unv = False
+        sig_parts = []
 
         # 1. Explicit static members (definite, unfiltered by policy-regex-filter)
-        explicit_origin = ("explicit", state.abs_path, id(rec))
         if use_initial:
-            for m in (rec.initial_members or rec.members):
-                definite.add((explicit_origin, None, unquote(m)))
+            explicit_names = {unquote(m) for m in (rec.initial_members or rec.members)}
         else:
-            for m in rec.members:
-                nm = unquote(m)
-                if nm not in global_deleted:
-                    definite.add((explicit_origin, None, nm))
+            explicit_names = {
+                unquote(m) for m in rec.members if unquote(m) not in global_deleted
+            }
+        definite |= explicit_names
+        for nm in sorted(explicit_names):
+            sig_parts.append(("E", nm))
 
-        # 2. Dynamic imported sources: keep policy-path (prefixed after filter)
-        #    and definite vs uncertain streams separate.
-        pp_def_items = set()
-        other_def_items = set()
-        other_unc_items = set()
-        child_unc_sources = []
-        all_origin = ("all", state.abs_path, id(rec))
-
+        # 2. Dynamic imported sources
         opts = (rec.initial_options or rec.options) if use_initial else rec.options
+        has_include_all = False
+        pp_remote_urls = set()
+        pp_missing_paths = set()
+        pp_local_pools = {}
+        iog_missing_groups = set()
+        iog_targets = {}
+
         for opt in opts:
             kl = opt.key.lower()
             if kl == "include-all-proxies" and opt.raw_value.strip() in {"1", "true"}:
-                if self._root_has_remote_proxy_include():
-                    has_unknown = True
-                else:
-                    for p in global_proxies:
-                        other_def_items.add((all_origin, None, p))
+                has_include_all = True
             elif kl == "policy-path" and opt.policy_path is not None:
                 if opt.policy_path.startswith(("http://", "https://")):
                     has_unknown = True
+                    pp_remote_urls.add(opt.policy_path)
                 else:
                     ref_abs = self._resolve_local_path(opt.policy_path, base_dir, prefer_root=True)
                     st = self.files.get(ref_abs)
                     if st is None:
                         if ref_abs not in self.abandoned_files:
                             has_unknown = True
+                            pp_missing_paths.add(ref_abs)
                     elif use_initial:
-                        pp_origin = ("pp", state.abs_path, id(rec), ref_abs)
-                        for p in st.initial_proxies:
-                            pp_def_items.add((pp_origin, None, p))
+                        pp_local_pools.setdefault(ref_abs, set()).update(st.initial_proxies)
                     elif not st.is_abandoned:
-                        pp_origin = ("pp", state.abs_path, id(rec), ref_abs)
-                        for p in (st.owned_proxies - st.self_deleted_proxies):
-                            pp_def_items.add((pp_origin, None, p))
+                        pp_local_pools.setdefault(ref_abs, set()).update(
+                            st.owned_proxies - st.self_deleted_proxies
+                        )
             elif kl == "include-other-group" and opt.iog_groups is not None:
                 groups = (
                     (opt.initial_iog_groups if opt.initial_iog_groups is not None else opt.iog_groups)
@@ -2308,95 +2320,121 @@ class Pipeline:
                     targets = group_index.get(g)
                     if not targets:
                         has_unknown = True
+                        iog_missing_groups.add(g)
                         continue
                     for sub_state, _, sub_rec in targets:
                         if not use_initial and sub_rec.commented_out:
                             continue
-                        sub_def, sub_unc, sub_unk, sub_unv, sub_cycle = self._group_member_supply(
-                            sub_state, sub_rec, group_index, global_deleted,
-                            global_proxies, use_initial, visited=visited, memo=memo,
-                        )
-                        other_def_items |= sub_def
-                        other_unc_items |= sub_unc
-                        has_unknown = has_unknown or sub_unk
-                        hit_cycle = hit_cycle or sub_cycle
-                        if sub_unc and sub_unv:
-                            child_unc_sources.append((sub_unc, sub_unv))
+                        sub_key = (g, sub_state.abs_path, id(sub_rec))
+                        if sub_key not in iog_targets:
+                            iog_targets[sub_key] = (sub_state, sub_rec)
 
-        def _apply_matcher(def_items, unc_items, apply_prefix=""):
-            if not def_items and not unc_items:
-                return set(), set(), set(), False
-            if matcher is None:
-                out_def = {(o, u, apply_prefix + nm) for (o, u, nm) in def_items}
-                out_unc = {(o, u, apply_prefix + nm) for (o, u, nm) in unc_items}
-                kept_names = {nm for (_, _, nm) in unc_items}
-                return out_def, out_unc, kept_names, False
-            all_names = {nm for (_, _, nm) in def_items} | {nm for (_, _, nm) in unc_items}
-            m_def, m_unc = matcher.match_set(all_names)
-            out_def = set()
-            out_unc = set()
-            self_unv = False
-            for o, u, nm in def_items:
-                if nm in m_def:
-                    out_def.add((o, u, apply_prefix + nm))
-                elif nm in m_unc:
-                    out_unc.add((o, visit_key, apply_prefix + nm))
+        # 2a. include-all-proxies
+        if has_include_all:
+            if self._root_has_remote_proxy_include():
+                has_unknown = True
+                sig_parts.append(("AR",))
+            else:
+                all_def, all_unc = _eval_names(global_proxies)
+                if all_unc:
                     self_unv = True
-            for o, u, nm in unc_items:
-                if nm in m_def:
-                    out_unc.add((o, u, apply_prefix + nm))
-                elif nm in m_unc:
-                    out_unc.add((o, visit_key, apply_prefix + nm))
-                    self_unv = True
-            return out_def, out_unc, m_def | m_unc, self_unv
+                definite |= all_def
+                uncertain |= all_unc
+                if all_def or all_unc:
+                    sig_parts.append(("A", tuple(sorted(all_def)), tuple(sorted(all_unc))))
 
-        pp_def, pp_unc, _, pp_self_unv = _apply_matcher(pp_def_items, set(), apply_prefix=prefix)
-        other_def, other_unc, other_kept_names, other_self_unv = _apply_matcher(
-            other_def_items, other_unc_items, apply_prefix=""
-        )
+        # 2b. policy-path (filter first, then apply external-policy-name-prefix)
+        for url in sorted(pp_remote_urls):
+            sig_parts.append(("PR", url))
+        for ref_abs in sorted(pp_missing_paths):
+            sig_parts.append(("PM", ref_abs))
+        for ref_abs in sorted(pp_local_pools):
+            pp_def, pp_unc = _eval_names(pp_local_pools[ref_abs])
+            if pp_unc:
+                self_unv = True
+            if prefix:
+                definite |= {prefix + n for n in pp_def}
+                uncertain |= {prefix + n for n in pp_unc}
+            else:
+                definite |= pp_def
+                uncertain |= pp_unc
+            if pp_def or pp_unc:
+                sig_parts.append(("P", ref_abs, tuple(sorted(pp_def)), tuple(sorted(pp_unc))))
 
-        for sub_unc, sub_unv in child_unc_sources:
-            if any(nm in other_kept_names for (_, _, nm) in sub_unc):
+        # 2c. include-other-group (preserve every contributing child's Merkle digest)
+        for g in sorted(iog_missing_groups):
+            sig_parts.append(("GM", g))
+        for sub_key in sorted(iog_targets):
+            g, sub_path, sub_id = sub_key
+            sub_state, sub_rec = iog_targets[sub_key]
+            sub_def, sub_unc, sub_unk, sub_unv, sub_sig, sub_cycle = self._group_member_supply(
+                sub_state, sub_rec, group_index, global_deleted,
+                global_proxies, use_initial, visited=visited, memo=memo,
+            )
+            has_unknown = has_unknown or sub_unk
+            hit_cycle = hit_cycle or sub_cycle
+
+            kept_def, unc_from_def = _eval_names(sub_def)
+            unc_def_match, unc_from_unc = _eval_names(sub_unc)
+            kept_unc_from_unc = unc_def_match | unc_from_unc
+            if unc_from_def or unc_from_unc:
+                self_unv = True
+            definite |= kept_def
+            uncertain |= unc_from_def | kept_unc_from_unc
+            if kept_unc_from_unc and sub_unv:
                 unverifiable.extend(sub_unv)
-        if (pp_self_unv or other_self_unv) and matcher is not None:
+            if sub_unk or kept_def or unc_from_def or kept_unc_from_unc:
+                sig_parts.append((
+                    "G", g, sub_path, sub_id, sub_unk,
+                    tuple(sorted(kept_def)),
+                    tuple(sorted(unc_from_def)),
+                    tuple(sorted(kept_unc_from_unc)),
+                    sub_sig,
+                ))
+
+        if self_unv and matcher is not None:
             unverifiable.append((os.path.basename(state.abs_path), rec.name, matcher.pattern))
 
-        definite |= pp_def | other_def
-        uncertain |= pp_unc | other_unc
+        h = hashlib.blake2b(digest_size=16)
+        for part in sig_parts:
+            h.update(repr(part).encode("utf-8"))
+            h.update(b"\0")
+        supply_sig = h.digest()
 
         res = (
             frozenset(definite),
             frozenset(uncertain),
             has_unknown,
             tuple(dict.fromkeys(unverifiable)),
+            supply_sig,
         )
         if memo is not None and not hit_cycle:
             memo[visit_key] = res
-        return res[0], res[1], res[2], res[3], hit_cycle
+        return res[0], res[1], res[2], res[3], res[4], hit_cycle
 
     def _group_lost_all_members(self, state, rec, initial_group_index, current_group_index,
                                 global_deleted, initial_global_proxies, current_global_proxies,
                                 initial_memo=None, current_memo=None):
         """Return (had_initial, has_current, unverifiable_error_list) using
-        3-valued member certainty (definite vs uncertain) with source provenance:
+        3-valued member certainty (definite vs uncertain) + Merkle DAG supply digest:
 
           - Cascade (`had_initial and not has_current`) ONLY when the group is
             PROVEN non-empty before conversion (`init_def` or `init_unk`) AND
             PROVEN empty after conversion (empty `cur_def`, `cur_unc`, `not cur_unk`).
           - Fail closed (report `unv_errors`) when the group has NO definite
             surviving member (`not cur_def and not cur_unk`) AND either:
-              1. `cur_unc` is non-empty and the group's provenance-tagged supply
-                 shrank during conversion, OR
+              1. `cur_unc` is non-empty and the group's post-filter Merkle
+                 dependency DAG changed during conversion (`init_sig != cur_sig`), OR
               2. `cur_unc` is empty, `init_def` was empty (`not init_unk`), and
                  `init_unc` was non-empty (all uncertain initial candidates were
-                 deleted, so we cannot prove whether the group was originally
+                 removed, so we cannot prove whether the group was originally
                  non-empty and must cascade or originally empty and must stay).
         """
-        init_def, init_unc, init_unk, init_unv, _ = self._group_member_supply(
+        init_def, init_unc, init_unk, init_unv, init_sig, _ = self._group_member_supply(
             state, rec, initial_group_index, set(), initial_global_proxies,
             use_initial=True, memo=initial_memo,
         )
-        cur_def, cur_unc, cur_unk, cur_unv, _ = self._group_member_supply(
+        cur_def, cur_unc, cur_unk, cur_unv, cur_sig, _ = self._group_member_supply(
             state, rec, current_group_index, global_deleted, current_global_proxies,
             use_initial=False, memo=current_memo,
         )
@@ -2409,12 +2447,8 @@ class Pipeline:
 
         unv_errors = []
         if not cur_definitely_nonempty:
-            supply_shrank = (
-                (init_unk and not cur_unk)
-                or bool(init_def - cur_def)
-                or bool(init_unc - cur_unc)
-            )
-            if cur_unc and supply_shrank:
+            supply_changed = (init_sig != cur_sig)
+            if cur_unc and supply_changed:
                 for fname, gname, pat in cur_unv:
                     unv_errors.append(
                         f"{fname} [{gname}] 无法按 Surge ICU 正则语义验证 policy-regex-filter={pat!r}，"

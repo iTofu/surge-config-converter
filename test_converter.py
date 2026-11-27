@@ -5525,3 +5525,70 @@ class TestRound6Regressions:
         assert convert_file(str(main), stats, {str(main): None}) is None
         assert any("ICU" in e and "Bad" in e for e in stats.errors)
         assert not (tmp_path / "v4" / "main-v4.conf").exists()
+
+
+# --- T95: Round-7 Codex review regression suite (Merkle DAG supply digest) ---
+
+class TestRound7Regressions:
+    def test_upper_unverifiable_filter_preserves_distinct_subgroup_paths(self, tmp_path, monkeypatch):
+        """P1: when Pool has an unverifiable filter and imports the same Node
+        from Base via two distinct unverifiable subgroups A (deleted) and B
+        (non-matching ^\\p{Han}+$), removing A must still trigger the ICU
+        diagnostic at Pool instead of collapsing A and B into one tuple."""
+        import converter as conv_mod
+        monkeypatch.setattr(conv_mod.sys, "platform", "linux")
+
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Relay = anytls, 1.1.1.1, 443, password=p\n"
+            "Node = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            "Base = select, Node\n"
+            "A = select, include-other-group=Base, underlying-proxy=Relay, policy-regex-filter=^(?=Node)Node$\n"
+            r"B = select, include-other-group=Base, policy-regex-filter=^\p{Han}+$" + "\n"
+            'Pool = select, include-other-group="A, B", policy-regex-filter=^(?=Node)Node$' + "\n"
+            "[Rule]\n"
+            "FINAL,Pool\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is None
+        assert any("ICU" in e and "policy-regex-filter" in e for e in stats.errors)
+
+    def test_deep_nested_unverifiable_diamond_preserves_path_loss_in_linear_time(self, tmp_path, monkeypatch):
+        """Merkle DAG supply digest detects path loss across multi-level nested
+        unverifiable filters AND stays O(V+E) on a 24-level unverifiable diamond."""
+        import time
+        import converter as conv_mod
+        monkeypatch.setattr(conv_mod.sys, "platform", "linux")
+
+        lines = [
+            "[Proxy]",
+            "Relay = anytls, 1.1.1.1, 443, password=p",
+            "Node = trojan, 2.2.2.2, 443, password=p",
+            "[Proxy Group]",
+            "Base = select, Node",
+            "L0 = select, include-other-group=Base, underlying-proxy=Relay, policy-regex-filter=^(?=Node)Node$",
+            r"R0 = select, include-other-group=Base, policy-regex-filter=^\p{Han}+$",
+        ]
+        for level in range(1, 25):
+            prev_l, prev_r = f"L{level - 1}", f"R{level - 1}"
+            lines.append(
+                f'L{level} = select, include-other-group="{prev_l}, {prev_r}", policy-regex-filter=^(?=Node)Node$'
+            )
+            lines.append(
+                f'R{level} = select, include-other-group="{prev_l}, {prev_r}", policy-regex-filter=^(?=Node)Node$'
+            )
+        lines.append('Pool = select, include-other-group="L24, R24", policy-regex-filter=^(?=Node)Node$')
+        lines.append("[Rule]")
+        lines.append("FINAL,Pool")
+
+        main = tmp_path / "diamond.conf"
+        main.write_text("\n".join(lines) + "\n")
+        t0 = time.monotonic()
+        stats = ConversionStats()
+        res = convert_file(str(main), stats, {str(main): None})
+        elapsed = time.monotonic() - t0
+        assert res is None
+        assert any("ICU" in e and "policy-regex-filter" in e for e in stats.errors)
+        assert elapsed < 1.0, f"expected O(V+E) under 1s, took {elapsed:.2f}s"
