@@ -4968,3 +4968,155 @@ class TestRound1Regressions:
         assert secret_token not in captured.out + captured.err
         assert "private.example.com" not in captured.out + captured.err
         assert "1 条远端 include" in captured.out
+
+
+# --- T90: Round-2 Codex review regression suite (6 P1 root-cause fixes) ---
+
+class TestRound2Regressions:
+    def test_dangling_symlink_output_aliasing_another_output_aborts(self, tmp_path):
+        """P1: dangling symlink v4/main-v4.conf -> data-v4.dconf must be rejected
+        pre-emit instead of letting both outputs write into data-v4.dconf."""
+        (tmp_path / "data.dconf").write_text(
+            "[Proxy]\nDead = anytls, 1.1.1.1, 443, password=p\nKeep = trojan, 2.2.2.2, 443, password=p\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy]\n#!include data.dconf\n[Rule]\nFINAL,Keep\n")
+        v4 = tmp_path / "v4"
+        v4.mkdir()
+        (v4 / "main-v4.conf").symlink_to("data-v4.dconf")
+
+        stats = ConversionStats()
+        res = convert_file(str(main), stats, {str(main): None})
+        assert res is None
+        assert any("映射到同一输出路径" in e for e in stats.errors)
+        assert not (v4 / "data-v4.dconf").exists()
+        assert (v4 / "main-v4.conf").is_symlink()
+
+    def test_same_source_file_referenced_with_different_case_merged_on_case_insensitive_fs(self, tmp_path):
+        """P1: on case-insensitive APFS, [Proxy] #!include Provider.dconf and
+        [Rule] #!include provider.dconf refer to the same file and merge cleanly."""
+        from converter import _probe_volume_semantics
+        case_sensitive, _ = _probe_volume_semantics(str(tmp_path))
+        if case_sensitive:
+            pytest.skip("requires case-insensitive volume")
+        prov = tmp_path / "Provider.dconf"
+        prov.write_text(
+            "[Proxy]\nDead = anytls, 1.1.1.1, 443, password=p\nKeep = trojan, 2.2.2.2, 443, password=p\n"
+            "[Rule]\nDOMAIN,a.example,Keep\nFINAL,Keep\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n#!include Provider.dconf\n"
+            "[Rule]\n#!include provider.dconf\n"
+        )
+        stats = ConversionStats()
+        res = convert_file(str(main), stats, {str(main): None})
+        assert res is not None and not stats.errors
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert out.count("#!include Provider-v4.dconf") == 2
+        assert (tmp_path / "v4" / "Provider-v4.dconf").exists()
+
+    def test_preflight_and_emit_share_newline_parity_avoiding_false_backup_conflict(self, tmp_path):
+        """P1: existing output with CRLF line endings matching LF converted text
+        must be treated as unchanged by both preflight and emit() (no false
+        backup collision against a loaded source named main-v4-deprecated.conf)."""
+        src_dep = tmp_path / "main-v4-deprecated.conf"
+        src_dep.write_text("[Proxy]\nKeep = trojan, 1.1.1.1, 443, password=p\n")
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\nDead = anytls, 2.2.2.2, 443, password=p\n"
+            "#!include main-v4-deprecated.conf\n"
+            "[Rule]\nFINAL,Keep\n"
+        )
+        # First export to -o tmp_path succeeds cleanly (main-v4.conf does not exist yet)
+        out_path = convert_file(str(main), ConversionStats(), {str(main): None}, output_dir=str(tmp_path))
+        assert out_path == str(tmp_path / "main-v4.conf")
+
+        # Rewrite main-v4.conf with CRLF line endings (same logical text)
+        lf_text = (tmp_path / "main-v4.conf").read_text()
+        (tmp_path / "main-v4.conf").write_bytes(lf_text.replace("\n", "\r\n").encode("utf-8"))
+
+        # Re-run: unchanged -> must skip without tripping a phantom backup conflict!
+        stats2 = ConversionStats()
+        res2 = convert_file(str(main), stats2, {str(main): None}, output_dir=str(tmp_path))
+        assert res2 == str(tmp_path / "main-v4.conf")
+        assert not stats2.errors
+        assert src_dep.exists()
+
+    def test_dynamic_group_regex_filter_emptied_cascades_and_trips_final_guard(self, tmp_path):
+        """P1: policy-regex-filter matching only deleted proxies empties the
+        dynamic group even when non-matching proxies survive."""
+        # Case A: include-all-proxies=1 + policy-regex-filter
+        d1 = tmp_path / "iap_re"
+        d1.mkdir()
+        m1 = d1 / "main.conf"
+        m1.write_text(
+            "[Proxy]\n"
+            "Fast = anytls, 1.1.1.1, 443, password=p\n"
+            "Slow = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            "OnlyFast = select, include-all-proxies=1, policy-regex-filter=^Fast$\n"
+            "[Rule]\n"
+            "FINAL,OnlyFast\n"
+        )
+        s1 = ConversionStats()
+        assert convert_file(str(m1), s1, {str(m1): None}) is None
+        assert any("FINAL" in e for e in s1.errors)
+
+        # Case B: local policy-path + policy-regex-filter
+        d2 = tmp_path / "pp_re"
+        d2.mkdir()
+        (d2 / "pool.dconf").write_text(
+            "[Proxy]\n"
+            "Fast = anytls, 1.1.1.1, 443, password=p\n"
+            "Slow = trojan, 2.2.2.2, 443, password=p\n"
+        )
+        m2 = d2 / "main.conf"
+        m2.write_text(
+            "[Proxy Group]\n"
+            "OnlyFast = select, policy-path=pool.dconf, policy-regex-filter=^Fast$\n"
+            "[Rule]\n"
+            "FINAL,OnlyFast\n"
+        )
+        s2 = ConversionStats()
+        assert convert_file(str(m2), s2, {str(m2): None}) is None
+        assert any("FINAL" in e for e in s2.errors)
+
+    def test_preexisting_comment_section_header_inside_proxy_does_not_hide_deletion(self, tmp_path):
+        """P1: `# [V5+] [Ruleset discarded]` inside [Proxy] is a plain comment
+        and must NOT switch section ownership away from [Proxy]."""
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "# [V5+] [Ruleset discarded]\n"
+            "Old = anytls, 1.1.1.1, 443, password=p\n"
+            "[Rule]\n"
+            "FINAL,Old\n"
+        )
+        stats = ConversionStats()
+        res = convert_file(str(main), stats, {str(main): None})
+        assert res is None
+        assert any("FINAL" in e for e in stats.errors)
+        assert not (tmp_path / "v4").exists()
+
+    def test_ruleset_with_unmatched_open_paren_in_filename_parsed_and_cascaded(self, tmp_path):
+        """P1: non-logical RULE-SET with '(' in filename splits without paren tracking."""
+        rs = tmp_path / "example (pilot.list"
+        rs.write_text("DOMAIN,pilot.example\n")
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Old = anytls, 1.1.1.1, 443, password=p\n"
+            "Keep = trojan, 2.2.2.2, 443, password=p\n"
+            "[Rule]\n"
+            "RULE-SET,example (pilot.list,Old\n"
+            "RULE-SET,example (pilot.list,Keep\n"
+            "FINAL,Keep\n"
+        )
+        stats = ConversionStats()
+        res = convert_file(str(main), stats, {str(main): None})
+        assert res is not None and not stats.errors
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] RULE-SET,example (pilot.list,Old" in out
+        assert "\nRULE-SET,example (pilot-v4.list,Keep\n" in out
+        assert (tmp_path / "v4" / "example (pilot-v4.list").read_text() == "DOMAIN,pilot.example\n"
