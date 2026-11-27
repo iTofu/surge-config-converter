@@ -2536,6 +2536,13 @@ class Pipeline:
                 if self._check_standalone and self._differs_from_standalone_root(state, loaded_set):
                     root_scoped_files.add(abs_path)
                     continue
+                # (f) contains any live Snell version>=6 proxy line (headed or
+                #     headerless, #!include or policy-path): its emitted bytes
+                #     depend on the CLI --snell-legacy override setting, which
+                #     can vary across invocations for different root profiles
+                if self._has_live_snell_v6_proxy(state):
+                    root_scoped_files.add(abs_path)
+                    continue
             self._assign_root_scoped_subfiles(root_scoped_files, final_loaded)
             if self.stats.errors:
                 self.emitting = set()
@@ -2565,6 +2572,23 @@ class Pipeline:
                 self.generated_rulesets = {}
                 self.output_relnames = {}
                 return
+
+    def _has_live_snell_v6_proxy(self, state):
+        """Return True if state's original content contains any uncommented
+        Snell version>=6 proxy line (headed or headerless), whose converted
+        output depends on the invocation's --snell-legacy configuration."""
+        lines = state.original.splitlines()
+        sections = compute_sections(lines, state.default_section)
+        for line, sec in zip(lines, sections):
+            if sec != "Proxy":
+                continue
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#") or _COMMENT_PREFIX_RE.match(stripped):
+                continue
+            reason = v5plus_only_proxy_reason(line)
+            if reason and reason.startswith("snell version="):
+                return True
+        return False
 
     def _has_convertible_commented_proxy(self, state):
         """Return True if state contains a commented-out [Proxy] line that

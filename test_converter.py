@@ -2174,10 +2174,13 @@ class TestSnellVersion6:
         )
         stats = ConversionStats()
         convert_file(str(main), stats, {str(main): None})
-        nodes_out = (tmp_path / "v4" / "nodes-v4.dconf").read_text().splitlines()
+        scoped_nodes = list((tmp_path / "v4").glob("main-nodes-*-v4.dconf"))
+        assert len(scoped_nodes) == 1
+        nodes_out = scoped_nodes[0].read_text().splitlines()
         assert nodes_out[0] == "# [V5+] S6 = snell, 1.2.3.4, 443, psk=pwd, version=6"
         assert nodes_out[1] == "S5 = snell, 5.6.7.8, 443, psk=pwd, version=4"
         main_out = (tmp_path / "v4" / "main-v4.conf").read_text().splitlines()
+        assert f"#!include {scoped_nodes[0].name}" in main_out
         assert "Mixed = select, S5" in main_out
         assert "# [V5+ cascade] Only6 = select" in main_out
         assert "# [V5+ cascade] DOMAIN,a.com,Only6" in main_out
@@ -3887,7 +3890,9 @@ class TestSnellLegacyOverride:
         stats = ConversionStats()
         convert_file(str(main), stats, {str(main): None}, snell_legacy=legacy)
         stem, ext = nodes_name.rsplit(".", 1)
-        nodes_out = (tmp_path / "v4" / f"{stem}-v4.{ext}").read_text().splitlines()
+        scoped = list((tmp_path / "v4").glob(f"main-{stem}-*-v4.{ext}"))
+        assert len(scoped) == 1
+        nodes_out = scoped[0].read_text().splitlines()
         main_out = (tmp_path / "v4" / "main-v4.conf").read_text().splitlines()
         return nodes_out, main_out, stats
 
@@ -4003,7 +4008,9 @@ class TestSnellLegacyLoading:
                     f"[srv.dconf]\nserver = legacy.fake.example\npsk = {self.PSK}\n")
         main = self._profile(tmp_path)
         self._main(monkeypatch, str(main))
-        out = (tmp_path / "v4" / "srv-v4.dconf").read_text()
+        scoped = list((tmp_path / "v4").glob("main-srv-*-v4.dconf"))
+        assert len(scoped) == 1
+        out = scoped[0].read_text()
         assert out == f"S6 = snell, legacy.fake.example, 6000, psk={self.PSK}, version=4\n"
         captured = capsys.readouterr()
         assert "snell-legacy.ini" in captured.out
@@ -4014,12 +4021,16 @@ class TestSnellLegacyLoading:
         f = self._write(tmp_path / "custom.ini", "[srv.dconf]\nport = 7000\n")
         main = self._profile(tmp_path)
         self._main(monkeypatch, "--snell-legacy", str(f), str(main))
-        assert ", 7000," in (tmp_path / "v4" / "srv-v4.dconf").read_text()
+        scoped = list((tmp_path / "v4").glob("main-srv-*-v4.dconf"))
+        assert len(scoped) == 1
+        assert ", 7000," in scoped[0].read_text()
 
     def test_no_file_feature_off(self, tmp_path, monkeypatch, capsys):
         main = self._profile(tmp_path)
         self._main(monkeypatch, str(main))
-        out = (tmp_path / "v4" / "srv-v4.dconf").read_text()
+        scoped = list((tmp_path / "v4").glob("main-srv-*-v4.dconf"))
+        assert len(scoped) == 1
+        out = scoped[0].read_text()
         assert out.startswith("# [V5+] S6 = snell")
         assert "snell" not in capsys.readouterr().err
 
@@ -5855,6 +5866,71 @@ class TestRound7Fixes:
         assert len(scoped3) == 1
         assert "7000, psk=FAKE-LEGACY-A" in scoped3[0].read_text()
         assert "7001, psk=FAKE-LEGACY-B" in (d3 / "v4" / "shared-v4.conf").read_text()
+
+
+class TestRound8Fixes:
+    """Regression tests for Round 8 finding:
+    Two roots sharing a headerless policy-path (or #!include) Snell v6+ list
+    with different --snell-legacy settings must isolate per root and never
+    overwrite each other.
+    """
+
+    def _run_cli(self, monkeypatch, *argv):
+        from converter import main as converter_main
+        monkeypatch.setattr("sys.argv", ["converter.py", *argv])
+        converter_main()
+
+    def test_shared_headerless_policy_path_different_snell_legacy_both_orders(
+        self, tmp_path, monkeypatch
+    ):
+        shared_txt = "S6 = snell, 192.0.2.20, 443, psk=fixture, version=6\n"
+        cfg_a = textwrap.dedent("""\
+            [Proxy Group]
+            Proxy = select, policy-path=shared.txt
+
+            [Rule]
+            FINAL,Proxy
+        """)
+        cfg_b = textwrap.dedent("""\
+            [Proxy]
+            OK = snell, 192.0.2.30, 8000, psk=ok, version=4
+
+            [Proxy Group]
+            Proxy = select, OK, policy-path=shared.txt
+
+            [Rule]
+            FINAL,Proxy
+        """)
+        legacy_text = "[shared.txt]\nport = 7443\npsk = legacy-fixture\n"
+
+        for order in ("a_then_b", "b_then_a"):
+            d = tmp_path / order
+            d.mkdir()
+            (d / "shared.txt").write_text(shared_txt)
+            (d / "a.conf").write_text(cfg_a)
+            (d / "b.conf").write_text(cfg_b)
+            ini = d / "enabled.ini"
+            ini.write_text(legacy_text)
+            ini.chmod(0o600)
+
+            if order == "a_then_b":
+                self._run_cli(monkeypatch, "--snell-legacy", str(ini), str(d / "a.conf"))
+                self._run_cli(monkeypatch, str(d / "b.conf"))
+            else:
+                self._run_cli(monkeypatch, str(d / "b.conf"))
+                self._run_cli(monkeypatch, "--snell-legacy", str(ini), str(d / "a.conf"))
+
+            a_v4 = (d / "v4" / "a-v4.conf").read_text()
+            b_v4 = (d / "v4" / "b-v4.conf").read_text()
+            a_lists = list((d / "v4").glob("a-shared-*-v4.txt"))
+            b_lists = list((d / "v4").glob("b-shared-*-v4.txt"))
+            assert len(a_lists) == 1 and len(b_lists) == 1
+            assert f"policy-path={a_lists[0].name}" in a_v4
+            assert f"policy-path={b_lists[0].name}" in b_v4
+            assert "S6 = snell, 192.0.2.20, 7443, psk=legacy-fixture, version=4" in a_lists[0].read_text()
+            assert a_lists[0].read_text().strip().startswith("S6 = snell")
+            assert b_lists[0].read_text().strip().startswith("# [V5+] S6 = snell")
+
 
 
 
