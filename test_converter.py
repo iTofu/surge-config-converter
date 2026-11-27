@@ -4425,3 +4425,70 @@ class TestRound2Fixes:
         assert "LiveMixed = ss, 1.1.1.1, 443, encrypt-method=aes-256-gcm, password=p, tfo=true\n" in out
         assert "# Dormant = ss, 2.2.2.2, 443, encrypt-method=aes-256-gcm, password=p ; primary, backup\n" in out
         assert "# DormantMixed = ss, 3.3.3.3, 443, encrypt-method=aes-256-gcm, password=p ; a, b\n" in out
+
+
+class TestRound3Fixes:
+    def test_unloaded_group_in_policy_path_file_never_cascades_or_kills_builtin_reject(self, tmp_path):
+        (tmp_path / "sub.dconf").write_text(
+            "[Proxy]\n"
+            "Dead = vless, 1.1.1.1, 443, username=u\n"
+            "Good = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            "REJECT = select, Dead\n"
+            "UnloadedOnly = select, Dead\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy Group]\n"
+            "Nodes = select, policy-path=sub.dconf\n"
+            "[Rule]\n"
+            "DOMAIN,blocked.example,REJECT\n"
+            "FINAL,DIRECT\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out_main = (tmp_path / "v4" / "main-v4.conf").read_text()
+        out_sub = (tmp_path / "v4" / "sub-v4.dconf").read_text()
+        assert "DOMAIN,blocked.example,REJECT\n" in out_main
+        assert "# [V5+ cascade] DOMAIN,blocked.example,REJECT" not in out_main
+        assert "# [V5+ cascade] REJECT = select" not in out_sub
+        assert "# [V5+ cascade] UnloadedOnly = select" not in out_sub
+
+    def test_escaped_quotes_in_group_and_rule_comma_splitting(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "New = vless, 1.1.1.1, 443, username=u\n"
+            "Good = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            "A = select, New\n"
+            "B = select, Good\n"
+            r'Pool = select, policy-regex-filter="^Local$|a\"b", include-other-group="A, B"' + "\n"
+            "[Rule]\n"
+            r'PROCESS-NAME,"test\"app",New' + "\n"
+            "FINAL,Pool\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert r'Pool = select, policy-regex-filter="^Local$|a\"b", include-other-group="B"' + "\n" in out
+        assert r'# [V5+ cascade] PROCESS-NAME,"test\"app",New' + "\n" in out
+
+    def test_unquote_decodes_escaped_quotes_for_underlying_proxy_cascade(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            'Dead "Relay" = vless, 1.1.1.1, 443, username=u\n'
+            "Good = trojan, 2.2.2.2, 443, password=p\n"
+            r'Chained = http, 3.3.3.3, 80, underlying-proxy="Dead \"Relay\""' + "\n"
+            "[Proxy Group]\n"
+            r'Main = select, Good, Chained, "Dead \"Relay\""' + "\n"
+            "[Rule]\n"
+            "FINAL,Main\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert '# [V5+] Dead "Relay" = vless, 1.1.1.1, 443, username=u\n' in out
+        assert r'# [V5+ cascade] Chained = http, 3.3.3.3, 80, underlying-proxy="Dead \"Relay\""' + "\n" in out
+        assert "Main = select, Good\n" in out

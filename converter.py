@@ -124,10 +124,17 @@ HOST_PORT_PROXY_TYPES = {
 } | (V5PLUS_ONLY_PROXY_TYPES - {"tailscale"})
 
 
+# Built-in Surge policies that always exist regardless of config sections
+BUILTIN_POLICIES = {
+    "DIRECT", "REJECT", "REJECT-TINYGIF", "REJECT-DROP", "REJECT-NO-DROP", "COMPATIBLE",
+}
+
+
 def unquote(name):
-    """Strip surrounding double quotes from a proxy / group name token."""
+    """Strip surrounding double quotes and decode Surge backslash escapes
+    (`\\"` and `\\\\`) from a quoted proxy / group name token."""
     if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
-        return name[1:-1]
+        return re.sub(r'\\(["\\])', r'\1', name[1:-1])
     return name
 
 
@@ -214,16 +221,17 @@ def parse_include_other_group(value):
 def format_include_other_group(groups, orig_value=""):
     """Format surviving group names back into an include-other-group value.
 
-    Returns None when empty. Quotes when multiple groups remain, when the name
-    contains commas, or when the original option value was quoted.
+    Returns None when empty. Quotes when multiple groups remain, when a name
+    contains commas/quotes, or when the original option value was quoted.
     """
     if not groups:
         return None
     joined = ", ".join(groups)
     orig = orig_value.strip()
     was_quoted = len(orig) >= 2 and orig[0] == '"' and orig[-1] == '"'
-    if len(groups) > 1 or was_quoted or "," in joined:
-        return f'"{joined}"'
+    if len(groups) > 1 or was_quoted or "," in joined or '"' in joined:
+        escaped = joined.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
     return joined
 
 
@@ -532,7 +540,7 @@ RULE_TRAILING_OPTIONS = {
 
 def _split_top_level_commas(s):
     """Split a string by commas at depth 0, outside of balanced parentheses
-    AND outside of double quotes.
+    AND outside of double quotes (honoring `\\"` escapes inside quotes).
 
     Used for rule lines (AND/OR/NOT compound criteria wrapped in parens) and
     for proxy group member lists, where quoted names like "HK, Fast" must
@@ -542,11 +550,17 @@ def _split_top_level_commas(s):
     depth = 0
     in_quote = False
     start = 0
-    for i, ch in enumerate(s):
+    n = len(s)
+    i = 0
+    while i < n:
+        ch = s[i]
+        if ch == "\\" and in_quote and i + 1 < n:
+            i += 2
+            continue
         if ch == '"':
             in_quote = not in_quote
         elif in_quote:
-            continue
+            pass
         elif ch == "(":
             depth += 1
         elif ch == ")":
@@ -554,6 +568,7 @@ def _split_top_level_commas(s):
         elif ch == "," and depth == 0:
             parts.append(s[start:i])
             start = i + 1
+        i += 1
     parts.append(s[start:])
     return [p.strip() for p in parts]
 
@@ -1156,7 +1171,7 @@ class Pipeline:
         imported in "proxy" mode contributes its [Proxy] entries but NOT its
         groups, because that section never reaches the profile.
         """
-        live = set()
+        live = set(BUILTIN_POLICIES)
         for abs_path, mode in self._reachable_modes().items():
             state = self.files[abs_path]
             if state.is_abandoned:
@@ -1211,10 +1226,12 @@ class Pipeline:
                     self.global_deleted |= state.owned_groups
                     self.global_deleted |= state.deleted_names
 
-            # 2. Merge direct-hit deletions from ALL files into global_deleted,
-            # then seed every non-abandoned file. Without this, a proxy
-            # commented in file A would not cascade into groups in file B.
-            for state in self.files.values():
+            # 2. Merge direct-hit deletions from reachable files into
+            # global_deleted, then seed every non-abandoned file. Without this,
+            # a proxy commented in file A would not cascade into groups in file B.
+            modes = self._reachable_modes()
+            for abs_path in modes:
+                state = self.files[abs_path]
                 if not state.is_abandoned:
                     self.global_deleted |= state.deleted_names
             live = self._live_names()
@@ -1223,30 +1240,35 @@ class Pipeline:
                     continue
                 state.deleted_names |= self.global_deleted - live
 
-            # 2a. Strip policy-path options pointing at abandoned files.
-            # May seed additional deletions (groups left without any member
-            # source), which are propagated immediately.
-            for state in self.files.values():
-                if state.is_abandoned:
+            # 2a. Strip policy-path options pointing at abandoned files (only in
+            # files whose [Proxy Group] section is actually loaded).
+            for abs_path, mode in modes.items():
+                state = self.files[abs_path]
+                if state.is_abandoned or mode != "full":
                     continue
                 self._strip_abandoned_policy_paths(state)
 
             # 2b. Strip #!include entries pointing at abandoned files.
-            for state in self.files.values():
+            for abs_path, mode in modes.items():
+                state = self.files[abs_path]
                 if state.is_abandoned:
                     continue
-                self._strip_abandoned_includes(state)
+                self._strip_abandoned_includes(state, mode=mode)
 
-            # 3. Fixpoint across all non-abandoned files: each file's cascade
-            # may produce new deletions that must propagate to other files.
+            # 3. Fixpoint across reachable non-abandoned files: respect each
+            # file's import mode so policy-path-only files ("proxy" mode) only
+            # cascade [Proxy] lines and never propagate unloaded [Proxy Group]
+            # deletions into the profile.
             changed = True
             while changed:
                 changed = False
-                for state in self.files.values():
+                modes = self._reachable_modes()
+                for abs_path, mode in modes.items():
+                    state = self.files[abs_path]
                     if state.is_abandoned:
                         continue
                     before = set(state.deleted_names)
-                    self._cascade_single_file(state)
+                    self._cascade_single_file(state, mode=mode)
                     new_deletions = state.deleted_names - before
                     if new_deletions:
                         self.global_deleted |= new_deletions
@@ -1372,10 +1394,14 @@ class Pipeline:
 
         return line, notes
 
-    def _cascade_single_file(self, state):
+    def _cascade_single_file(self, state, mode="full"):
         """Fixpoint: cascade deleted proxies/groups through underlying-proxy,
         Proxy Group members, and multi-group include-other-group; then comment
-        out Rule lines pointing at deleted policies."""
+        out Rule lines pointing at deleted policies.
+
+        In "proxy" mode (imported solely via policy-path), Surge loads only
+        [Proxy], so [Proxy Group] and [Rule] lines in this file are ignored.
+        """
         basename = os.path.basename(state.abs_path)
 
         changed = True
@@ -1409,7 +1435,7 @@ class Pipeline:
                         changed = True
                     continue
 
-                if section != "Proxy Group":
+                if mode != "full" or section != "Proxy Group":
                     continue
                 pgl = parse_proxy_group_line(line)
                 if pgl is None:
@@ -1474,6 +1500,8 @@ class Pipeline:
         # Per existing converter contract (see TestFinalRuleCascade), a FINAL
         # rule targeting a deleted policy is commented with CASCADE_TAG and
         # still emitted for user review rather than aborting export.
+        if mode != "full":
+            return
         for i, line in enumerate(state.lines):
             if state.sections[i] != "Rule":
                 continue
@@ -1544,15 +1572,18 @@ class Pipeline:
                 self.stats.count_commented(basename)
                 self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", pgl.name)
 
-    def _strip_abandoned_includes(self, state):
+    def _strip_abandoned_includes(self, state, mode="full"):
         """Remove entries in #!include lines that point at abandoned files.
 
         If the list becomes empty after stripping, tag the whole line cascade.
+        In "proxy" mode only [Proxy] includes are loaded by Surge.
         """
         abandoned_basenames = {os.path.basename(p) for p in self.abandoned_files}
         if not abandoned_basenames:
             return
         for i, line in enumerate(state.lines):
+            if mode == "proxy" and state.sections[i] != "Proxy":
+                continue
             if not line.lstrip().startswith("#!include"):
                 continue
             entries = parse_include_list(line)
