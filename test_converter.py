@@ -4640,3 +4640,25 @@ class TestRound5Fixes:
         assert "DOMAIN,cell.example,CELLULAR\n" in out
         assert "DOMAIN,hybrid.example,HYBRID\n" in out
         assert "# [V5+ cascade] DOMAIN,cell.example,CELLULAR" not in out
+
+
+class TestRound6Fixes:
+    def test_preexisting_v5_section_comment_does_not_switch_active_section(self, tmp_path):
+        """A pre-existing `# [V5+] [Body Rewrite] ; archived` comment inside
+        [Proxy] must not switch section attribution away from [Proxy]."""
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "# [V5+] [Body Rewrite] ; archived\n"
+            "Dead = vless, 1.1.1.1, 443, username=u\n"
+            "Good = trojan, 2.2.2.2, 443, password=p\n"
+            "[Rule]\n"
+            "DOMAIN,dead.example,Dead\n"
+            "FINAL,Good\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+] Dead = vless, 1.1.1.1, 443, username=u\n" in out
+        assert "# [V5+ cascade] DOMAIN,dead.example,Dead\n" in out
+        assert "FINAL,Good\n" in out

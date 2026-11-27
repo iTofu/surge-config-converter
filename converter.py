@@ -192,21 +192,39 @@ def _split_inline_comment(text):
     return text, ""
 
 
-def compute_sections(lines, default_section=None):
+def compute_sections(lines, default_section=None, orig_lines=None):
     """Return a list parallel to lines where each entry is the section name
     the line belongs to (or default_section before any header appears).
 
-    Also recognizes section headers that the direct-hit pass commented out
-    (e.g. "# [V5+] [Port Forwarding]") and optional trailing inline comments
-    (e.g. "[Ruleset Custom] ; note") so section attribution stays accurate.
+    When `orig_lines` is supplied (1-to-1 with `lines`), section headers are
+    parsed strictly from active (non-commented) lines in `orig_lines`, matching
+    `convert_content()` so pre-existing comments such as
+    `# [V5+] [Body Rewrite] ; archived` never switch the current section.
+    When `orig_lines` is omitted, falls back to recognizing `# [V5+] [...]`
+    headers for standalone callers.
     """
     result = []
     current = default_section
-    for line in lines:
-        head, _ = _split_inline_comment(line.strip())
-        m = re.match(r'^(?:# \[V5\+\] )?\[(.+)\]$', head.strip())
-        if m:
-            current = m.group(1)
+    use_orig = orig_lines is not None and len(orig_lines) == len(lines)
+    for i, line in enumerate(lines):
+        src = orig_lines[i] if use_orig else line
+        stripped = src.strip()
+        if use_orig:
+            if not stripped.startswith(("#", ";", "//")):
+                head, _ = _split_inline_comment(stripped)
+                m = re.match(r'^\[(.+)\]$', head.strip())
+                if m:
+                    current = m.group(1)
+        elif stripped.startswith("# [V5+] "):
+            head, _ = _split_inline_comment(stripped[len("# [V5+] "):])
+            m = re.match(r'^\[(.+)\]$', head.strip())
+            if m:
+                current = m.group(1)
+        elif not stripped.startswith(("#", ";", "//")):
+            head, _ = _split_inline_comment(stripped)
+            m = re.match(r'^\[(.+)\]$', head.strip())
+            if m:
+                current = m.group(1)
         result.append(current)
     return result
 
@@ -1025,7 +1043,7 @@ class Pipeline:
         # v5+ proxy whose definition just got commented by direct-hit pass.
         orig_lines = state.original.splitlines()
         state.lines = state.converted.splitlines()
-        state.sections = compute_sections(state.lines, default_section)
+        state.sections = compute_sections(state.lines, default_section, orig_lines=orig_lines)
         for i, line in enumerate(state.lines):
             section = state.sections[i]
             if section == "Proxy":
