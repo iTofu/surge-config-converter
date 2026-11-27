@@ -41,7 +41,10 @@ from send2trash import send2trash
 
 
 # Proxy types not supported in Surge v4
-V5PLUS_ONLY_PROXY_TYPES = {"hysteria2", "hy2", "anytls", "tuic", "trust-tunnel"}
+V5PLUS_ONLY_PROXY_TYPES = {
+    "hysteria2", "hy2", "anytls", "tuic", "tuic-v5",
+    "trust-tunnel", "tailscale", "vless", "masque", "h2-connect",
+}
 
 # Snell versions above this have no v4 equivalent: v4 speaks up to version=4,
 # version=5 is down-converted to 4, version=6+ nodes are disabled like the
@@ -61,8 +64,27 @@ _SNELL_LEGACY_FIELD_RES = {
 }
 SNELL_LEGACY_FILENAME = "snell-legacy.ini"
 
-# Sections that should be entirely commented out in v4
-V5PLUS_ONLY_SECTIONS = {"Port Forwarding", "Body Rewrite"}
+# Sections that should be entirely commented out in v4 (static names).
+# Dynamic v5+ sections ([Tailscale <name>], [Ruleset <name>], [WireGuard *])
+# are matched by is_v5plus_only_section(); concrete [WireGuard <name>] is v4-valid.
+V5PLUS_ONLY_SECTIONS = {
+    "Port Forwarding", "Body Rewrite", "WireGuard *", "Tailscale *", "Ruleset *",
+}
+
+
+def is_v5plus_only_section(section_name):
+    """Return True if section_name is v5+/v6-only and unsupported in v4.
+
+    Concrete [WireGuard <name>] sections are valid in v4 and return False.
+    """
+    if section_name in V5PLUS_ONLY_SECTIONS:
+        return True
+    if re.match(r'^(?:Tailscale|Ruleset)\s+\S', section_name):
+        return True
+    if re.match(r'^WireGuard\s+\*$', section_name):
+        return True
+    return False
+
 
 # General parameters not supported in v4
 V5PLUS_ONLY_GENERAL_PARAMS = {"udp-priority", "block-quic"}
@@ -80,7 +102,7 @@ _V5PLUS_NESTED_RULE_RE = re.compile(
 )
 
 # Proxy parameters to remove (v5+ only)
-V5PLUS_ONLY_PROXY_PARAMS = {"port-hopping", "port-hopping-interval", "ecn"}
+V5PLUS_ONLY_PROXY_PARAMS = {"port-hopping", "port-hopping-interval", "ecn", "block-quic"}
 
 # Cascade-cleanup tag prefix: distinguishes follow-on deletions from direct hits.
 CASCADE_TAG = "# [V5+ cascade] "
@@ -92,9 +114,10 @@ _COMMENT_PREFIX_RE = re.compile(r'^\s*(?:(?:#(?!!)|//|;)\s*)+')
 
 # Proxy types whose definition is "name = type, host, port, key=value...".
 # Only these are recognized inside comments; anything else stays verbatim.
+# tailscale uses "name = tailscale, section-name=..." (no host/port).
 HOST_PORT_PROXY_TYPES = {
     "http", "https", "socks5", "socks5-tls", "ss", "snell", "vmess", "trojan", "ssh",
-} | V5PLUS_ONLY_PROXY_TYPES
+} | (V5PLUS_ONLY_PROXY_TYPES - {"tailscale"})
 
 
 def unquote(name):
@@ -145,13 +168,55 @@ def compute_sections(lines, default_section=None):
     return result
 
 
+def parse_include_other_group(value):
+    """Parse an include-other-group option value into a list of group names.
+
+    Surge supports both a single group (`include-other-group=G1`) and a quoted
+    comma-separated list (`include-other-group="G1, G2, G3"`).
+    """
+    inner = unquote(value.strip())
+    return [g.strip() for g in inner.split(",") if g.strip()]
+
+
+def format_include_other_group(groups, orig_value=""):
+    """Format surviving group names back into an include-other-group value.
+
+    Returns None when empty. Quotes when multiple groups remain, when the name
+    contains commas, or when the original option value was quoted.
+    """
+    if not groups:
+        return None
+    joined = ", ".join(groups)
+    orig = orig_value.strip()
+    was_quoted = len(orig) >= 2 and orig[0] == '"' and orig[-1] == '"'
+    if len(groups) > 1 or was_quoted or "," in joined:
+        return f'"{joined}"'
+    return joined
+
+
+def extract_proxy_option(line, key):
+    """Extract the unquoted value of a key=value option from a [Proxy] line, or None."""
+    if "=" not in line:
+        return None
+    _, rest = line.split("=", 1)
+    key_lower = key.lower()
+    for tok in _split_top_level_commas(rest)[1:]:
+        if "=" in tok and not tok.startswith('"'):
+            k, v = tok.split("=", 1)
+            if k.strip().lower() == key_lower:
+                return unquote(v.strip())
+    return None
+
+
 def has_effective_members(pgl, deleted_names, abandoned_basenames):
     """Return True if the Proxy Group still has at least one valid member source.
 
-    Valid sources:
+    Valid sources (structural check — intentionally keeps non-abandoned
+    policy-path / include-all-proxies intact without simulating runtime
+    policy-regex-filter evaluation):
       - an explicit member name not in deleted_names
       - include-all-proxies=1 option
-      - include-other-group=<group> where <group> is not in deleted_names
+      - include-other-group with at least one group not in deleted_names
       - policy-path=<file> where <file> is an HTTP URL, or a local file whose
         basename is NOT in abandoned_basenames
     """
@@ -161,12 +226,14 @@ def has_effective_members(pgl, deleted_names, abandoned_basenames):
     for key, value in pgl.options:
         if key == "include-all-proxies" and value.strip() in {"1", "true"}:
             return True
-        if key == "include-other-group" and unquote(value.strip()) not in deleted_names:
-            return True
-        if key == "policy-path":
-            if value.startswith("http://") or value.startswith("https://"):
+        if key == "include-other-group":
+            if any(g not in deleted_names for g in parse_include_other_group(value)):
                 return True
-            if os.path.basename(value) not in abandoned_basenames:
+        if key == "policy-path":
+            raw_path = unquote(value.strip())
+            if raw_path.startswith(("http://", "https://")):
+                return True
+            if os.path.basename(raw_path) not in abandoned_basenames:
                 return True
     return False
 
@@ -328,6 +395,8 @@ class FileState:
     owned_groups: set = field(default_factory=set)     # group names defined in this file
     deleted_names: set = field(default_factory=set)    # names removed (propagates cascade)
     self_deleted: set = field(default_factory=set)     # subset killed by THIS file's own line
+    self_deleted_proxies: set = field(default_factory=set)  # [Proxy] lines deleted in this file
+    self_deleted_groups: set = field(default_factory=set)   # [Proxy Group] lines deleted in this file
 
 
 def parse_proxy_group_line(line):
@@ -466,7 +535,7 @@ def remove_proxy_params(line, params_to_remove):
     for param in params_to_remove:
         # Match param=value where value can be quoted or unquoted
         # Handle: param=value, param="value", param='value'
-        pattern = r',\s*' + re.escape(param) + r'=["\']?[^,]*["\']?'
+        pattern = r',\s*' + re.escape(param) + r'\s*=\s*["\']?[^,]*["\']?'
         new_line, n = re.subn(pattern, '', line)
         if n > 0:
             line = new_line
@@ -697,7 +766,7 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
         section_match = re.match(r'^\[(.+)\]$', stripped)
         if section_match:
             section_name = section_match.group(1)
-            if section_name in V5PLUS_ONLY_SECTIONS:
+            if is_v5plus_only_section(section_name):
                 in_v5plus_only_section = True
                 current_section = section_name
                 stats.count_commented(filename)
@@ -814,12 +883,13 @@ class Pipeline:
         # Populate cascade fields: split into mutable lines, sectionize, and
         # catalog owned proxy / group names. Seed deleted_names with any
         # v5+ proxy whose definition just got commented by direct-hit pass.
+        orig_lines = state.original.splitlines()
         state.lines = state.converted.splitlines()
         state.sections = compute_sections(state.lines, default_section)
         for i, line in enumerate(state.lines):
             section = state.sections[i]
             if section == "Proxy":
-                if line.startswith("# [V5+] "):
+                if line.startswith("# [V5+] ") and (i >= len(orig_lines) or line != orig_lines[i]):
                     raw = line[len("# [V5+] "):]
                     if "=" in raw:
                         name = raw.split("=", 1)[0].strip()
@@ -827,12 +897,13 @@ class Pipeline:
                             deleted_name = unquote(name)
                             state.deleted_names.add(deleted_name)
                             state.self_deleted.add(deleted_name)
-                elif not line.lstrip().startswith("#") and "=" in line:
+                            state.self_deleted_proxies.add(deleted_name)
+                elif not line.lstrip().startswith(("#", ";", "//")) and "=" in line:
                     name = line.split("=", 1)[0].strip()
                     if name:
                         state.owned_proxies.add(unquote(name))
             elif section == "Proxy Group":
-                if not line.lstrip().startswith("#") and "=" in line:
+                if not line.lstrip().startswith(("#", ";", "//")) and "=" in line:
                     name = line.split("=", 1)[0].strip()
                     if name:
                         state.owned_groups.add(unquote(name))
@@ -974,10 +1045,9 @@ class Pipeline:
             state = self.files[abs_path]
             if state.is_abandoned:
                 continue
-            names = set(state.owned_proxies)
+            live |= state.owned_proxies - state.self_deleted_proxies
             if mode == "full":
-                names |= state.owned_groups
-            live |= names - state.self_deleted
+                live |= state.owned_groups - state.self_deleted_groups
         return live
 
     def _emitting(self):
@@ -1187,35 +1257,92 @@ class Pipeline:
         return line, notes
 
     def _cascade_single_file(self, state):
-        """Fixpoint: remove deleted members from Proxy Group lines; if a group
-        loses all effective members due to OUR removals, tag it cascade and
-        add its name to deleted_names so it propagates in the next iteration."""
+        """Fixpoint: cascade deleted proxies/groups through underlying-proxy,
+        Proxy Group members, and multi-group include-other-group; then comment
+        out Rule lines pointing at deleted policies."""
+        basename = os.path.basename(state.abs_path)
+
         changed = True
         while changed:
             changed = False
             for i, line in enumerate(state.lines):
-                if state.sections[i] != "Proxy Group":
+                section = state.sections[i]
+                stripped = line.lstrip()
+                if not stripped or stripped.startswith(("#", ";", "//")):
                     continue
-                if line.lstrip().startswith("#"):
+
+                if section == "Proxy":
+                    if "=" not in line:
+                        continue
+                    underlying = extract_proxy_option(line, "underlying-proxy")
+                    if underlying and underlying in state.deleted_names:
+                        state.lines[i] = CASCADE_TAG + stripped
+                        name = line.split("=", 1)[0].strip()
+                        deleted_name = unquote(name)
+                        state.deleted_names.add(deleted_name)
+                        state.self_deleted.add(deleted_name)
+                        state.self_deleted_proxies.add(deleted_name)
+                        self.stats.count_commented(basename)
+                        self.stats.add_change(
+                            basename, i + 1, "Proxy", "级联注释",
+                            f"{name} (underlying-proxy={underlying})")
+                        changed = True
+                    continue
+
+                if section != "Proxy Group":
                     continue
                 pgl = parse_proxy_group_line(line)
                 if pgl is None:
                     continue
+
+                # Group-level underlying-proxy pointing at a deleted proxy/group
+                dead_relay = None
+                for k, v in pgl.options:
+                    if k.lower() == "underlying-proxy":
+                        relay = unquote(v.strip())
+                        if relay in state.deleted_names:
+                            dead_relay = relay
+                            break
+                if dead_relay is not None:
+                    state.lines[i] = CASCADE_TAG + stripped
+                    deleted_name = unquote(pgl.name)
+                    state.deleted_names.add(deleted_name)
+                    state.self_deleted.add(deleted_name)
+                    state.self_deleted_groups.add(deleted_name)
+                    self.stats.count_commented(basename)
+                    self.stats.add_change(
+                        basename, i + 1, "Proxy Group", "级联注释",
+                        f"{pgl.name} (underlying-proxy={dead_relay})")
+                    changed = True
+                    continue
+
                 original_members = list(pgl.members)
                 pgl.members = [
                     m for m in original_members
                     if unquote(m) not in state.deleted_names
                 ]
-                # include-other-group pointing at a deleted group is dead supply
+                # include-other-group may name multiple comma-separated groups
                 original_options = list(pgl.options)
-                pgl.options = [
-                    (k, v) for k, v in original_options
-                    if not (k == "include-other-group"
-                            and unquote(v.strip()) in state.deleted_names)
-                ]
+                new_options = []
+                removed_opt_tokens = []
+                for k, v in original_options:
+                    if k == "include-other-group":
+                        groups = parse_include_other_group(v)
+                        kept = [g for g in groups if g not in state.deleted_names]
+                        dropped = [g for g in groups if g in state.deleted_names]
+                        if not dropped:
+                            new_options.append((k, v))
+                        elif kept:
+                            new_options.append((k, format_include_other_group(kept, v)))
+                            removed_opt_tokens.append(f"{k}:{', '.join(dropped)}")
+                        else:
+                            removed_opt_tokens.append(f"{k}={v}")
+                    else:
+                        new_options.append((k, v))
+                pgl.options = new_options
                 removed_tokens = (
                     [m for m in original_members if m not in pgl.members]
-                    + [f"{k}={v}" for k, v in original_options if (k, v) not in pgl.options]
+                    + removed_opt_tokens
                 )
                 if not removed_tokens:
                     continue  # D6: pre-existing empty groups left alone
@@ -1223,7 +1350,6 @@ class Pipeline:
                     new_line = _preserve_indent(line, format_proxy_group_line(pgl))
                     if new_line != line:
                         state.lines[i] = new_line
-                        basename = os.path.basename(state.abs_path)
                         self.stats.add_change(
                             basename, i + 1, "Proxy Group", "级联移除成员",
                             f"{pgl.name}: {', '.join(removed_tokens)}")
@@ -1236,7 +1362,7 @@ class Pipeline:
                     deleted_name = unquote(pgl.name)
                     state.deleted_names.add(deleted_name)
                     state.self_deleted.add(deleted_name)
-                    basename = os.path.basename(state.abs_path)
+                    state.self_deleted_groups.add(deleted_name)
                     self.stats.count_commented(basename)
                     self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", pgl.name)
                     changed = True
@@ -1253,7 +1379,6 @@ class Pipeline:
                 continue
             if unquote(policy) in state.deleted_names:
                 state.lines[i] = CASCADE_TAG + line.lstrip()
-                basename = os.path.basename(state.abs_path)
                 self.stats.count_commented(basename)
                 self.stats.add_change(basename, i + 1, "Rule", "级联注释", line.strip())
 
@@ -1301,6 +1426,7 @@ class Pipeline:
                 deleted_name = unquote(pgl.name)
                 state.deleted_names.add(deleted_name)
                 state.self_deleted.add(deleted_name)
+                state.self_deleted_groups.add(deleted_name)
                 self.global_deleted.add(deleted_name)
                 # Propagate to all other non-abandoned files so the downstream
                 # fixpoint catches references to this group — unless some other

@@ -56,12 +56,14 @@ Documents/
 |------|------|
 | `hysteria2` / `hy2` | 注释（iOS 5.8.0+） |
 | `anytls` | 注释（iOS 5.17.0+） |
-| `tuic` | 注释（iOS 5.2.0+） |
+| `tuic` / `tuic-v5` | 注释（iOS 5.2.0+） |
+| `vless` / `masque` / `h2-connect` | 注释（v5+/v6 新增协议） |
+| `tailscale` | 注释（iOS 5.16+ / Mac 6.2+） |
 | `trust-tunnel` | 注释（Mac 6.4.4+） |
 | Snell `version=5` | 替换为 `version=4` |
 | Snell `version=6` 及以上 | 注释（v4 无对应版本）；配了旧版实例覆盖的文件改写为 `version=4`，见下文 |
 | `shadow-tls-version=3` | 替换为 `shadow-tls-version=2` |
-| `port-hopping` / `port-hopping-interval` / `ecn` | 移除参数 |
+| `port-hopping` / `port-hopping-interval` / `ecn` / `block-quic` | 移除参数 |
 
 被注释掉的节点行（`#` / `;` / `//` 开头，可重复、可带空格）在产出的 `-v4` 文件里按上表同样改参数，注释前缀原样保留，取消注释即可在 v4 使用；v5+ 独有协议与 Snell `version=6` 及以上的注释行本已停用，原样保留。去掉前缀后必须是完整的 `名称 = 类型, host, port, key=value...` 才转换，其余注释文字一律原样。注释行不参与「是否需要转换」的判定：只有注释行变化时不产出 `v4/`，也不会因此放弃托管配置。
 
@@ -111,6 +113,9 @@ psk = <legacy-psk>
 |------|------|
 | `[Port Forwarding]` | 整段注释 |
 | `[Body Rewrite]` | 整段注释 |
+| `[Tailscale <name>]` / `[Tailscale *]` | 整段注释 |
+| `[WireGuard *]` | 整段注释（具名 `[WireGuard <name>]` 为 v4 合法语法，保留） |
+| `[Ruleset <name>]` / `[Ruleset *]` | 整段注释 |
 
 ### 引用文件
 
@@ -131,7 +136,8 @@ psk = <legacy-psk>
 
 当某个 proxy 或 proxy group 因 v5+ 转换被注释或因托管配置放弃而消失时，引用它的其他配置行也会被清理：
 
-- **Proxy Group 成员**：从成员列表中移除已删除的名称（含指向已删除 group 的 `include-other-group` 选项）；若 group 因此失去所有有效成员来源（显式成员 / `include-all-proxies` / `include-other-group` / 有效 `policy-path`），整行注释
+- **Proxy 链式代理**：`[Proxy]`（及 `[Proxy Group]`）的 `underlying-proxy` 指向已删除的 proxy/group 时，整行注释并继续传播
+- **Proxy Group 成员**：从成员列表中移除已删除的名称（支持单组及逗号分隔的多组 `include-other-group="A, B"` 逐项剔除）；若 group 因此失去所有结构化成员来源（显式成员 / `include-all-proxies` / 有效 `include-other-group` / 未放弃的 `policy-path`），整行注释（不模拟运行时 `policy-regex-filter` 正则求值，非托管 `policy-path` 即使节点被注释也保留并改写为 `-v4`）
 - **Rule 策略**：规则指向已删除的 group/proxy 时，整行注释
 - **`#!include`**：移除指向被放弃文件的条目；若列表清空，整行注释
 - **`policy-path`**：移除指向被放弃文件的选项；若 group 因此失去所有成员来源，整行注释

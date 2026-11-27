@@ -4000,3 +4000,258 @@ class TestSnellLegacyLoading:
         captured = capsys.readouterr()
         assert ("权限宽于 0600" in captured.err) is warned
         assert self.PSK not in captured.out + captured.err
+
+
+class TestV5V6ProtocolsAndParams:
+    @pytest.mark.parametrize("proxy_line", [
+        "TS = tailscale, section-name=TS01",
+        "TV5 = tuic-v5, 1.2.3.4, 443, uuid=u, password=p",
+        "VL = vless, 1.2.3.4, 443, username=u",
+        "MQ = masque, 1.2.3.4, 443, private-key=k",
+        "H2C = h2-connect, 1.2.3.4, 443, username=u, password=p",
+    ])
+    def test_v5v6_proxy_types_commented_and_cascaded(self, tmp_path, proxy_line):
+        name = proxy_line.split("=", 1)[0].strip()
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            f"{proxy_line}\n"
+            "Good = trojan, 5.6.7.8, 443, password=p\n"
+            "[Proxy Group]\n"
+            f"OnlyNew = select, {name}\n"
+            f"Mixed = select, Good, {name}\n"
+            "[Rule]\n"
+            "DOMAIN,a.example,OnlyNew\n"
+            "FINAL,Mixed\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert f"# [V5+] {proxy_line}" in out
+        assert "# [V5+ cascade] OnlyNew = select" in out
+        assert "Mixed = select, Good\n" in out
+        assert "# [V5+ cascade] DOMAIN,a.example,OnlyNew" in out
+
+    def test_commented_v5v6_proxies_left_verbatim_and_do_not_emit(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "# TS = tailscale, section-name=TS01\n"
+            "# VL = vless, 1.2.3.4, 443, username=u\n"
+            "Good = trojan, 5.6.7.8, 443, password=p\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is None
+        assert not (tmp_path / "v4").exists()
+
+    def test_proxy_block_quic_removed_live_and_commented(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "S1 = ss, 1.2.3.4, 443, encrypt-method=aes-256-gcm, password=p, block-quic=on, tfo=true\n"
+            "S2 = snell, 2.3.4.5, 443, psk=k, version=4, block-quic = off\n"
+            "# S3 = ss, 3.4.5.6, 443, encrypt-method=aes-256-gcm, password=p, block-quic=auto\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "S1 = ss, 1.2.3.4, 443, encrypt-method=aes-256-gcm, password=p, tfo=true\n" in out
+        assert "S2 = snell, 2.3.4.5, 443, psk=k, version=4\n" in out
+        assert "# S3 = ss, 3.4.5.6, 443, encrypt-method=aes-256-gcm, password=p\n" in out
+
+
+class TestV5V6Sections:
+    def test_tailscale_wildcard_wireguard_and_ruleset_sections_commented_concrete_wg_kept(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Good = trojan, 1.2.3.4, 443, password=p\n"
+            "[WireGuard Home]\n"
+            "private-key = fake-key\n"
+            "self-ip = 10.0.0.2\n"
+            "[WireGuard *]\n"
+            "#!include tunnel.dconf\n"
+            "[Tailscale *]\n"
+            "#!include tunnel.dconf\n"
+            "[Tailscale TS01]\n"
+            "interactive-login = true\n"
+            "[Ruleset *]\n"
+            "#!include rules.dconf\n"
+            "[Ruleset Custom]\n"
+            "DOMAIN-SUFFIX,example.com\n"
+            "[Rule]\n"
+            "DOMAIN-WILDCARD,*foo.example,Good\n"
+            "FINAL,Good\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        # Concrete [WireGuard Home] stays intact
+        assert "\n[WireGuard Home]\nprivate-key = fake-key\nself-ip = 10.0.0.2\n" in out
+        # Wildcard & v5+ sections commented completely
+        assert "# [V5+] [WireGuard *]\n# [V5+] #!include tunnel.dconf\n" in out
+        assert "# [V5+] [Tailscale *]\n# [V5+] #!include tunnel.dconf\n" in out
+        assert "# [V5+] [Tailscale TS01]\n# [V5+] interactive-login = true\n" in out
+        assert "# [V5+] [Ruleset *]\n# [V5+] #!include rules.dconf\n" in out
+        assert "# [V5+] [Ruleset Custom]\n# [V5+] DOMAIN-SUFFIX,example.com\n" in out
+        # Subsequent [Rule] section still transformed properly
+        assert "# [V5+] DOMAIN-WILDCARD,*foo.example,Good\n" in out
+        assert "\nFINAL,Good\n" in out
+
+
+class TestMultiGroupIncludeOtherGroup:
+    def test_partial_removal_keeps_remaining_groups_and_quotes(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Dead = anytls, 1.1.1.1, 443, password=p\n"
+            "Good1 = trojan, 2.2.2.2, 443, password=p\n"
+            "Good2 = trojan, 3.3.3.3, 443, password=p\n"
+            "[Proxy Group]\n"
+            "GDead = select, Dead\n"
+            "GA = select, Good1\n"
+            "GB = select, Good2\n"
+            'AllThree = select, include-other-group="GA, GDead, GB"\n'
+            'TwoToOne = select, include-other-group="GA, GDead"\n'
+            'Untouched = select, include-other-group="GA, GB"\n'
+            "[Rule]\n"
+            "FINAL,AllThree\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] GDead = select\n" in out
+        assert 'AllThree = select, include-other-group="GA, GB"\n' in out
+        assert 'TwoToOne = select, include-other-group="GA"\n' in out
+        assert 'Untouched = select, include-other-group="GA, GB"\n' in out
+
+    def test_all_included_groups_deleted_cascades_group_or_drops_option(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "D1 = anytls, 1.1.1.1, 443, password=p\n"
+            "D2 = hysteria2, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            "Group One = select, D1\n"
+            "Group Two = select, D2\n"
+            'DeadPool = select, include-other-group="Group One, Group Two"\n'
+            'FallbackDirect = select, DIRECT, include-other-group="Group One, Group Two"\n'
+            "[Rule]\n"
+            "DOMAIN,dead.example,DeadPool\n"
+            "FINAL,FallbackDirect\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] DeadPool = select\n" in out
+        assert "FallbackDirect = select, DIRECT\n" in out
+        assert "# [V5+ cascade] DOMAIN,dead.example,DeadPool\n" in out
+
+
+class TestUnderlyingProxyCascade:
+    def test_proxy_and_multihop_underlying_proxy_cascade(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Dead = anytls, 1.1.1.1, 443, password=p\n"
+            "Good = trojan, 2.2.2.2, 443, password=p\n"
+            "Hop1 = http, 3.3.3.3, 80, underlying-proxy=Dead\n"
+            'Hop2 = http, 4.4.4.4, 80, underlying-proxy="Hop1"\n'
+            "AliveChain = http, 5.5.5.5, 80, underlying-proxy=Good\n"
+            "[Proxy Group]\n"
+            "OnlyChained = select, Hop2\n"
+            "Main = select, Good, Hop1, Hop2, AliveChain\n"
+            "[Rule]\n"
+            "DOMAIN,c.example,OnlyChained\n"
+            "FINAL,Main\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] Hop1 = http, 3.3.3.3, 80, underlying-proxy=Dead\n" in out
+        assert '# [V5+ cascade] Hop2 = http, 4.4.4.4, 80, underlying-proxy="Hop1"\n' in out
+        assert "AliveChain = http, 5.5.5.5, 80, underlying-proxy=Good\n" in out
+        assert "# [V5+ cascade] OnlyChained = select\n" in out
+        assert "Main = select, Good, AliveChain\n" in out
+        assert "# [V5+ cascade] DOMAIN,c.example,OnlyChained\n" in out
+
+    def test_cross_file_and_group_underlying_proxy_cascade(self, tmp_path):
+        res = tmp_path / "res.dconf"
+        res.write_text(
+            "[Proxy]\n"
+            "ResDead = http, 3.3.3.3, 80, underlying-proxy=DeadGroup\n"
+            "ResKeep = http, 4.4.4.4, 80, underlying-proxy=LiveGroup\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Dead = anytls, 1.1.1.1, 443, password=p\n"
+            "Good = trojan, 2.2.2.2, 443, password=p\n"
+            "#!include res.dconf\n"
+            "[Proxy Group]\n"
+            "DeadGroup = select, Dead\n"
+            "LiveGroup = select, Good\n"
+            "RelayGroup = select, Good, underlying-proxy=DeadGroup\n"
+            "All = select, Good, ResDead, ResKeep, RelayGroup\n"
+            "[Rule]\n"
+            "FINAL,All\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out_res = (tmp_path / "v4" / "res-v4.dconf").read_text()
+        out_main = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] ResDead = http, 3.3.3.3, 80, underlying-proxy=DeadGroup\n" in out_res
+        assert "ResKeep = http, 4.4.4.4, 80, underlying-proxy=LiveGroup\n" in out_res
+        assert "# [V5+ cascade] RelayGroup = select, Good, underlying-proxy=DeadGroup\n" in out_main
+        assert "All = select, Good, ResKeep\n" in out_main
+
+
+class TestTailscaleRealWorldIntegration:
+    def test_profile_with_tailscale_dconf_managed_abandon_and_multi_iog(self, tmp_path):
+        (tmp_path / "tunnel.dconf").write_text(
+            "[Proxy]\n"
+            "MyTS = tailscale, section-name=TS01\n"
+            "\n"
+            "[Tailscale TS01]\n"
+            "interactive-login = true\n"
+        )
+        (tmp_path / "managed.conf").write_text(
+            "#!MANAGED-CONFIG https://example.com/sub\n"
+            "[Proxy]\n"
+            "SubNode = tuic-v5, 9.9.9.9, 443, uuid=u, password=p\n"
+        )
+        (tmp_path / "vps.dconf").write_text(
+            "[Proxy]\n"
+            "VPS1 = ss, 2.2.2.2, 443, encrypt-method=aes-256-gcm, password=p, block-quic=on\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "#!include tunnel.dconf\n"
+            "[Proxy Group]\n"
+            "VPS = select, policy-path=vps.dconf\n"
+            "Managed = select, policy-path=managed.conf\n"
+            "Tailscale = select, policy-path=tunnel.dconf, hidden=1\n"
+            'All = select, include-other-group="VPS, Managed"\n'
+            "[Rule]\n"
+            "FINAL,All\n"
+            "[WireGuard *]\n"
+            "#!include tunnel.dconf\n"
+            "[Tailscale *]\n"
+            "#!include tunnel.dconf\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out_main = (tmp_path / "v4" / "main-v4.conf").read_text()
+        out_tunnel = (tmp_path / "v4" / "tunnel-v4.dconf").read_text()
+        out_vps = (tmp_path / "v4" / "vps-v4.dconf").read_text()
+
+        assert "# [V5+] MyTS = tailscale, section-name=TS01" in out_tunnel
+        assert "# [V5+] [Tailscale TS01]" in out_tunnel
+        assert "block-quic" not in out_vps
+        assert "# [V5+ cascade] Managed = select" in out_main
+        assert 'All = select, include-other-group="VPS"' in out_main
+        assert "Tailscale = select, policy-path=tunnel-v4.dconf, hidden=1" in out_main
+        assert "# [V5+] [WireGuard *]" in out_main
+        assert "# [V5+] [Tailscale *]" in out_main
+        assert not (tmp_path / "v4" / "managed-v4.conf").exists()
