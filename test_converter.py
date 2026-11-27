@@ -2025,11 +2025,12 @@ class TestMultiLevelCascade:
         assert "L4 = select, L3, HK" in out
 
 
-# --- T36: FINAL rule cascade ---
+# --- T36: FINAL rule cascade & lost-FINAL safety guard ---
 
 class TestFinalRuleCascade:
-    def test_final_rule_policy_cascade_deleted(self, tmp_path):
-        """FINAL,GroupName where GroupName gets cascade-deleted."""
+    def test_sole_final_rule_policy_cascade_aborts_export(self, tmp_path):
+        """If cascading removes the only FINAL rule, conversion aborts with an
+        error rather than emitting an unloadable Surge config."""
         main = tmp_path / "main.conf"
         main.write_text(
             "[Proxy]\n"
@@ -2041,12 +2042,13 @@ class TestFinalRuleCascade:
             "[Rule]\n"
             "FINAL,OnlyV5\n"
         )
-        convert_file(str(main), ConversionStats(), {str(main): None})
-        out = (tmp_path / "v4" / "main-v4.conf").read_text()
-        assert "# [V5+ cascade] OnlyV5 = select" in out
-        assert "# [V5+ cascade] FINAL,OnlyV5" in out
+        stats = ConversionStats()
+        result = convert_file(str(main), stats, {str(main): None})
+        assert result is None
+        assert any("FINAL" in e for e in stats.errors)
+        assert not (tmp_path / "v4" / "main-v4.conf").exists()
 
-    def test_final_rule_with_dns_failed_cascade(self, tmp_path):
+    def test_sole_final_rule_with_dns_failed_cascade_aborts_export(self, tmp_path):
         """FINAL,GroupName,dns-failed — trailing option must not confuse policy extraction."""
         main = tmp_path / "main.conf"
         main.write_text(
@@ -2059,9 +2061,54 @@ class TestFinalRuleCascade:
             "[Rule]\n"
             "FINAL,OnlyV5,dns-failed\n"
         )
-        convert_file(str(main), ConversionStats(), {str(main): None})
+        stats = ConversionStats()
+        result = convert_file(str(main), stats, {str(main): None})
+        assert result is None
+        assert any("FINAL" in e for e in stats.errors)
+        assert not (tmp_path / "v4" / "main-v4.conf").exists()
+
+    def test_final_rule_cascade_succeeds_when_fallback_final_survives(self, tmp_path):
+        """When another live FINAL rule remains, the dead FINAL is cascade-commented."""
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "JP = anytls, 1.2.3.4, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "OnlyV5 = select, JP\n"
+            "\n"
+            "[Rule]\n"
+            "FINAL,OnlyV5,dns-failed\n"
+            "FINAL,DIRECT\n"
+        )
+        stats = ConversionStats()
+        result = convert_file(str(main), stats, {str(main): None})
+        assert result is not None
+        assert not stats.errors
         out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] OnlyV5 = select" in out
         assert "# [V5+ cascade] FINAL,OnlyV5,dns-failed" in out
+        assert "\nFINAL,DIRECT\n" in out
+
+    def test_final_in_abandoned_rule_subfile_aborts_export(self, tmp_path):
+        """Losing FINAL because its managed [Rule] sub-file was abandoned also aborts."""
+        rules = tmp_path / "rules.conf"
+        rules.write_text(
+            "#!MANAGED-CONFIG https://x.com/r.conf interval=3600\n"
+            "[Rule]\n"
+            "HOSTNAME-TYPE,DHCP,DIRECT\n"
+            "FINAL,DIRECT\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Rule]\n"
+            "#!include rules.conf\n"
+        )
+        stats = ConversionStats()
+        result = convert_file(str(main), stats, {str(main): None})
+        assert result is None
+        assert any("FINAL" in e for e in stats.errors)
+        assert not (tmp_path / "v4" / "main-v4.conf").exists()
 
 
 # --- T37: Snell version regex boundary ---
@@ -2525,7 +2572,7 @@ class TestTrailingNewline:
 class TestCrossFileDirectHitCascade:
     def test_proxy_deleted_in_file_a_cascades_to_group_in_file_b(self, tmp_path):
         """Proxy commented in main.conf must cascade into groups defined in
-        an included sub-file that references it by name."""
+        an included [Proxy Group] sub-file that references it by name."""
         sub = tmp_path / "groups.dconf"
         sub.write_text(
             "[Proxy Group]\n"
@@ -2536,6 +2583,8 @@ class TestCrossFileDirectHitCascade:
             "[Proxy]\n"
             "JP = anytls, 1.2.3.4, 443, password=pwd\n"
             "HK = trojan, 5.6.7.8, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
             "#!include groups.dconf\n"
         )
         stats = ConversionStats()
@@ -2560,6 +2609,8 @@ class TestCrossFileDirectHitCascade:
         main.write_text(
             "[Proxy]\n"
             "JP = anytls, 1.2.3.4, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
             "#!include groups.dconf\n"
         )
         stats = ConversionStats()
@@ -3228,6 +3279,8 @@ class TestCascadeDetailCompleteness:
             "[Proxy]\n"
             "JP = anytls, 1.2.3.4, 443, password=pwd\n"
             "HK = trojan, 5.6.7.8, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
             "#!include groups.dconf\n"
         )
         stats = ConversionStats()
@@ -3245,6 +3298,8 @@ class TestCascadeDetailCompleteness:
             "[Proxy]\n"
             "JP = anytls, 1.2.3.4, 443, password=pwd\n"
             "HK = trojan, 5.6.7.8, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
             "#!include groups.dconf\n"
         )
         stats = ConversionStats()
@@ -3508,6 +3563,7 @@ class TestAbandonedNameCollision:
             "OK = trojan, 9.9.9.9, 443, password=pwd\n"
             "\n"
             "[Proxy Group]\n"
+            "#!include managed.conf\n"
             "Pool = select, policy-path=nodes.conf\n"
             "Wrap = select, G, DIRECT\n"
             "\n"
@@ -3524,8 +3580,8 @@ class TestAbandonedNameCollision:
         assert "FINAL,Wrap" in out
 
     def test_included_file_groups_stay_live(self, tmp_path):
-        """Counterpart: a file pulled in by #!include IS textually merged, so
-        its group definitions do shield the same name."""
+        """Counterpart: a file pulled in by [Proxy Group] #!include loads its
+        [Proxy Group] definitions and therefore shields the same name."""
         managed = tmp_path / "managed.conf"
         managed.write_text(
             "#!MANAGED-CONFIG https://x.com/m.conf interval=3600\n"
@@ -3550,6 +3606,7 @@ class TestAbandonedNameCollision:
             "OK = trojan, 9.9.9.9, 443, password=pwd\n"
             "\n"
             "[Proxy Group]\n"
+            "#!include managed.conf, nodes.conf\n"
             "Wrap = select, G, DIRECT\n"
             "\n"
             "[Rule]\n"
@@ -4000,3 +4057,580 @@ class TestSnellLegacyLoading:
         captured = capsys.readouterr()
         assert ("权限宽于 0600" in captured.err) is warned
         assert self.PSK not in captured.out + captured.err
+
+
+# --- T82: v5+/v6 proxy types, block-quic, quote/comment-safe lexer ---
+
+class TestV5V6ProxyTypesAndLexer:
+    @pytest.mark.parametrize("ptype, spec", [
+        ("tailscale", "tailscale, section-name=WorkTS"),
+        ("vless", "vless, 1.2.3.4, 443, username=00000000-0000-0000-0000-000000000000"),
+        ("tuic-v5", "tuic-v5, 1.2.3.4, 443, uuid=00000000-0000-0000-0000-000000000000, password=pwd"),
+        ("masque", "masque, 1.2.3.4, 443, username=u, password=p"),
+        ("h2-connect", "h2-connect, 1.2.3.4, 443, username=u, password=p"),
+    ])
+    def test_v5_v6_proxy_types_commented_and_cascaded(self, tmp_path, ptype, spec):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            f"V6 = {spec}\n"
+            "HK = trojan, 5.6.7.8, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "All = select, V6, HK\n"
+            "Only = select, V6\n"
+            "\n"
+            "[Rule]\n"
+            "DOMAIN,v6.example,Only\n"
+            "FINAL,All\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert f"# [V5+] V6 = {spec}" in out
+        assert "All = select, HK" in out
+        assert "# [V5+ cascade] Only = select" in out
+        assert "# [V5+ cascade] DOMAIN,v6.example,Only" in out
+        assert "FINAL,All" in out
+
+    def test_block_quic_removed_on_proxy_and_commented_in_general(self):
+        result = convert("""
+            [General]
+            block-quic = all-proxy
+
+            [Proxy]
+            HK = trojan, 1.2.3.4, 443, password=pwd, block-quic=on, ecn=true
+        """)
+        assert "# [V5+] block-quic = all-proxy" in result
+        assert "HK = trojan, 1.2.3.4, 443, password=pwd" in result
+        assert "block-quic=on" not in result
+        assert "ecn=true" not in result
+
+    def test_quote_and_comment_safe_proxy_transforms(self):
+        result = convert("""
+            [Proxy]
+            P1 = ss, 1.2.3.4, 443, encrypt-method=aes-256-gcm, password="a, ecn=true, block-quic=on", ecn=true # keep ecn=true
+            P2 = trojan, 1.2.3.4, 443, password=pass(word, block-quic=on ; comment block-quic=on
+            S1 = snell, 1.2.3.4, 443, psk="version=5", version = 5, shadow-tls-version = 3 # old version=5
+            S2 = snell, 1.2.3.4, 443, psk=abc, version=4 # TODO upgrade version=6
+        """)
+        lines = result.splitlines()
+        assert lines[1] == 'P1 = ss, 1.2.3.4, 443, encrypt-method=aes-256-gcm, password="a, ecn=true, block-quic=on" # keep ecn=true'
+        assert lines[2] == "P2 = trojan, 1.2.3.4, 443, password=pass(word ; comment block-quic=on"
+        assert lines[3] == 'S1 = snell, 1.2.3.4, 443, psk="version=5", version = 4, shadow-tls-version = 2 # old version=5'
+        assert lines[4] == "S2 = snell, 1.2.3.4, 443, psk=abc, version=4 # TODO upgrade version=6"
+
+    def test_snell_legacy_preserves_inline_comment(self, tmp_path):
+        (tmp_path / "nodes.dconf").write_text(
+            "S6 = snell, v6.example, 6000, psk=OLD, version=6 # note port=6000 version=6\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy]\n#!include nodes.dconf\n[Rule]\nFINAL,DIRECT\n")
+        convert_file(
+            str(main), ConversionStats(), {str(main): None},
+            snell_legacy={"nodes.dconf": {"port": "7000", "psk": "LEGACY"}},
+        )
+        out = (tmp_path / "v4" / "nodes-v4.dconf").read_text().strip()
+        assert out == "S6 = snell, v6.example, 7000, psk=LEGACY, version=4 # note port=6000 version=6"
+
+    def test_preexisting_v5_comment_does_not_cascade_live_proxy(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "# [V5+] HK = anytls, 9.9.9.9, 443, password=old\n"
+            "HK = trojan, 1.2.3.4, 443, password=pwd\n"
+            "V6 = anytls, 2.2.2.2, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "G = select, HK, V6\n"
+            "\n"
+            "[Rule]\n"
+            "FINAL,G\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "G = select, HK" in out
+        assert "FINAL,G" in out
+
+
+# --- T83: [Tailscale], [WireGuard *], and [Ruleset] sections ---
+
+class TestV5V6SectionsAndWildcards:
+    def test_tailscale_sections_and_wireguard_wildcard_expansion(self, tmp_path):
+        tunnel = tmp_path / "tunnel.dconf"
+        tunnel.write_text(
+            "[Proxy]\n"
+            "HomeWG = wireguard, section-name=HomeWG\n"
+            "WorkTS = tailscale, section-name=WorkTS\n"
+            "\n"
+            "[WireGuard HomeWG]\n"
+            "private-key = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            "self-ip = 10.0.0.2\n"
+            "peer = (public-key = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=, allowed-ips = 0.0.0.0/0, endpoint = 1.2.3.4:51820)\n"
+            "\n"
+            "[Tailscale WorkTS]\n"
+            "auth-mode = interactive\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "#!include tunnel.dconf\n"
+            "\n"
+            "[Proxy Group]\n"
+            "All = select, HomeWG, WorkTS\n"
+            "\n"
+            "[Rule]\n"
+            "FINAL,All\n"
+            "\n"
+            "[WireGuard *]\n"
+            "#!include tunnel.dconf\n"
+            "\n"
+            "[Tailscale *]\n"
+            "#!include tunnel.dconf\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        main_out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        tunnel_out = (tmp_path / "v4" / "tunnel-v4.dconf").read_text()
+
+        assert "# [V5+] [WireGuard *]" in main_out
+        assert "[WireGuard HomeWG]\n#!include tunnel-v4.dconf" in main_out
+        assert "# [V5+] [Tailscale *]" in main_out
+        assert "All = select, HomeWG" in main_out
+        assert "HomeWG = wireguard, section-name=HomeWG" in tunnel_out
+        assert "# [V5+] WorkTS = tailscale" in tunnel_out
+        assert "# [V5+] [Tailscale WorkTS]" in tunnel_out
+
+    def test_wireguard_wildcard_pure_v4_target_and_split_files(self, tmp_path):
+        """[WireGuard *] referencing pure-v4 files split across a.dconf and b.dconf."""
+        (tmp_path / "a.dconf").write_text(
+            "[WireGuard office]\n"
+            "private-key = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            "self-ip = 10.0.0.2\n"
+        )
+        (tmp_path / "b.dconf").write_text(
+            "[WireGuard office]\n"
+            "peer = (public-key = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=, allowed-ips = 0.0.0.0/0, endpoint = 1.2.3.4:51820)\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "OfficeWG = wireguard, section-name=office\n"
+            "\n"
+            "[Rule]\n"
+            "FINAL,OfficeWG\n"
+            "\n"
+            "[WireGuard *]\n"
+            "#!include a.dconf, b.dconf\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        main_out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "[WireGuard office]\n#!include a-v4.dconf, b-v4.dconf" in main_out
+        assert (tmp_path / "v4" / "a-v4.dconf").exists()
+        assert (tmp_path / "v4" / "b-v4.dconf").exists()
+        assert "OfficeWG = wireguard, section-name=office" in main_out
+
+    def test_wireguard_remote_include_stripped_and_incomplete_cascades(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "DeadWG = wireguard, section-name=incomplete\n"
+            "LiveWG = wireguard, section-name=complete\n"
+            "\n"
+            "[Proxy Group]\n"
+            "G = select, DeadWG, LiveWG\n"
+            "\n"
+            "[Rule]\n"
+            "FINAL,G\n"
+            "\n"
+            "[WireGuard incomplete]\n"
+            "private-key = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            "#!include https://example.com/wg-peers.conf\n"
+            "\n"
+            "[WireGuard complete]\n"
+            "private-key = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            "self-ip-v6 = fd00::2\n"
+            "peer = (public-key = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=, allowed-ips = ::/0, endpoint = 1.2.3.4:51820)\n"
+            "#!include https://example.com/extra.conf\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] [WireGuard incomplete]" in out
+        assert "# [V5+ cascade] DeadWG = wireguard, section-name=incomplete" in out
+        assert "[WireGuard complete]" in out
+        assert "# [V5+] #!include https://example.com/extra.conf" in out
+        assert "LiveWG = wireguard, section-name=complete" in out
+        assert "G = select, LiveWG" in out
+
+    def test_wireguard_wildcard_managed_target_cascades_dependent_proxy(self, tmp_path):
+        managed = tmp_path / "managed-wg.conf"
+        managed.write_text(
+            "#!MANAGED-CONFIG https://x.com/wg.conf interval=3600\n"
+            "[WireGuard mwg]\n"
+            "private-key = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            "self-ip = 10.0.0.2\n"
+            "peer = (public-key = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=, allowed-ips = 0.0.0.0/0, endpoint = 1.2.3.4:51820)\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "MWG = wireguard, section-name=mwg\n"
+            "HK = trojan, 1.2.3.4, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "G = select, MWG, HK\n"
+            "\n"
+            "[Rule]\n"
+            "FINAL,G\n"
+            "\n"
+            "[WireGuard *]\n"
+            "#!include managed-wg.conf\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert str(managed) in stats.abandoned_files
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] MWG = wireguard, section-name=mwg" in out
+        assert "G = select, HK" in out
+
+    def test_inline_ruleset_commented_and_cascaded_preserving_builtins_and_files(self, tmp_path):
+        (tmp_path / "local.list").write_text("DOMAIN,keep.example\n")
+        rs_sub = tmp_path / "rulesets.dconf"
+        rs_sub.write_text(
+            "#!MANAGED-CONFIG https://x.com/rs.conf interval=3600\n"
+            "[Ruleset SubRS]\n"
+            "DOMAIN,sub.example\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Rule]\n"
+            "RULE-SET,Office,DIRECT\n"
+            "AND,((PROTOCOL,TCP),(RULE-SET,SubRS)),REJECT\n"
+            "RULE-SET,SYSTEM,DIRECT\n"
+            "RULE-SET,LAN,DIRECT\n"
+            "RULE-SET,local.list,DIRECT\n"
+            "FINAL,DIRECT\n"
+            "\n"
+            "[Ruleset Office]\n"
+            "DOMAIN,office.example\n"
+            "\n"
+            "[Ruleset SYSTEM]\n"
+            "DOMAIN,shadow.example\n"
+            "\n"
+            "[Ruleset *]\n"
+            "#!include rulesets.dconf\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        # rulesets.dconf was ONLY under dead [Ruleset *], not abandoned as a loaded file
+        assert str(rs_sub) not in stats.abandoned_files
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+] [Ruleset Office]" in out
+        assert "# [V5+] [Ruleset *]" in out
+        assert "# [V5+ cascade] RULE-SET,Office,DIRECT" in out
+        assert "# [V5+ cascade] AND,((PROTOCOL,TCP),(RULE-SET,SubRS)),REJECT" in out
+        assert "\nRULE-SET,SYSTEM,DIRECT\n" in out
+        assert "\nRULE-SET,LAN,DIRECT\n" in out
+        assert "\nRULE-SET,local.list,DIRECT\n" in out
+        assert not (tmp_path / "v4" / "Office.list").exists()
+
+
+# --- T84: Single-parse [Proxy Group] IR & multi-group include-other-group ---
+
+class TestMultiGroupIncludeOtherGroupIR:
+    def test_multi_group_partial_cascade_with_backslash_and_policy_path(self, tmp_path):
+        """Mutating include-other-group AND policy-path on the SAME line never
+        re-parses v4-formatted quotes."""
+        (tmp_path / "pool.dconf").write_text(
+            "[Proxy]\nP1 = trojan, 1.2.3.4, 443, password=pwd\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Dead = anytls, 1.2.3.4, 443, password=pwd\n"
+            "HK = trojan, 5.6.7.8, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "Gone = select, Dead\n"
+            "G1 = select, HK\n"
+            r"Keep\Team\ = select, HK" + "\n"
+            r'All = select, include-other-group="Gone, G1, Keep\\Team\\", policy-path=pool.dconf' + "\n"
+            "\n"
+            "[Rule]\n"
+            "FINAL,All\n"
+        )
+        stats = ConversionStats()
+        convert_file(str(main), stats, {str(main): None})
+        assert not stats.errors
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert r'All = select, include-other-group="G1, Keep\Team\", policy-path=pool-v4.dconf' in out
+
+    def test_v5_escape_only_rewritten_without_cascade(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "HK = trojan, 1.2.3.4, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            r"Team\A = select, HK" + "\n"
+            r'All = select, include-other-group="Team\\A"' + "\n"
+            "\n"
+            "[Rule]\n"
+            "FINAL,All\n"
+        )
+        stats = ConversionStats()
+        result = convert_file(str(main), stats, {str(main): None})
+        assert result is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert r"All = select, include-other-group=Team\A" in out
+
+    def test_unrepresentable_quote_in_surviving_iog_aborts_before_emit(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "HK = trojan, 1.2.3.4, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            'Team "A" = select, HK\n'
+            r'All = select, include-other-group="Team \"A\""' + "\n"
+            "\n"
+            "[Rule]\n"
+            "FINAL,All\n"
+        )
+        stats = ConversionStats()
+        result = convert_file(str(main), stats, {str(main): None})
+        assert result is None
+        assert stats.errors
+        assert not (tmp_path / "v4" / "main-v4.conf").exists()
+
+    def test_unrepresentable_quote_deleted_by_cascade_does_not_error(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Dead = anytls, 1.2.3.4, 443, password=pwd\n"
+            "HK = trojan, 5.6.7.8, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            'Team "A" = select, Dead\n'
+            "Safe = select, HK\n"
+            r'All = select, include-other-group="Team \"A\", Safe"' + "\n"
+            "\n"
+            "[Rule]\n"
+            "FINAL,All\n"
+        )
+        stats = ConversionStats()
+        result = convert_file(str(main), stats, {str(main): None})
+        assert result is not None
+        assert not stats.errors
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert 'All = select, include-other-group="Safe"' in out
+
+
+# --- T85: underlying-proxy cascade on [Proxy] and [Proxy Group] ---
+
+class TestUnderlyingProxyCascade:
+    def test_proxy_and_group_underlying_proxy_cascade(self, tmp_path):
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Relay = anytls, 1.2.3.4, 443, password=pwd\n"
+            "Hop1 = trojan, 2.2.2.2, 443, password=pwd, underlying-proxy=Relay\n"
+            'Hop2 = ss, 3.3.3.3, 443, encrypt-method=aes-256-gcm, password=pwd, underlying-proxy="Hop1"\n'
+            "DirectNode = trojan, 4.4.4.4, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "ViaDead = select, DirectNode, underlying-proxy=Hop2\n"
+            "Main = select, ViaDead, DirectNode\n"
+            "\n"
+            "[Rule]\n"
+            "DOMAIN,hop.example,ViaDead\n"
+            "FINAL,Main\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "# [V5+ cascade] Hop1 = trojan" in out
+        assert "# [V5+ cascade] Hop2 = ss" in out
+        assert "# [V5+ cascade] ViaDead = select, DirectNode, underlying-proxy=Hop2" in out
+        assert "Main = select, DirectNode" in out
+        assert "# [V5+ cascade] DOMAIN,hop.example,ViaDead" in out
+        assert "FINAL,Main" in out
+
+
+# --- T86: Section-scoped #!include & private policy-path semantics ---
+
+class TestSectionScopedIncludeAndPrivatePolicyPath:
+    def test_proxy_include_does_not_load_proxy_group_section(self, tmp_path):
+        sub = tmp_path / "sub.dconf"
+        sub.write_text(
+            "[Proxy]\n"
+            "HK = trojan, 1.2.3.4, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "Unused = smart, HK\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "#!include sub.dconf\n"
+            "\n"
+            "[Rule]\n"
+            "FINAL,HK\n"
+        )
+        stats = ConversionStats()
+        # sub.dconf's [Proxy Group] is NOT loaded by [Proxy] #!include -> pure v4!
+        result = convert_file(str(main), stats, {str(main): None})
+        assert result is None
+        assert not (tmp_path / "v4").exists()
+
+    def test_private_policy_path_deletion_does_not_pollute_global_namespace(self, tmp_path):
+        (tmp_path / "extra.dconf").write_text(
+            "[Proxy]\nShared = anytls, 2.2.2.2, 443, password=pwd\n"
+        )
+        (tmp_path / "pool.dconf").write_text(
+            "[Proxy]\n"
+            "#!include extra.dconf\n"
+            "PoolKeep = trojan, 1.2.3.4, 443, password=pwd\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "OK = trojan, 9.9.9.9, 443, password=pwd\n"
+            "\n"
+            "[Proxy Group]\n"
+            "Pool = select, policy-path=pool.dconf\n"
+            "Global = select, Shared, OK\n"
+            "\n"
+            "[Rule]\n"
+            "DOMAIN,a.example,Shared\n"
+            "FINAL,Global\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None})
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        # Shared was only inside private policy-path subtree, never global
+        assert "Global = select, Shared, OK" in out
+        assert "\nDOMAIN,a.example,Shared\n" in out
+
+    def test_abandoned_subfile_strips_exact_path_not_same_basename(self, tmp_path):
+        (tmp_path / "bad").mkdir()
+        (tmp_path / "good").mkdir()
+        (tmp_path / "bad" / "sub.dconf").write_text(
+            "#!MANAGED-CONFIG https://x.com/bad.conf interval=3600\n"
+            "[Proxy]\nV6 = anytls, 1.2.3.4, 443, password=pwd\n"
+        )
+        (tmp_path / "good" / "sub.dconf").write_text(
+            "[Proxy]\nHK = trojan, 5.6.7.8, 443, password=pwd\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "#!include bad/sub.dconf, good/sub.dconf\n"
+            "\n"
+            "[Rule]\n"
+            "FINAL,HK\n"
+        )
+        convert_file(str(main), ConversionStats(), {str(main): None}, output_dir=str(tmp_path / "out"))
+        out = (tmp_path / "out" / "main-v4.conf").read_text()
+        assert "bad/sub.dconf" not in out
+        assert "#!include sub-v4.dconf" in out
+        assert (tmp_path / "out" / "sub-v4.dconf").exists()
+
+
+# --- T87: Unified RuleNode AST & extended-matching negation polarity ---
+
+class TestRuleNodeASTNegationPolarity:
+    def test_positive_and_double_negated_extended_matching_stripped(self):
+        result = convert("""
+            [Rule]
+            AND,((DOMAIN,a.com,extended-matching),(PROTOCOL,TCP)),PROXY
+            AND,((OR,((DOMAIN,a.com),(DOMAIN,b.com)),extended-matching),(PROTOCOL,TCP)),PROXY
+            OR,((DOMAIN,a.com),(DOMAIN,b.com)),PROXY,extended-matching
+            NOT,((NOT,((DOMAIN,a.com,extended-matching)))),REJECT
+            NOT,((DOMAIN,a.com)),REJECT,pre-matching
+            DOMAIN,c.com,DIRECT,extended-matching # keep note
+        """)
+        lines = result.splitlines()
+        assert lines[1] == "AND,((DOMAIN,a.com),(PROTOCOL,TCP)),PROXY"
+        assert lines[2] == "AND,((OR,((DOMAIN,a.com),(DOMAIN,b.com))),(PROTOCOL,TCP)),PROXY"
+        assert lines[3] == "OR,((DOMAIN,a.com),(DOMAIN,b.com)),PROXY"
+        assert lines[4] == "NOT,((NOT,((DOMAIN,a.com)))),REJECT"
+        assert lines[5] == "NOT,((DOMAIN,a.com)),REJECT"
+        assert lines[6] == "DOMAIN,c.com,DIRECT # keep note"
+
+    @pytest.mark.parametrize("rule", [
+        "NOT,((DOMAIN,a.com,extended-matching)),REJECT",
+        "NOT,((DOMAIN,a.com)),REJECT,extended-matching",
+        "NOT,((AND,((DOMAIN,a.com),(DOMAIN,b.com)),extended-matching)),REJECT",
+        "AND,((PROTOCOL,TCP),(NOT,((DOMAIN,a.com)))),REJECT,extended-matching",
+        "AND,((PROTOCOL,TCP),(OR,((HOSTNAME-TYPE,DHCP),(DOMAIN,a.com)))),DIRECT",
+        "NOT,((DOMAIN-WILDCARD,*.a.com)),DIRECT",
+    ])
+    def test_negated_extended_matching_and_nested_v5_rules_commented(self, rule):
+        result = convert(f"[Rule]\n{rule}\n")
+        assert result.splitlines()[1] == f"# [V5+] {rule}"
+
+
+# --- T88: -o / --output-dir isolation & pre-emit path validation ---
+
+class TestOutputDirAndPathValidation:
+    def test_output_dir_isolates_conflicting_roots_sharing_subfile(self, tmp_path, monkeypatch):
+        from converter import main as converter_main
+        (tmp_path / "common.dconf").write_text(
+            "[Proxy]\nS6 = snell, v6.example, 6000, psk=V6, version=6\n"
+        )
+        a_conf = tmp_path / "a.conf"
+        a_conf.write_text("[Proxy]\n#!include common.dconf\n[Rule]\nFINAL,DIRECT\n")
+        b_conf = tmp_path / "b.conf"
+        b_conf.write_text("[Proxy]\n#!include common.dconf\n[Rule]\nFINAL,DIRECT\n")
+        legacy_a = tmp_path / "legacy-a.ini"
+        legacy_a.write_text("[common.dconf]\nport = 7000\npsk = LEGACY\n")
+        legacy_a.chmod(0o600)
+
+        out_a = tmp_path / "out-a"
+        out_b = tmp_path / "out-b"
+        monkeypatch.setattr("sys.argv", ["converter.py", "--snell-legacy", str(legacy_a), "-o", str(out_a), str(a_conf)])
+        converter_main()
+        monkeypatch.setattr("sys.argv", ["converter.py", "-o", str(out_b), str(b_conf)])
+        converter_main()
+
+        assert "version=4" in (out_a / "common-v4.dconf").read_text()
+        assert "# [V5+] S6 = snell" in (out_b / "common-v4.dconf").read_text()
+        assert "#!include common-v4.dconf" in (out_a / "a-v4.conf").read_text()
+        assert "#!include common-v4.dconf" in (out_b / "b-v4.conf").read_text()
+
+    def test_same_basename_collision_in_output_dir_aborts_before_writing(self, tmp_path):
+        (tmp_path / "d1").mkdir()
+        (tmp_path / "d2").mkdir()
+        (tmp_path / "d1" / "nodes.dconf").write_text("[Proxy]\nA = anytls, 1.1.1.1, 443, password=p\n")
+        (tmp_path / "d2" / "nodes.dconf").write_text("[Proxy]\nB = trojan, 2.2.2.2, 443, password=p\n")
+        main = tmp_path / "main.conf"
+        main.write_text("[Proxy]\n#!include d1/nodes.dconf, d2/nodes.dconf\n[Rule]\nFINAL,DIRECT\n")
+        out_dir = tmp_path / "out"
+        stats = ConversionStats()
+        result = convert_file(str(main), stats, {str(main): None}, output_dir=str(out_dir))
+        assert result is None
+        assert any("映射到同一输出路径" in e for e in stats.errors)
+        assert not out_dir.exists()
+
+    def test_real_filesystem_unicode_name_succeeds_and_overlong_aborts(self, tmp_path):
+        # Multi-byte Unicode filename (60 CJK chars = 180 UTF-8 bytes; valid everywhere)
+        # plus 100 CJK chars (= 300 UTF-8 bytes) when the underlying FS accepts it (e.g. APFS)
+        cjk_name = ("配置" * 50) + ".conf"
+        cjk_file = tmp_path / cjk_name
+        try:
+            cjk_file.write_text("[Proxy]\nV6 = anytls, 1.2.3.4, 443, password=p\n[Rule]\nFINAL,DIRECT\n")
+        except OSError:
+            cjk_file = tmp_path / (("配置" * 30) + ".conf")
+            cjk_file.write_text("[Proxy]\nV6 = anytls, 1.2.3.4, 443, password=p\n[Rule]\nFINAL,DIRECT\n")
+        stats = ConversionStats()
+        out_path = convert_file(str(cjk_file), stats, {str(cjk_file): None})
+        assert out_path is not None and not stats.errors
+
+        # Truly over-long name (>255 ASCII chars) aborts pre-emit without creating v4/
+        long_dir = tmp_path / "long_case"
+        long_dir.mkdir()
+        long_file = long_dir / ("a" * 248 + ".conf")
+        long_file.write_text("[Proxy]\nV6 = anytls, 1.2.3.4, 443, password=p\n[Rule]\nFINAL,DIRECT\n")
+        stats2 = ConversionStats()
+        res2 = convert_file(str(long_file), stats2, {str(long_file): None})
+        assert res2 is None
+        assert any("长度上限" in e for e in stats2.errors)
+        assert not (long_dir / "v4").exists()

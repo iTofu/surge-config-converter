@@ -2,11 +2,11 @@
 """Surge v5+ -> v4 configuration converter.
 
 Usage:
-    python3 converter.py [--snell-legacy PATH] <input_file_path>
+    python3 converter.py [--snell-legacy PATH] [-o DIR] <input_file_path>
 
 Output layout:
-    All generated -v4 files are written to a v4/ subdirectory next to
-    the source files:
+    All generated -v4 files are written 1-to-1 into the output directory
+    (default: a v4/ subdirectory next to the source files):
 
         Documents/
         ├── profile.conf              <- source (v5+)
@@ -15,22 +15,19 @@ Output layout:
             ├── profile-v4.conf       <- converted (v4)
             └── work-vps-v4.dconf
 
-    Files inside v4/ reference each other using bare filenames (e.g.
-    #!include work-vps-v4.dconf) with no directory prefix. v4/ is
-    self-contained: whenever anything needs conversion, every file the
-    profile loads gets a -v4 copy (verbatim if it needed no conversion),
-    so copying v4/ alone to the Surge v4 device is enough.
-
-Limitation:
-    All referenced files (#!include, policy-path) must reside in the
-    same directory as the root config. Sub-directory references produce
-    output under <subdir>/v4/ while parents reference bare -v4 names,
-    so those need manual merging; identically named files in different
-    sub-directories would collide.
+    Files inside the output directory reference each other using bare
+    filenames (e.g. #!include work-vps-v4.dconf) with no directory prefix.
+    The output directory is self-contained for a single root profile:
+    whenever anything in the loaded profile needs conversion, every file it
+    loads gets a -v4 copy (verbatim if it needed no conversion). If you
+    convert multiple root profiles in the same source folder that share
+    sub-files with diverging conversions, pass -o / --output-dir to isolate
+    each profile into its own output directory.
 """
 
 import argparse
 import configparser
+import errno
 import os
 import re
 import sys
@@ -40,8 +37,15 @@ from pathlib import Path
 from send2trash import send2trash
 
 
+# ---------------------------------------------------------------------------
+# Constants: Surge v5+/v6 -> v4 compatibility tables
+# ---------------------------------------------------------------------------
+
 # Proxy types not supported in Surge v4
-V5PLUS_ONLY_PROXY_TYPES = {"hysteria2", "hy2", "anytls", "tuic", "trust-tunnel"}
+V5PLUS_ONLY_PROXY_TYPES = {
+    "hysteria2", "hy2", "anytls", "tuic", "tuic-v5",
+    "trust-tunnel", "tailscale", "vless", "masque", "h2-connect",
+}
 
 # Snell versions above this have no v4 equivalent: v4 speaks up to version=4,
 # version=5 is down-converted to 4, version=6+ nodes are disabled like the
@@ -50,10 +54,7 @@ SNELL_MAX_V4_VERSION = 5
 _SNELL_VERSION_RE = re.compile(r'(?<![\w-])version\s*=\s*(\d+)')
 
 # Optional per-file override for servers that run an extra v4-compatible snell
-# instance next to the version=6+ one (own port / PSK, maybe own host). Live
-# version=6+ nodes of a matching source file are rewritten to version=4 with
-# these fields instead of being disabled. Group 1 of each regex spans the
-# value; every other byte of the line is kept.
+# instance next to the version=6+ one (own port / PSK, maybe own host).
 _SNELL_LEGACY_FIELD_RES = {
     "server": re.compile(r'^[^=]+=[^,]*,\s*([^,]*?)\s*(?=,)'),
     "port": re.compile(r'^[^=]+=[^,]*,[^,]*,\s*([^,]*?)\s*(?=,|$)'),
@@ -61,8 +62,26 @@ _SNELL_LEGACY_FIELD_RES = {
 }
 SNELL_LEGACY_FILENAME = "snell-legacy.ini"
 
-# Sections that should be entirely commented out in v4
+# Sections entirely unsupported in v4
 V5PLUS_ONLY_SECTIONS = {"Port Forwarding", "Body Rewrite"}
+# Section prefixes unsupported in v4 ([Tailscale <name>], [Tailscale *],
+# inline [Ruleset <name>], [Ruleset *])
+V5PLUS_ONLY_SECTION_PREFIXES = ("Tailscale ", "Ruleset ")
+# Wildcard named-section includes ([<Base> *], iOS 5.22.0+ / Mac 6.9.0+);
+# concrete [WireGuard <name>] remains valid in v4.
+V5PLUS_WILDCARD_SECTION_BASES = {"WireGuard", "Tailscale", "Ruleset"}
+
+
+def is_v5plus_only_section(section_name):
+    """Return True if [section_name] is unsupported as a whole in Surge v4."""
+    if section_name in V5PLUS_ONLY_SECTIONS:
+        return True
+    if any(section_name.startswith(p) for p in V5PLUS_ONLY_SECTION_PREFIXES):
+        return True
+    if section_name.endswith(" *"):
+        return section_name[:-2] in V5PLUS_WILDCARD_SECTION_BASES
+    return False
+
 
 # General parameters not supported in v4
 V5PLUS_ONLY_GENERAL_PARAMS = {"udp-priority", "block-quic"}
@@ -71,49 +90,220 @@ V5PLUS_ONLY_GENERAL_PARAMS = {"udp-priority", "block-quic"}
 V5PLUS_ONLY_RULE_TYPES = {"HOSTNAME-TYPE", "DOMAIN-WILDCARD"}
 
 # Rule options not supported in v4 (extended-matching: iOS 5.8.0+,
-# pre-matching: iOS 5.14.0+). Stripped from the line; the rule itself stays.
+# pre-matching: iOS 5.14.0+).
 V5PLUS_ONLY_RULE_OPTIONS = {"extended-matching", "pre-matching"}
 
-# v5+ only rule types appearing as parenthesized criteria of AND/OR/NOT rules
-_V5PLUS_NESTED_RULE_RE = re.compile(
-    r'\(\s*(?:' + '|'.join(sorted(V5PLUS_ONLY_RULE_TYPES)) + r')\s*,'
-)
+# Known trailing options that can follow a rule's policy (or leaf sub-rule args)
+RULE_TRAILING_OPTIONS = {
+    "no-resolve",
+    "force-remote-dns",
+    "extended-matching",
+    "dns-failed",
+    "pre-matching",
+}
 
-# Proxy parameters to remove (v5+ only)
-V5PLUS_ONLY_PROXY_PARAMS = {"port-hopping", "port-hopping-interval", "ecn"}
+# Surge built-in rule sets always take precedence over inline [Ruleset <name>]
+BUILTIN_RULESETS = {"SYSTEM", "LAN"}
+
+# Characters that Surge v4 cannot represent inside an include-other-group value
+# (quoted \" / \\ escapes require iOS 5.21.0+ / Mac 6.8.0+; commas delimit items).
+_V4_UNREPRESENTABLE_IOG_CHARS = ('"', ',')
+
+# Proxy parameters not supported in v4
+V5PLUS_ONLY_PROXY_PARAMS = {"port-hopping", "port-hopping-interval", "ecn", "block-quic"}
 
 # Cascade-cleanup tag prefix: distinguishes follow-on deletions from direct hits.
 CASCADE_TAG = "# [V5+ cascade] "
 
-# Comment prefixes Surge accepts ("#", ";", "//", Surge manual, Profile
-# Format), possibly repeated with spaces in between. "#!" is a directive
-# (#!include, #!MANAGED-CONFIG), not a comment.
+# Comment prefixes Surge accepts ("#", ";", "//"), possibly repeated with spaces.
+# "#!" is a directive (#!include, #!MANAGED-CONFIG), never a comment.
 _COMMENT_PREFIX_RE = re.compile(r'^\s*(?:(?:#(?!!)|//|;)\s*)+')
 
 # Proxy types whose definition is "name = type, host, port, key=value...".
-# Only these are recognized inside comments; anything else stays verbatim.
-HOST_PORT_PROXY_TYPES = {
-    "http", "https", "socks5", "socks5-tls", "ss", "snell", "vmess", "trojan", "ssh",
-} | V5PLUS_ONLY_PROXY_TYPES
+HOST_PORT_PROXY_TYPES = (
+    {"http", "https", "socks5", "socks5-tls", "ss", "snell", "vmess", "trojan", "ssh"}
+    | (V5PLUS_ONLY_PROXY_TYPES - {"tailscale"})
+)
+
+V4_SUBDIR = "v4"
+
+
+# ---------------------------------------------------------------------------
+# Layer 1: Surge Lexer & Line Primitives
+# ---------------------------------------------------------------------------
+
+def is_comment_line(line):
+    """Return True if line is a Surge comment (#, ;, //), excluding #! directives."""
+    stripped = line.lstrip()
+    if not stripped:
+        return False
+    if stripped.startswith("#!"):
+        return False
+    return stripped.startswith("#") or _COMMENT_PREFIX_RE.match(stripped) is not None
+
+
+def split_inline_comment(s):
+    """Split a Surge line/RHS into (body, trailing_comment).
+
+    Surge recognizes '#', ';', and '//' as inline comment starters when
+    preceded by whitespace outside double quotes (respecting \\ and \" escapes).
+    Leading whitespace before the comment marker stays attached to
+    trailing_comment for lossless round-tripping.
+    """
+    in_quote = False
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_quote:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                in_quote = False
+            i += 1
+            continue
+        if ch == '"':
+            in_quote = True
+            i += 1
+            continue
+        if i > 0 and s[i - 1].isspace():
+            if ch in ("#", ";") or (ch == "/" and i + 1 < n and s[i + 1] == "/"):
+                j = i
+                while j > 0 and s[j - 1].isspace():
+                    j -= 1
+                return s[:j], s[j:]
+        i += 1
+    return s, ""
+
+
+def _split_top_level_comma_spans(s, track_parens=True):
+    """Return (start, end) index spans for comma-separated segments outside
+    double quotes (respecting \\ and \" escapes) and optionally outside
+    balanced parentheses.
+    """
+    spans = []
+    depth = 0
+    in_quote = False
+    start = 0
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_quote:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                in_quote = False
+            i += 1
+            continue
+        if ch == '"':
+            in_quote = True
+        elif track_parens and ch == "(":
+            depth += 1
+        elif track_parens and ch == ")":
+            if depth > 0:
+                depth -= 1
+        elif ch == "," and (not track_parens or depth == 0):
+            spans.append((start, i))
+            start = i + 1
+        i += 1
+    spans.append((start, n))
+    return spans
+
+
+def _split_top_level_commas(s, track_parens=True):
+    """Split a string by commas outside double quotes (with \\/\" escapes)
+    and optionally outside balanced parentheses."""
+    return [s[a:b].strip() for a, b in _split_top_level_comma_spans(s, track_parens=track_parens)]
+
+
+def _escape_quoted(s):
+    """Escape backslash and double-quote for Surge double-quoted values."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def unquote(name):
-    """Strip surrounding double quotes from a proxy / group name token."""
+    """Strip surrounding double quotes and decode Surge \" and \\ escapes."""
     if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
-        return name[1:-1]
+        return re.sub(r'\\(["\\])', r'\1', name[1:-1])
     return name
 
 
-def _serialize_lines(lines, original):
-    """Join working lines back into file content, restoring the trailing
-    newline iff the original had one.
+def _has_v5_quote_escape(raw_value):
+    """Return True if a double-quoted value contains v5.21+/6.8+ \\ or \" escapes."""
+    sv = raw_value.strip()
+    if len(sv) >= 2 and sv[0] == '"' and sv[-1] == '"':
+        inner = sv[1:-1]
+        return '\\\\' in inner or '\\"' in inner
+    return False
 
-    splitlines() drops the final newline, so a naive join + endswith check
-    loses one newline for content ending in a blank line ("a\\n\\n" →
-    ["a", ""] → "a\\n"): the join already ends with "\\n" and the naive
-    compensation never fires. Appending unconditionally when the original
-    ended with a newline is correct for every case.
+
+def parse_section_header(line, include_v5_commented=False):
+    """Return the section name if line is a Surge [Section] header, else None.
+
+    Strips legal Surge trailing inline comments before matching [Section].
+    When include_v5_commented is True, also recognizes headers commented out
+    by this converter ("# [V5+] [...]" / CASCADE_TAG).
     """
+    stripped = line.strip()
+    if include_v5_commented:
+        for prefix in ("# [V5+] ", CASCADE_TAG):
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix):].lstrip()
+                break
+    body, _ = split_inline_comment(stripped)
+    body = body.strip()
+    if len(body) >= 3 and body[0] == "[" and body[-1] == "]":
+        inner = body[1:-1]
+        if inner and "[" not in inner and "]" not in inner:
+            return inner
+    return None
+
+
+def compute_sections(lines, default_section=None):
+    """Return a list parallel to lines where each entry is the section name
+    the line belongs to (or default_section before any header appears).
+    """
+    result = []
+    current = default_section
+    for line in lines:
+        sec = parse_section_header(line, include_v5_commented=True)
+        if sec is not None:
+            current = sec
+        result.append(current)
+    return result
+
+
+def parse_include_list(line):
+    """Parse a #!include line into a list of path/url entries, or None."""
+    m = re.match(r'^\s*#!include\s+(.+)$', line)
+    if not m:
+        return None
+    body, _ = split_inline_comment(m.group(1))
+    return [p.strip() for p in body.split(",") if p.strip()]
+
+
+def _include_trailing_comment(line):
+    """Return any trailing Surge inline comment on a #!include line."""
+    m = re.match(r'^\s*#!include\s+(.+)$', line)
+    if not m:
+        return ""
+    _, trailing = split_inline_comment(m.group(1))
+    return trailing
+
+
+def format_include_list(entries, trailing_comment=""):
+    """Format entries back into a #!include line, or None if empty."""
+    if not entries:
+        return None
+    return "#!include " + ", ".join(entries) + trailing_comment
+
+
+def _serialize_lines(lines, original):
+    """Join lines back into file content, restoring the trailing newline iff
+    original had one."""
     joined = "\n".join(lines)
     if original.endswith("\n"):
         joined += "\n"
@@ -123,59 +313,17 @@ def _serialize_lines(lines, original):
 def _preserve_indent(original_line, new_content):
     """Prepend original_line's leading whitespace to new_content."""
     stripped = original_line.lstrip()
-    indent = original_line[: len(original_line) - len(stripped)]
+    indent = original_line[:len(original_line) - len(stripped)]
     return indent + new_content
 
 
-def compute_sections(lines, default_section=None):
-    """Return a list parallel to lines where each entry is the section name
-    the line belongs to (or default_section before any header appears).
-
-    Also recognizes section headers that the direct-hit pass commented out
-    (e.g. "# [V5+] [Port Forwarding]") so that the commented section body is
-    not attributed to the preceding section.
-    """
-    result = []
-    current = default_section
-    for line in lines:
-        m = re.match(r'^(?:# \[V5\+\] )?\[(.+)\]$', line.strip())
-        if m:
-            current = m.group(1)
-        result.append(current)
-    return result
-
-
-def has_effective_members(pgl, deleted_names, abandoned_basenames):
-    """Return True if the Proxy Group still has at least one valid member source.
-
-    Valid sources:
-      - an explicit member name not in deleted_names
-      - include-all-proxies=1 option
-      - include-other-group=<group> where <group> is not in deleted_names
-      - policy-path=<file> where <file> is an HTTP URL, or a local file whose
-        basename is NOT in abandoned_basenames
-    """
-    for m in pgl.members:
-        if unquote(m) not in deleted_names:
-            return True
-    for key, value in pgl.options:
-        if key == "include-all-proxies" and value.strip() in {"1", "true"}:
-            return True
-        if key == "include-other-group" and unquote(value.strip()) not in deleted_names:
-            return True
-        if key == "policy-path":
-            if value.startswith("http://") or value.startswith("https://"):
-                return True
-            if os.path.basename(value) not in abandoned_basenames:
-                return True
-    return False
+def comment_line(line):
+    """Add # [V5+] prefix to a line."""
+    return f"# [V5+] {line}"
 
 
 def is_managed_config(content):
-    """Return True if content starts with a #!MANAGED-CONFIG directive.
-
-    Skips leading blank lines. The directive must be the first non-blank line.
-    """
+    """Return True if content's first non-blank line is #!MANAGED-CONFIG."""
     for raw in content.splitlines():
         line = raw.strip()
         if not line:
@@ -184,10 +332,470 @@ def is_managed_config(content):
     return False
 
 
+# ---------------------------------------------------------------------------
+# Layer 2: Proxy Group Structured IR (parse once, mutate in memory, render once)
+# ---------------------------------------------------------------------------
+
+def parse_include_other_groups(value):
+    """Decode an include-other-group option value into a list of group names."""
+    body, _ = split_inline_comment(value)
+    raw = unquote(body.strip())
+    return [g.strip() for g in raw.split(",") if g.strip()]
+
+
+def is_v4_representable_group_name(name):
+    """Return True if name can be encoded in a Surge v4 include-other-group value."""
+    return not any(c in name for c in _V4_UNREPRESENTABLE_IOG_CHARS)
+
+
+def format_include_other_groups(groups, was_quoted=False):
+    """Format surviving group names into a Surge v4-readable include-other-group value.
+
+    Surge v4 does not decode \\ / \" inside double quotes (added in iOS 5.21.0 /
+    Mac 6.8.0): single backslash-bearing names without spaces are emitted
+    unquoted so both v4 and v5+/v6 read the literal name, multi-group lists emit
+    literal backslashes without v5.21+ doubling, and names containing '"' or ','
+    raise ValueError because v4 cannot represent them unambiguously.
+    """
+    bad = [g for g in groups if not is_v4_representable_group_name(g)]
+    if bad:
+        raise ValueError(
+            f"v4 include-other-group 无法表示含引号或逗号的组名: {', '.join(bad)}"
+        )
+    if len(groups) == 1:
+        g = groups[0]
+        if "\\" in g and " " not in g:
+            return g
+        if was_quoted or " " in g:
+            return f'"{g}"'
+        return g
+    return '"' + ", ".join(groups) + '"'
+
+
+@dataclass
+class ProxyGroupLine:
+    """Public structured representation of a Surge [Proxy Group] definition line."""
+    name: str
+    group_type: str
+    members: list      # raw tokens, quotes preserved
+    options: list      # ordered list of (key, value) tuples
+    trailing_comment: str = ""
+
+
+@dataclass
+class _GroupOptionIR:
+    """In-memory structured option inside a [Proxy Group] record."""
+    key: str
+    raw_value: str
+    # Populated when key.lower() == "include-other-group"
+    iog_groups: list = None
+    iog_was_quoted: bool = False
+    iog_had_v5_escape: bool = False
+    iog_dirty: bool = False
+    # Populated when key.lower() == "policy-path"
+    policy_path: str = None
+    policy_path_was_quoted: bool = False
+    policy_path_dirty: bool = False
+
+
+@dataclass
+class _GroupRecordIR:
+    """Single-parse IR for a live [Proxy Group] line during Pipeline analysis.
+
+    Mutations happen strictly on structured fields in memory. Final v4
+    rendering happens ONCE after all cascade and reference-rewriting passes
+    complete, so v4-serialized quotes are never re-parsed by a v5+ parser.
+    """
+    name: str
+    group_type: str
+    members: list
+    options: list           # list[_GroupOptionIR]
+    trailing_comment: str
+    indent: str
+    dirty: bool = False
+    commented_out: bool = False
+
+    def needs_v4_writeback(self):
+        return self.dirty or any(opt.iog_had_v5_escape for opt in self.options)
+
+    def has_effective_members(self, deleted_names, abandoned_paths=None, base_dir=None):
+        abandoned_paths = abandoned_paths or set()
+        for m in self.members:
+            if unquote(m) not in deleted_names:
+                return True
+        for opt in self.options:
+            kl = opt.key.lower()
+            if kl == "include-all-proxies" and opt.raw_value.strip() in {"1", "true"}:
+                return True
+            if kl == "include-other-group" and opt.iog_groups is not None:
+                if any(g not in deleted_names for g in opt.iog_groups):
+                    return True
+            if kl == "policy-path" and opt.policy_path is not None:
+                if opt.policy_path.startswith(("http://", "https://")):
+                    return True
+                if base_dir is not None:
+                    ref_abs = os.path.normpath(os.path.join(base_dir, opt.policy_path))
+                    if ref_abs not in abandoned_paths:
+                        return True
+                elif os.path.basename(opt.policy_path) not in abandoned_paths:
+                    return True
+        return False
+
+    def render_v4(self, allow_raw_iog=False):
+        """Render this record to its final v4 text line.
+
+        Raises ValueError if an active (non-commented) include-other-group
+        option has surviving names unrepresentable in Surge v4.
+        """
+        rendered_opts = []
+        for opt in self.options:
+            kl = opt.key.lower()
+            if kl == "include-other-group" and opt.iog_groups is not None:
+                if not allow_raw_iog and (opt.iog_dirty or opt.iog_had_v5_escape):
+                    val = format_include_other_groups(opt.iog_groups, was_quoted=opt.iog_was_quoted)
+                elif allow_raw_iog and opt.iog_dirty:
+                    val = '"' + ", ".join(opt.iog_groups) + '"' if len(opt.iog_groups) > 1 else opt.iog_groups[0]
+                else:
+                    val = opt.raw_value
+                rendered_opts.append((opt.key, val))
+            elif kl == "policy-path" and opt.policy_path is not None and opt.policy_path_dirty:
+                val = f'"{_escape_quoted(opt.policy_path)}"' if opt.policy_path_was_quoted else opt.policy_path
+                rendered_opts.append((opt.key, val))
+            else:
+                rendered_opts.append((opt.key, opt.raw_value))
+        parts = [self.group_type]
+        parts.extend(self.members)
+        parts.extend(f"{k}={v}" for k, v in rendered_opts)
+        body = f"{self.name} = " + ", ".join(parts) + self.trailing_comment
+        if self.commented_out:
+            return CASCADE_TAG + body.lstrip()
+        return self.indent + body
+
+
+def parse_proxy_group_line(line):
+    """Parse a Surge [Proxy Group] definition line into ProxyGroupLine, or None."""
+    stripped = line.lstrip()
+    if (not stripped or is_comment_line(stripped)
+            or stripped.startswith("[") or stripped.startswith("#!")):
+        return None
+    if "=" not in line:
+        return None
+
+    name_part, rest = line.split("=", 1)
+    name = name_part.strip()
+    if not name:
+        return None
+
+    body, trailing_comment = split_inline_comment(rest)
+    tokens = _split_top_level_commas(body, track_parens=False)
+    if not tokens or not tokens[0]:
+        return None
+
+    group_type = tokens[0]
+    members = []
+    options = []
+    for token in tokens[1:]:
+        if not token:
+            continue
+        if "=" in token and not token.startswith('"'):
+            key, value = token.split("=", 1)
+            options.append((key.strip(), value.strip()))
+        else:
+            members.append(token)
+
+    return ProxyGroupLine(
+        name=name, group_type=group_type, members=members,
+        options=options, trailing_comment=trailing_comment,
+    )
+
+
+def _build_group_record(line):
+    """Parse a live [Proxy Group] line ONCE into _GroupRecordIR, or None."""
+    pgl = parse_proxy_group_line(line)
+    if pgl is None:
+        return None
+    stripped = line.lstrip()
+    indent = line[:len(line) - len(stripped)]
+    opts = []
+    for key, value in pgl.options:
+        kl = key.lower()
+        sv = value.strip()
+        is_quoted = len(sv) >= 2 and sv[0] == '"' and sv[-1] == '"'
+        if kl == "include-other-group":
+            opts.append(_GroupOptionIR(
+                key=key,
+                raw_value=value,
+                iog_groups=parse_include_other_groups(sv),
+                iog_was_quoted=is_quoted,
+                iog_had_v5_escape=_has_v5_quote_escape(sv),
+            ))
+        elif kl == "policy-path":
+            opts.append(_GroupOptionIR(
+                key=key,
+                raw_value=value,
+                policy_path=unquote(sv),
+                policy_path_was_quoted=is_quoted,
+            ))
+        else:
+            opts.append(_GroupOptionIR(key=key, raw_value=value))
+    return _GroupRecordIR(
+        name=pgl.name,
+        group_type=pgl.group_type,
+        members=list(pgl.members),
+        options=opts,
+        trailing_comment=pgl.trailing_comment,
+        indent=indent,
+    )
+
+
+def format_proxy_group_line(pgl):
+    """Format a ProxyGroupLine back into a config line (stable round-trip)."""
+    parts = [pgl.group_type]
+    parts.extend(pgl.members)
+    parts.extend(f"{k}={v}" for k, v in pgl.options)
+    return f"{pgl.name} = " + ", ".join(parts) + pgl.trailing_comment
+
+
+def has_effective_members(pgl, deleted_names, abandoned_basenames):
+    """Return True if a ProxyGroupLine still has at least one valid member source."""
+    for m in pgl.members:
+        if unquote(m) not in deleted_names:
+            return True
+    for key, value in pgl.options:
+        kl = key.lower()
+        if kl == "include-all-proxies" and value.strip() in {"1", "true"}:
+            return True
+        if kl == "include-other-group":
+            if any(g not in deleted_names for g in parse_include_other_groups(value)):
+                return True
+        if kl == "policy-path":
+            path_val = unquote(value.strip())
+            if path_val.startswith(("http://", "https://")):
+                return True
+            if os.path.basename(path_val) not in abandoned_basenames:
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: Unified Recursive Rule AST (handles top-level & nested AND/OR/NOT)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RuleNode:
+    """Recursive AST node for a Surge [Rule] line or nested logical criterion."""
+    kind: str                       # uppercase rule type ("AND", "OR", "NOT", "RULE-SET", "FINAL", ...)
+    raw_kind: str                   # original spelling
+    args: list                      # list[RuleNode] for AND/OR/NOT; list[str] for leaf rules
+    policy: str = None              # present on top-level [Rule], None on sub-rules
+    options: list = field(default_factory=list)
+    trailing_comment: str = ""
+
+
+def _strip_outer_parens(s):
+    """If s (trimmed) is wrapped in a single matched (...) pair, return interior."""
+    t = s.strip()
+    if len(t) < 2 or t[0] != "(" or t[-1] != ")":
+        return None
+    depth = 0
+    in_quote = False
+    i = 0
+    n = len(t)
+    while i < n:
+        ch = t[i]
+        if in_quote:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                in_quote = False
+            i += 1
+            continue
+        if ch == '"':
+            in_quote = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0 and i != n - 1:
+                return None
+        i += 1
+    return t[1:-1] if depth == 0 else None
+
+
+def _is_rule_option_token(token):
+    return token in RULE_TRAILING_OPTIONS or ("=" in token and not token.startswith('"'))
+
+
+def _rule_policy_index(tokens):
+    """Return index of the policy token in a top-level [Rule] line, or 0."""
+    i = len(tokens) - 1
+    while i > 0 and _is_rule_option_token(tokens[i]):
+        i -= 1
+    return i
+
+
+def _parse_logical_criteria(raw_group):
+    """Parse `((SUB1),(SUB2),...)` into list[RuleNode], or None if malformed."""
+    inner = _strip_outer_parens(raw_group)
+    if inner is None:
+        return None
+    children = []
+    for item in _split_top_level_commas(inner, track_parens=True):
+        if not item:
+            continue
+        crit_inner = _strip_outer_parens(item)
+        if crit_inner is None:
+            return None
+        sub_tokens = _split_top_level_commas(crit_inner, track_parens=True)
+        if len(sub_tokens) < 2:
+            return None
+        raw_kind = sub_tokens[0]
+        kind = raw_kind.upper()
+        if kind in ("AND", "OR", "NOT"):
+            sub_children = _parse_logical_criteria(sub_tokens[1])
+            if sub_children is None:
+                return None
+            # Trailing options attached directly to the nested compound node
+            extra = sub_tokens[2:]
+            opt_idx = len(extra)
+            while opt_idx > 0 and _is_rule_option_token(extra[opt_idx - 1]):
+                opt_idx -= 1
+            if opt_idx != 0:
+                return None
+            children.append(RuleNode(
+                kind=kind, raw_kind=raw_kind, args=sub_children,
+                policy=None, options=extra,
+            ))
+        else:
+            opt_idx = len(sub_tokens)
+            while opt_idx > 2 and _is_rule_option_token(sub_tokens[opt_idx - 1]):
+                opt_idx -= 1
+            children.append(RuleNode(
+                kind=kind, raw_kind=raw_kind, args=sub_tokens[1:opt_idx],
+                policy=None, options=sub_tokens[opt_idx:],
+            ))
+    return children
+
+
+def parse_rule_line(line):
+    """Parse a live [Rule] line into a RuleNode AST, or None if not a rule."""
+    stripped = line.lstrip()
+    if (not stripped or is_comment_line(stripped)
+            or stripped.startswith("[") or stripped.startswith("#!")):
+        return None
+    body, trailing = split_inline_comment(stripped)
+    tokens = _split_top_level_commas(body, track_parens=True)
+    if len(tokens) < 2:
+        return None
+    pi = _rule_policy_index(tokens)
+    if pi == 0:
+        return None
+    raw_kind = tokens[0]
+    kind = raw_kind.upper()
+    policy = tokens[pi]
+    options = tokens[pi + 1:]
+    if kind in ("AND", "OR", "NOT") and pi == 2:
+        children = _parse_logical_criteria(tokens[1])
+        if children is not None:
+            return RuleNode(
+                kind=kind, raw_kind=raw_kind, args=children,
+                policy=policy, options=options, trailing_comment=trailing,
+            )
+    return RuleNode(
+        kind=kind, raw_kind=raw_kind, args=tokens[1:pi],
+        policy=policy, options=options, trailing_comment=trailing,
+    )
+
+
+def render_rule_node(node):
+    """Render a RuleNode AST back into a Surge rule string."""
+    if node.kind in ("AND", "OR", "NOT") and node.args and isinstance(node.args[0], RuleNode):
+        inner = "(" + ",".join(f"({render_rule_node(child)})" for child in node.args) + ")"
+        parts = [node.raw_kind, inner]
+    else:
+        parts = [node.raw_kind, *node.args]
+    if node.policy is not None:
+        parts.append(node.policy)
+    parts.extend(node.options)
+    return ",".join(parts) + node.trailing_comment
+
+
+def _transform_rule_ast(node, negated=False):
+    """Recursively downgrade v5+ rule types and options in-place on a RuleNode.
+
+    Returns (changed, must_comment, removed_opts, has_negated_leaf):
+      - Any v5+-only rule type at any depth sets must_comment=True.
+      - Any `extended-matching` attached to a leaf or compound node whose scope
+        reaches an odd-NOT negated leaf sets must_comment=True (stripping it
+        would narrow the inner matcher and expand the enclosing negation).
+      - Positive-polarity `extended-matching` and any `pre-matching` are
+        stripped cleanly while preserving the rule.
+    """
+    if node.kind in V5PLUS_ONLY_RULE_TYPES:
+        return True, True, [], negated
+
+    if node.kind in ("AND", "OR", "NOT") and node.args and isinstance(node.args[0], RuleNode):
+        child_neg = (not negated) if node.kind == "NOT" else negated
+        any_changed = False
+        removed_all = []
+        sub_has_neg = False
+        for child in node.args:
+            c_changed, c_comment, c_rem, c_neg = _transform_rule_ast(child, negated=child_neg)
+            if c_comment:
+                return True, True, [], True
+            any_changed = any_changed or c_changed
+            removed_all.extend(c_rem)
+            sub_has_neg = sub_has_neg or c_neg
+        removed_self = [opt for opt in node.options if opt in V5PLUS_ONLY_RULE_OPTIONS]
+        if removed_self:
+            if "extended-matching" in removed_self and sub_has_neg:
+                return True, True, [], True
+            node.options = [opt for opt in node.options if opt not in V5PLUS_ONLY_RULE_OPTIONS]
+            any_changed = True
+            removed_all.extend(removed_self)
+        return any_changed, False, removed_all, sub_has_neg
+
+    # Leaf rule (or unparsed logical syntax fallback)
+    removed = [opt for opt in node.options if opt in V5PLUS_ONLY_RULE_OPTIONS]
+    if not removed:
+        return False, False, [], negated
+    if (negated or node.kind == "NOT") and "extended-matching" in removed:
+        return True, True, [], True
+    node.options = [opt for opt in node.options if opt not in V5PLUS_ONLY_RULE_OPTIONS]
+    return True, False, removed, negated
+
+
+def _collect_rule_ruleset_targets(node):
+    """Collect decoded RULE-SET targets referenced at any depth of a RuleNode."""
+    if node.kind == "RULE-SET" and node.args:
+        return [unquote(node.args[0])]
+    if node.kind in ("AND", "OR", "NOT") and node.args and isinstance(node.args[0], RuleNode):
+        out = []
+        for child in node.args:
+            out.extend(_collect_rule_ruleset_targets(child))
+        return out
+    return []
+
+
+def extract_rule_policy(line):
+    """Return the policy target from a live [Rule] line, or None."""
+    node = parse_rule_line(line)
+    return node.policy if node is not None else None
+
+
+def _is_live_final_rule(line):
+    """Return True if line is an active FINAL,... rule."""
+    node = parse_rule_line(line)
+    return node is not None and node.kind == "FINAL"
+
+
+# ---------------------------------------------------------------------------
+# Stats & File / Path Utilities
+# ---------------------------------------------------------------------------
+
 class ConversionStats:
-    """Edit bookkeeping, tracked per file so that edits recorded for a file
-    whose conversion is later discarded (abandoned managed config, orphan)
-    can be purged instead of misleading the final summary."""
+    """Edit bookkeeping, tracked per file so edits for discarded files can be purged."""
 
     def __init__(self):
         self.files_processed = []
@@ -195,6 +803,7 @@ class ConversionStats:
         self.deprecated_files = []
         self.abandoned_files = []    # managed configs we refused to convert
         self.stale_v4_files = []     # pre-existing -v4 files for abandoned managed configs
+        self.errors = []             # fatal v4 conversion errors that block emission
         self._commented_by_file = {}
         self._params_by_file = {}
 
@@ -239,36 +848,54 @@ class ConversionStats:
             print(f"放弃的托管配置数: {len(self.abandoned_files)}")
 
 
-V4_SUBDIR = "v4"
-
-
-def make_v4_filename(filepath):
-    """Generate the -v4 output filename inside the v4/ subdirectory.
+def make_v4_filename(filepath, output_dir=None):
+    """Generate the 1-to-1 -v4 output filename inside output_dir (default: v4/).
 
     Example: /path/to/profile.conf -> /path/to/v4/profile-v4.conf
     """
     p = Path(filepath)
-    return str(p.parent / V4_SUBDIR / (p.stem + "-v4" + p.suffix))
+    out_base = Path(output_dir) if output_dir is not None else (p.parent / V4_SUBDIR)
+    return str(out_base / (p.stem + "-v4" + p.suffix))
 
 
 def make_v4_relname(filename):
-    """Generate the -v4 basename for config-internal references.
-
-    All v4 files share the same v4/ subdirectory, so cross-references
-    between them use bare filenames without directory prefix.
-    Example: work-vps.dconf -> work-vps-v4.dconf
-    """
+    """Generate the bare -v4 basename for config-internal references."""
     p = Path(filename)
     return p.stem + "-v4" + p.suffix
 
 
-def backup_if_exists(filepath):
-    """If filepath exists, rename it with a -deprecated suffix.
+def _filename_too_long(directory, filename):
+    """Return True if filename cannot be created on directory's actual filesystem.
 
-    A pre-existing backup at the target name (kept by the user in an earlier
-    run) is moved to the trash first — os.rename would silently overwrite it,
-    destroying the only recoverable copy.
+    Probes the nearest existing ancestor directory via zero-write os.lstat()
+    (respecting APFS Unicode name units on macOS as well as 255-byte limits on
+    ext4/Linux) and guards against PC_PATH_MAX on the full target path.
     """
+    probe_dir = os.path.abspath(directory)
+    while probe_dir and not os.path.isdir(probe_dir):
+        parent = os.path.dirname(probe_dir)
+        if parent == probe_dir:
+            probe_dir = "."
+            break
+        probe_dir = parent
+    try:
+        os.lstat(os.path.join(probe_dir, filename))
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG:
+            return True
+    full_path = os.path.join(directory, filename)
+    try:
+        path_max = os.pathconf(probe_dir, "PC_PATH_MAX")
+        if path_max > 0 and len(os.fsencode(full_path)) >= path_max:
+            return True
+    except (OSError, ValueError, AttributeError):
+        pass
+    return False
+
+
+def backup_if_exists(filepath):
+    """If filepath exists, rename it with a -deprecated suffix (trashing any
+    pre-existing backup first so we never silently overwrite)."""
     if os.path.exists(filepath):
         p = Path(filepath)
         backup = str(p.with_stem(p.stem + "-deprecated"))
@@ -280,212 +907,124 @@ def backup_if_exists(filepath):
     return None
 
 
-def comment_line(line):
-    """Add # [V5+] prefix to a line."""
-    return f"# [V5+] {line}"
-
+# ---------------------------------------------------------------------------
+# Single-Line Direct-Hit Transforms
+# ---------------------------------------------------------------------------
 
 def extract_proxy_type(line):
-    """Extract proxy type from a proxy definition line.
-
-    Format: Name = type, host, port, params...
-    Returns the type string (lowercase) or None.
-    Proxy names may contain '#' (e.g. "Node #1"); commented lines are
-    rejected by the explicit prefix check, not by the name character class.
-    """
-    if line.lstrip().startswith("#"):
+    """Extract lowercase proxy type from a live proxy definition line, or None."""
+    if is_comment_line(line):
         return None
     m = re.match(r'^[^=]+=\s*(\w[\w-]*)', line)
-    if m:
-        return m.group(1).strip().lower()
+    return m.group(1).strip().lower() if m else None
+
+
+def extract_proxy_option(line, option_name):
+    """Return decoded value of option_name on a live [Proxy] line, or None."""
+    if is_comment_line(line) or "=" not in line:
+        return None
+    _, rhs = line.split("=", 1)
+    rhs_body, _ = split_inline_comment(rhs)
+    target = option_name.lower()
+    for token in _split_top_level_commas(rhs_body, track_parens=False)[1:]:
+        if "=" not in token or token.startswith('"'):
+            continue
+        k, v = token.split("=", 1)
+        if k.strip().lower() == target:
+            return unquote(v.strip())
     return None
-
-
-@dataclass
-class ProxyGroupLine:
-    """Structured representation of a Surge Proxy Group definition line."""
-    name: str
-    group_type: str
-    members: list      # raw tokens, quotes preserved
-    options: list      # ordered list of (key, value) tuples
-
-
-@dataclass
-class FileState:
-    """Intermediate state for one file during the three-phase conversion pipeline."""
-    abs_path: str
-    original: str                # raw file content
-    converted: str               # content after direct-hit transforms (and later cascade)
-    is_managed: bool
-    default_section: str = None  # for files without explicit section headers
-    is_abandoned: bool = False   # managed + changed → decided during analyze()
-    output_written: bool = False # set during emit()
-    output_path: str = None      # destination if written
-    # Cascade fields (populated during Discover, consumed during Analyze)
-    lines: list = field(default_factory=list)          # mutable working copy of converted
-    sections: list = field(default_factory=list)       # per-line section name
-    owned_proxies: set = field(default_factory=set)    # proxy names defined in this file
-    owned_groups: set = field(default_factory=set)     # group names defined in this file
-    deleted_names: set = field(default_factory=set)    # names removed (propagates cascade)
-    self_deleted: set = field(default_factory=set)     # subset killed by THIS file's own line
-
-
-def parse_proxy_group_line(line):
-    """Parse a Surge Proxy Group definition line.
-
-    Returns a ProxyGroupLine or None if the line is not a group definition
-    (comment, section header, empty line, etc.).
-    """
-    stripped = line.lstrip()
-    if not stripped or stripped.startswith("#") or stripped.startswith("["):
-        return None
-    if "=" not in line:
-        return None
-
-    name_part, rest = line.split("=", 1)
-    name = name_part.strip()
-    if not name:
-        return None
-
-    tokens = _split_top_level_commas(rest)
-    if not tokens or not tokens[0]:
-        return None
-
-    group_type = tokens[0]
-    members = []
-    options = []
-    for token in tokens[1:]:
-        if not token:
-            continue
-        if "=" in token and not token.startswith('"'):
-            key, value = token.split("=", 1)
-            options.append((key.strip(), value.strip()))
-        else:
-            members.append(token)
-
-    return ProxyGroupLine(name=name, group_type=group_type, members=members, options=options)
-
-
-def format_proxy_group_line(pgl):
-    """Format a ProxyGroupLine back into a config line (stable round-trip)."""
-    parts = [pgl.group_type]
-    parts.extend(pgl.members)
-    parts.extend(f"{k}={v}" for k, v in pgl.options)
-    return f"{pgl.name} = " + ", ".join(parts)
-
-
-# Known trailing options that can follow the policy in a rule line
-RULE_TRAILING_OPTIONS = {
-    "no-resolve",
-    "force-remote-dns",
-    "extended-matching",
-    "dns-failed",
-    "pre-matching",
-}
-
-
-def _split_top_level_commas(s):
-    """Split a string by commas at depth 0, outside of balanced parentheses
-    AND outside of double quotes.
-
-    Used for rule lines (AND/OR/NOT compound criteria wrapped in parens) and
-    for proxy group member lists, where quoted names like "HK, Fast" must
-    stay a single token.
-    """
-    parts = []
-    depth = 0
-    in_quote = False
-    start = 0
-    for i, ch in enumerate(s):
-        if ch == '"':
-            in_quote = not in_quote
-        elif in_quote:
-            continue
-        elif ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-        elif ch == "," and depth == 0:
-            parts.append(s[start:i])
-            start = i + 1
-    parts.append(s[start:])
-    return [p.strip() for p in parts]
-
-
-def parse_include_list(line):
-    """Parse a #!include line into a list of path/url entries, or None.
-
-    Returns None if the line is not an #!include directive.
-    """
-    m = re.match(r'^\s*#!include\s+(.+)$', line)
-    if not m:
-        return None
-    return [p.strip() for p in m.group(1).split(",") if p.strip()]
-
-
-def format_include_list(entries):
-    """Format a list of entries back into a #!include line.
-
-    Returns None if the list is empty (caller should comment the whole line).
-    """
-    if not entries:
-        return None
-    return "#!include " + ", ".join(entries)
-
-
-def _rule_policy_index(tokens):
-    """Return the index of the policy among a rule line's top-level tokens,
-    or 0 if none is found.
-
-    Walks from the end, skipping known trailing option keywords and
-    key=value option pairs; the first remaining token is the policy.
-    """
-    i = len(tokens) - 1
-    while i > 0 and (tokens[i] in RULE_TRAILING_OPTIONS
-                     or ("=" in tokens[i] and not tokens[i].startswith('"'))):
-        i -= 1
-    return i
-
-
-def extract_rule_policy(line):
-    """Return the policy target from a rule line, or None if not a rule."""
-    stripped = line.lstrip()
-    if not stripped or stripped.startswith("#") or stripped.startswith("["):
-        return None
-    tokens = _split_top_level_commas(stripped)
-    i = _rule_policy_index(tokens)
-    return tokens[i] if i > 0 else None
 
 
 def remove_proxy_params(line, params_to_remove):
     """Remove specific key=value parameters from a proxy line.
 
+    Quote- and inline-comment-aware (with track_parens=False so unquoted
+    passwords containing '(' stay intact). Preserves untouched spacing verbatim.
     Returns (modified_line, list_of_removed_param_names).
     """
+    if "=" not in line:
+        return line, []
+    lhs, rhs = line.split("=", 1)
+    rhs_body, trailing = split_inline_comment(rhs)
+    targets = {p.lower() for p in params_to_remove}
+    spans = _split_top_level_comma_spans(rhs_body, track_parens=False)
+    if len(spans) <= 1:
+        return line, []
+
+    drop_ranges = []
     removed = []
-    for param in params_to_remove:
-        # Match param=value where value can be quoted or unquoted
-        # Handle: param=value, param="value", param='value'
-        pattern = r',\s*' + re.escape(param) + r'=["\']?[^,]*["\']?'
-        new_line, n = re.subn(pattern, '', line)
-        if n > 0:
-            line = new_line
-            removed.append(param)
-    return line, removed
+    for idx in range(1, len(spans)):
+        start, end = spans[idx]
+        token = rhs_body[start:end].strip()
+        if "=" not in token or token.startswith('"'):
+            continue
+        key, _ = token.split("=", 1)
+        norm_key = key.strip().lower()
+        if norm_key in targets:
+            drop_ranges.append((start - 1, end))
+            if norm_key not in removed:
+                removed.append(norm_key)
+
+    if not drop_ranges:
+        return line, []
+
+    out = []
+    cursor = 0
+    for d_start, d_end in drop_ranges:
+        out.append(rhs_body[cursor:d_start])
+        cursor = d_end
+    out.append(rhs_body[cursor:])
+    return lhs + "=" + "".join(out) + trailing, removed
+
+
+def _replace_proxy_option_value(line, option_name, old_value, new_value):
+    """Replace exact key=old_value with key=new_value in a proxy line's RHS,
+    ignoring LHS, quoted values, and inline comments. Returns (line, count)."""
+    if "=" not in line:
+        return line, 0
+    lhs, rhs = line.split("=", 1)
+    rhs_body, trailing = split_inline_comment(rhs)
+    target = option_name.lower()
+    spans = _split_top_level_comma_spans(rhs_body, track_parens=False)
+    if len(spans) <= 1:
+        return line, 0
+    replacements = []
+    for idx in range(1, len(spans)):
+        start, end = spans[idx]
+        seg = rhs_body[start:end]
+        stripped = seg.strip()
+        if "=" not in stripped or stripped.startswith('"'):
+            continue
+        eq_rel = seg.find("=")
+        key = seg[:eq_rel].strip().lower()
+        val_part = seg[eq_rel + 1:]
+        val_stripped = val_part.strip()
+        if key == target and val_stripped == old_value:
+            val_lead = len(val_part) - len(val_part.lstrip())
+            v_start = start + eq_rel + 1 + val_lead
+            v_end = v_start + len(val_stripped)
+            replacements.append((v_start, v_end))
+    if not replacements:
+        return line, 0
+    out = []
+    cursor = 0
+    for v_start, v_end in replacements:
+        out.append(rhs_body[cursor:v_start])
+        out.append(new_value)
+        cursor = v_end
+    out.append(rhs_body[cursor:])
+    return lhs + "=" + "".join(out) + trailing, len(replacements)
 
 
 def v5plus_only_proxy_reason(line):
-    """Why an uncommented proxy line cannot exist in v4 at all, or None.
-
-    Covers v5+ only proxy types and snell versions with no v4 equivalent.
-    """
+    """Why an uncommented proxy line cannot exist in v4 at all, or None."""
     proxy_type = extract_proxy_type(line)
     if proxy_type in V5PLUS_ONLY_PROXY_TYPES:
         return proxy_type
     if proxy_type == "snell":
-        m = _SNELL_VERSION_RE.search(line)
-        if m and int(m.group(1)) > SNELL_MAX_V4_VERSION:
-            return f"snell version={m.group(1)}"
+        ver = extract_proxy_option(line, "version")
+        if ver is not None and ver.isdigit() and int(ver) > SNELL_MAX_V4_VERSION:
+            return f"snell version={ver}"
     return None
 
 
@@ -496,34 +1035,30 @@ def _replace_group(regex, line, value):
 
 
 def snell_legacy_line(line, legacy):
-    """Point a snell version=6+ node at the server's v4-compatible instance:
-    version becomes 4 and each overridden field takes its value."""
-    line = _replace_group(_SNELL_VERSION_RE, line, "4")
+    """Point a snell version=6+ node at the server's v4-compatible instance."""
+    body, trailing = split_inline_comment(line)
+    body = _replace_group(_SNELL_VERSION_RE, body, "4")
     for key, value in legacy.items():
-        line = _replace_group(_SNELL_LEGACY_FIELD_RES[key], line, value)
-    return line
+        body = _replace_group(_SNELL_LEGACY_FIELD_RES[key], body, value)
+    return body + trailing
 
 
 def transform_proxy_line(line, stats, filename, line_num, section, legacy=None):
-    """Transform a single proxy line in [Proxy] section.
-
-    legacy: this file's snell override ({field: value}) or None. Only field
-    names ever reach the change log, never values.
-    """
+    """Transform a single live line in [Proxy] section."""
     proxy_type = extract_proxy_type(line)
     if not proxy_type:
         return line
 
-    name = line.split('=', 1)[0].strip()
+    name = line.split("=", 1)[0].strip()
 
-    # Comment out proxies v4 cannot use (v5+ only types, snell version=6+),
-    # unless the file's server keeps a v4-compatible snell instance.
     reason = v5plus_only_proxy_reason(line)
     if reason and legacy and proxy_type == "snell":
         line = snell_legacy_line(line, legacy)
         stats.count_params(filename, 1 + len(legacy))
-        stats.add_change(filename, line_num, section, f"{reason} → version=4",
-                         f"{name} (旧版实例: {', '.join(legacy)})")
+        stats.add_change(
+            filename, line_num, section, f"{reason} → version=4",
+            f"{name} (旧版实例: {', '.join(legacy)})",
+        )
         reason = None
     if reason:
         stats.count_commented(filename)
@@ -532,22 +1067,19 @@ def transform_proxy_line(line, stats, filename, line_num, section, legacy=None):
 
     modified = line
 
-    # Snell version=5 → version=4
     if proxy_type == "snell":
-        new, n = re.subn(r'version\s*=\s*5\b', 'version=4', modified)
+        new, n = _replace_proxy_option_value(modified, "version", "5", "4")
         if n:
             modified = new
             stats.count_params(filename, n)
             stats.add_change(filename, line_num, section, "version=5 → version=4", name)
 
-    # shadow-tls-version=3 → shadow-tls-version=2
-    new, n = re.subn(r'shadow-tls-version\s*=\s*3\b', 'shadow-tls-version=2', modified)
+    new, n = _replace_proxy_option_value(modified, "shadow-tls-version", "3", "2")
     if n:
         modified = new
         stats.count_params(filename, n)
         stats.add_change(filename, line_num, section, "shadow-tls-version=3 → 2", name)
 
-    # Remove v5+ only parameters
     modified, removed = remove_proxy_params(modified, V5PLUS_ONLY_PROXY_PARAMS)
     stats.count_params(filename, len(removed))
     for param in removed:
@@ -557,18 +1089,14 @@ def transform_proxy_line(line, stats, filename, line_num, section, legacy=None):
 
 
 def is_proxy_definition(body):
-    """Strictly check that body is a complete proxy definition:
-    name = type, host, port[, key=value...] with a known host/port type.
-
-    Used to tell commented-out nodes from free-form comment text, so it
-    rejects anything it cannot fully account for.
-    """
+    """Strictly check that body is `name = type, host, port[, key=value...]`."""
     if "=" not in body:
         return False
     name, rest = body.split("=", 1)
     if not name.strip():
         return False
-    tokens = _split_top_level_commas(rest)
+    rhs_body, _ = split_inline_comment(rest)
+    tokens = _split_top_level_commas(rhs_body, track_parens=False)
     if len(tokens) < 3 or tokens[0].lower() not in HOST_PORT_PROXY_TYPES:
         return False
     host, port = tokens[1], tokens[2]
@@ -578,13 +1106,7 @@ def is_proxy_definition(body):
 
 
 def transform_commented_proxy_line(line, stats, filename, line_num, section):
-    """Apply the proxy-line transforms to a commented-out node, keeping the
-    comment prefix verbatim, so uncommenting it in v4 yields a v4-valid node.
-
-    Free-form comments, converter tags and nodes v4 cannot use (v5+ only
-    types, snell version=6+: already disabled; a "# [V5+]" tag on top would
-    add nothing) are returned unchanged.
-    """
+    """Apply proxy-line transforms to a commented-out node, preserving prefix."""
     if line.startswith(("# [V5+] ", CASCADE_TAG)):
         return line
     m = _COMMENT_PREFIX_RE.match(line)
@@ -597,94 +1119,60 @@ def transform_commented_proxy_line(line, stats, filename, line_num, section):
 
 
 def transform_proxy_group_line(line, stats, filename, line_num, section):
-    """Transform a single line in [Proxy Group] section.
-
-    Only direct hits (smart → url-test). policy-path reference rewriting
-    happens later in Pipeline._rewrite_references, once every sub-file's
-    final converted/abandoned status is known.
-    """
-    if line.startswith("#"):
+    """Transform direct hits in [Proxy Group] section (smart -> url-test)."""
+    if is_comment_line(line):
         return line
-
-    modified = line
-
-    # smart → url-test
-    m = re.match(r'^([^=]+=\s*)smart\b(.*)', modified)
+    m = re.match(r'^([^=]+=\s*)smart\b(.*)', line)
     if m:
-        name = line.split('=', 1)[0].strip()
-        modified = m.group(1) + "url-test" + m.group(2)
+        name = line.split("=", 1)[0].strip()
         stats.count_params(filename)
         stats.add_change(filename, line_num, section, "smart → url-test", name)
-
-    return modified
+        return m.group(1) + "url-test" + m.group(2)
+    return line
 
 
 def transform_rule_line(line, stats, filename, line_num, section):
-    """Transform a single line in [Rule] section."""
+    """Transform a single line in [Rule] section via unified RuleNode AST."""
     stripped = line.lstrip()
-    if stripped.startswith("#"):
+    if not stripped or is_comment_line(stripped):
         return line
 
-    for rule_type in V5PLUS_ONLY_RULE_TYPES:
-        if stripped.startswith(rule_type + ","):
-            stats.count_commented(filename)
-            stats.add_change(filename, line_num, section, "注释", stripped)
-            return comment_line(line)
+    node = parse_rule_line(line)
+    if node is None:
+        return line
 
-    # v5+ only rule types nested inside AND/OR/NOT compound criteria,
-    # e.g. AND,((DOMAIN-WILDCARD,*bar*),(DEST-PORT,443)),DIRECT
-    if _V5PLUS_NESTED_RULE_RE.search(stripped):
+    changed, must_comment, removed, _ = _transform_rule_ast(node, negated=False)
+    if must_comment:
         stats.count_commented(filename)
         stats.add_change(filename, line_num, section, "注释", stripped)
         return comment_line(line)
+    if not changed:
+        return line
 
-    # Strip v5+ only options after the policy, e.g.
-    # RULE-SET,<url>,REJECT,extended-matching → RULE-SET,<url>,REJECT
-    tokens = _split_top_level_commas(stripped)
-    i = _rule_policy_index(tokens)
-    if i == 0:
-        return line
-    options = tokens[i + 1:]
-    removed = [t for t in options if t in V5PLUS_ONLY_RULE_OPTIONS]
-    if not removed:
-        return line
-    kept = tokens[:i + 1] + [t for t in options if t not in V5PLUS_ONLY_RULE_OPTIONS]
-    rule = ",".join(kept)
+    indent = line[:len(line) - len(stripped)]
+    rendered = render_rule_node(node)
     stats.count_params(filename, len(removed))
     for opt in removed:
-        stats.add_change(filename, line_num, section, "移除参数", f"{opt} ({rule})")
-    return line[:len(line) - len(stripped)] + rule
+        stats.add_change(filename, line_num, section, "移除参数", f"{opt} ({rendered})")
+    return indent + rendered
 
 
 def transform_general_line(line, stats, filename, line_num, section):
     """Transform a single line in [General] section."""
     stripped = line.lstrip()
-    if stripped.startswith("#"):
+    if is_comment_line(stripped):
         return line
-
     for param in V5PLUS_ONLY_GENERAL_PARAMS:
         if re.match(rf'^{re.escape(param)}\s*=', stripped):
             stats.count_commented(filename)
             stats.add_change(filename, line_num, section, "注释", param)
             return comment_line(line)
-
     return line
 
 
 def convert_content(content, base_dir, stats, processed_files, default_section=None, filename="",
                     legacy=None):
-    """Convert configuration content from v5+ to v4 format (direct hits only).
-
-    Args:
-        base_dir, processed_files: kept for signature compatibility; sub-file
-                         discovery and reference rewriting now live in Pipeline.
-        default_section: If set, treat lines before any [Section] header
-                         as belonging to this section. Used for included files
-                         that lack section headers.
-        legacy: this file's snell override, see transform_proxy_line.
-
-    Returns the converted content string.
-    """
+    """Convert configuration content from v5+ to v4 format (direct hits only)."""
     lines = content.splitlines()
     result = []
     current_section = default_section
@@ -693,44 +1181,32 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
     for line_num, line in enumerate(lines, 1):
         stripped = line.strip()
 
-        # Detect section headers
-        section_match = re.match(r'^\[(.+)\]$', stripped)
-        if section_match:
-            section_name = section_match.group(1)
-            if section_name in V5PLUS_ONLY_SECTIONS:
+        section_name = parse_section_header(line, include_v5_commented=False)
+        if section_name is not None:
+            if is_v5plus_only_section(section_name):
                 in_v5plus_only_section = True
                 current_section = section_name
                 stats.count_commented(filename)
                 stats.add_change(filename, line_num, current_section, "注释段", f"[{section_name}]")
                 result.append(comment_line(line))
                 continue
-            else:
-                in_v5plus_only_section = False
-                current_section = section_name
-                result.append(line)
-                continue
+            in_v5plus_only_section = False
+            current_section = section_name
+            result.append(line)
+            continue
 
-        # If inside a v5+ only section, comment everything
         if in_v5plus_only_section:
-            if stripped:  # Don't comment empty lines
+            if stripped:
                 stats.count_commented(filename)
                 result.append(comment_line(line))
             else:
                 result.append(line)
             continue
 
-        # Comments and #!include directives pass through untouched here.
-        # Include reference rewriting happens later in the pipeline
-        # (Pipeline._rewrite_references), once sub-file outcomes are known.
-        # Commented-out nodes ("#", ";" or "//" in [Proxy]) never decide
-        # whether a file needs conversion; they are rewritten only in files
-        # that get emitted anyway (Pipeline._convert_commented_proxies).
-        if stripped.startswith("#") or (
-                current_section == "Proxy" and _COMMENT_PREFIX_RE.match(line)):
+        if stripped.startswith("#!") or is_comment_line(line):
             result.append(line)
             continue
 
-        # Apply section-specific transformations
         if current_section == "General":
             result.append(transform_general_line(line, stats, filename, line_num, current_section))
         elif current_section == "Proxy":
@@ -743,41 +1219,72 @@ def convert_content(content, base_dir, stats, processed_files, default_section=N
         else:
             result.append(line)
 
-    joined = "\n".join(result)
-    if content.endswith("\n"):
-        joined += "\n"
-    return joined
+    return _serialize_lines(result, content)
+
+
+# ---------------------------------------------------------------------------
+# Layer 4 & 5: Pipeline (discover -> analyze -> emit)
+# ---------------------------------------------------------------------------
+
+def _section_is_loaded(loaded_set, section):
+    """Return True if section is loaded (None means all sections, i.e. root)."""
+    return loaded_set is None or section in loaded_set
+
+
+def _wireguard_keys_complete(keys):
+    """Return True if keys satisfy Surge's required [WireGuard <name>] fields."""
+    return (
+        "private-key" in keys
+        and ("self-ip" in keys or "self-ip-v6" in keys)
+        and "peer" in keys
+    )
+
+
+@dataclass
+class FileState:
+    """Intermediate state for one file during the three-phase conversion pipeline."""
+    abs_path: str
+    original: str
+    converted: str
+    is_managed: bool
+    default_section: str = None
+    is_abandoned: bool = False
+    output_written: bool = False
+    output_path: str = None
+    lines: list = field(default_factory=list)
+    sections: list = field(default_factory=list)
+    group_records: dict = field(default_factory=dict)  # line_idx -> _GroupRecordIR
+    owned_proxies: set = field(default_factory=set)
+    owned_groups: set = field(default_factory=set)
+    owned_wireguard_sections: list = field(default_factory=list)
+    owned_rulesets: set = field(default_factory=set)
+    has_unexpanded_wg_wildcard: bool = False
+    has_unexpanded_ruleset_wildcard: bool = False
+    managed_wildcard_targets: set = field(default_factory=set)
+    wg_lost_remote: set = field(default_factory=set)
+    deleted_names: set = field(default_factory=set)
+    self_deleted: set = field(default_factory=set)
 
 
 class Pipeline:
-    """Three-phase converter: discover → analyze → emit.
+    """Three-phase converter: discover -> analyze -> emit."""
 
-    The pipeline owns the dict of FileState for the root file and all
-    recursively-discovered dependencies. Analyze and emit iterate over this
-    shared dict — this is what makes cross-file cascade cleanup possible.
-    """
-
-    def __init__(self, stats, processed_files=None, snell_legacy=None):
+    def __init__(self, stats, processed_files=None, snell_legacy=None, output_dir=None):
         self.stats = stats
-        self.snell_legacy = snell_legacy or {}  # source basename → {field: value}
-        self.files = {}  # abs_path → FileState (insertion order = discovery order)
+        self.snell_legacy = snell_legacy or {}
+        self.output_dir = os.path.abspath(output_dir) if output_dir is not None else None
+        self.files = {}                  # abs_path -> FileState (insertion order = root first)
         self.processed_files = processed_files if processed_files is not None else {}
-        self.abandoned_files = set()    # absolute paths of managed files we refused
-        self.global_deleted = set()     # union of all names deleted anywhere
-        self.reachable = set()          # final root-reachable set, settled by analyze()
-        self.emitting = set()           # files that get a -v4 copy, settled by analyze()
+        self.abandoned_files = set()
+        self.global_deleted = set()
+        self.dead_wg_sections = set()
+        self.ruleset_wildcard_sources = {}  # host abs_path -> [target abs_path]
+        self.reachable = set()
+        self.emitting = set()
 
     def discover(self, input_path, default_section=None):
-        """Read a file, apply direct v5+ hits, and recurse into dependencies.
-
-        No decisions are made here beyond the direct-hit transforms —
-        abandonment and reference rewriting are analyze-phase concerns,
-        because cascade mutations can change a file's status after discovery.
-
-        Returns the FileState for this file, or None if not a valid /
-        readable file. Idempotent: calling twice on the same path returns
-        the cached state.
-        """
+        """Read a file, apply direct v5+ hits, build structured ProxyGroup IR,
+        and recurse into local dependencies."""
         abs_path = os.path.abspath(input_path)
         if abs_path in self.files:
             return self.files[abs_path]
@@ -785,8 +1292,6 @@ class Pipeline:
             return None
 
         try:
-            # utf-8-sig: strip a leading BOM, which would otherwise defeat
-            # #!MANAGED-CONFIG detection and first-line section headers.
             with open(abs_path, "r", encoding="utf-8-sig") as f:
                 original = f.read()
         except (OSError, UnicodeDecodeError) as e:
@@ -796,7 +1301,7 @@ class Pipeline:
         state = FileState(
             abs_path=abs_path,
             original=original,
-            converted=original,  # placeholder; replaced after convert_content
+            converted=original,
             is_managed=is_managed_config(original),
             default_section=default_section,
         )
@@ -811,15 +1316,26 @@ class Pipeline:
             legacy=self.snell_legacy.get(basename),
         )
 
-        # Populate cascade fields: split into mutable lines, sectionize, and
-        # catalog owned proxy / group names. Seed deleted_names with any
-        # v5+ proxy whose definition just got commented by direct-hit pass.
+        orig_lines = original.splitlines()
         state.lines = state.converted.splitlines()
         state.sections = compute_sections(state.lines, default_section)
+
+        # Catalog definitions and build structured [Proxy Group] IR ONCE.
         for i, line in enumerate(state.lines):
             section = state.sections[i]
+            live_header = parse_section_header(line, include_v5_commented=False)
+            if live_header and live_header.startswith("WireGuard ") and live_header != "WireGuard *":
+                wg_name = live_header[len("WireGuard "):].strip()
+                if wg_name and wg_name not in state.owned_wireguard_sections:
+                    state.owned_wireguard_sections.append(wg_name)
+                continue
+            if section and section.startswith("Ruleset ") and section != "Ruleset *":
+                rs_name = section[len("Ruleset "):].strip()
+                if rs_name:
+                    state.owned_rulesets.add(rs_name)
+                continue
             if section == "Proxy":
-                if line.startswith("# [V5+] "):
+                if line.startswith("# [V5+] ") and (i >= len(orig_lines) or line != orig_lines[i]):
                     raw = line[len("# [V5+] "):]
                     if "=" in raw:
                         name = raw.split("=", 1)[0].strip()
@@ -827,65 +1343,63 @@ class Pipeline:
                             deleted_name = unquote(name)
                             state.deleted_names.add(deleted_name)
                             state.self_deleted.add(deleted_name)
-                elif not line.lstrip().startswith("#") and "=" in line:
+                elif not is_comment_line(line) and "=" in line:
                     name = line.split("=", 1)[0].strip()
                     if name:
                         state.owned_proxies.add(unquote(name))
             elif section == "Proxy Group":
-                if not line.lstrip().startswith("#") and "=" in line:
-                    name = line.split("=", 1)[0].strip()
-                    if name:
-                        state.owned_groups.add(unquote(name))
+                rec = _build_group_record(line)
+                if rec is not None:
+                    state.group_records[i] = rec
+                    state.owned_groups.add(unquote(rec.name))
 
-        # Recurse into local #!include and policy-path references so every
-        # transitively referenced file lives in the shared FileState dict.
-        # policy-path detection is STRUCTURED (parse_proxy_group_line) — a
-        # whole-line regex would also match inside quoted member names like
-        # "policy-path=nodes.conf, Fast", which are identifiers, not refs.
+        # Recurse into local #!include, policy-path, and commented [WireGuard *]/[Ruleset *] includes.
         for i, line in enumerate(state.lines):
             stripped = line.lstrip()
+            section = state.sections[i]
             if stripped.startswith("#!include"):
                 for entry in parse_include_list(line) or []:
-                    self._discover_ref(base_dir, entry, state.sections[i])
-            elif state.sections[i] == "Proxy Group" and not stripped.startswith("#"):
-                pgl = parse_proxy_group_line(line)
-                if pgl is None:
-                    continue
-                for key, value in pgl.options:
-                    if key == "policy-path":
-                        # policy-path always references proxy list files
-                        self._discover_ref(base_dir, value, "Proxy")
+                    self._discover_ref(base_dir, entry, section)
+            elif (section in ("WireGuard *", "Ruleset *")
+                    and line.startswith("# [V5+] ")
+                    and (i >= len(orig_lines) or line != orig_lines[i])):
+                inner = line[len("# [V5+] "):]
+                if inner.lstrip().startswith("#!include"):
+                    for entry in parse_include_list(inner) or []:
+                        self._discover_ref(base_dir, entry, None)
+            elif i in state.group_records:
+                for opt in state.group_records[i].options:
+                    if opt.key.lower() == "policy-path" and opt.policy_path is not None:
+                        self._discover_ref(base_dir, opt.policy_path, "Proxy")
 
         return state
 
     def _discover_ref(self, base_dir, ref, default_section):
-        """Discover one local reference; URLs and missing files are ignored."""
-        if ref.startswith("http://") or ref.startswith("https://"):
+        if ref.startswith(("http://", "https://")):
             return
         abs_path = os.path.normpath(os.path.join(base_dir, ref))
         if os.path.isfile(abs_path):
             self.discover(abs_path, default_section=default_section)
 
-    def _pending_change(self, state):
-        """True if the file's working lines differ from its original content."""
-        return _serialize_lines(state.lines, state.original) != state.original
+    def _output_path(self, abs_path):
+        return make_v4_filename(abs_path, output_dir=self.output_dir)
+
+    def _pending_change(self, state, loaded_set=None):
+        """True if any loaded section of state differs from original (including
+        dirty or v5-escape-bearing [Proxy Group] IR records)."""
+        for idx, rec in state.group_records.items():
+            if _section_is_loaded(loaded_set, state.sections[idx]) and rec.needs_v4_writeback():
+                return True
+        if loaded_set is None:
+            return _serialize_lines(state.lines, state.original) != state.original
+        orig_lines = state.original.splitlines()
+        orig_sections = compute_sections(orig_lines, state.default_section)
+        orig_loaded = [l for l, s in zip(orig_lines, orig_sections) if s in loaded_set]
+        cur_loaded = [l for l, s in zip(state.lines, state.sections) if s in loaded_set]
+        return orig_loaded != cur_loaded
 
     def _live_local_refs(self, state):
-        """(abs_path, kind, section) for local files referenced by live
-        (non-commented) #!include / policy-path lines, resolved against the
-        file's directory.
-
-        `kind` is "include" or "policy-path"; `section` is the section the
-        reference line sits in. The two kinds are NOT interchangeable:
-        #!include merges the referenced file textually — every section of it
-        joins the profile — whereas policy-path imports only the [Proxy]
-        section ("if the content contains a [Proxy] section, the policies in
-        that section are used", Surge manual, Policy Including). Callers that
-        care which definitions actually reach the output must tell them apart.
-
-        Recomputed from current lines each call, so entries already stripped
-        by abandoned-reference cleanup no longer count.
-        """
+        """(abs_path, kind, section) for live #!include and policy-path refs."""
         refs = []
         base_dir = os.path.dirname(state.abs_path)
         for i, line in enumerate(state.lines):
@@ -895,201 +1409,536 @@ class Pipeline:
                     if not entry.startswith(("http://", "https://")):
                         refs.append((
                             os.path.normpath(os.path.join(base_dir, entry)),
-                            "include", state.sections[i]))
-            elif state.sections[i] == "Proxy Group" and not stripped.startswith("#"):
-                pgl = parse_proxy_group_line(line)
-                if pgl is None:
+                            "include", state.sections[i],
+                        ))
+            elif i in state.group_records:
+                rec = state.group_records[i]
+                if rec.commented_out:
                     continue
-                for key, value in pgl.options:
-                    if key == "policy-path" and not value.startswith(("http://", "https://")):
+                for opt in rec.options:
+                    if (opt.key.lower() == "policy-path"
+                            and opt.policy_path is not None
+                            and not opt.policy_path.startswith(("http://", "https://"))):
                         refs.append((
-                            os.path.normpath(os.path.join(base_dir, value)),
-                            "policy-path", state.sections[i]))
+                            os.path.normpath(os.path.join(base_dir, opt.policy_path)),
+                            "policy-path", state.sections[i],
+                        ))
         return refs
 
-    def _reachable_modes(self):
-        """abs_path → import mode, for every file the profile actually loads.
-
-        Two modes, propagated along the reference edges:
-          "full"  — the whole file joins the profile: the root itself, and
-                    anything a "full" file pulls in with #!include.
-          "proxy" — only the [Proxy] section is used: anything reached by a
-                    policy-path edge (Surge manual, Policy Including).
-
-        A "proxy" file's other sections do not exist as far as the profile is
-        concerned, so references sitting in them are NOT walked — Surge cannot
-        reach those files either, and names defined there never load. This is
-        what makes reachability mean "imported" rather than "mentioned
-        somewhere", at any depth.
-
-        Reaching a file both ways is normal; "full" wins and the file is
-        re-walked so the wider edge set is explored.
+    def _loaded_state(self):
+        """Return (loaded_sections, global_proxy_files) following exact Surge
+        Detached Profile Section semantics:
+          - #!include under [S] loads ONLY section [S] of target.
+          - policy-path under loaded [Proxy Group] loads ONLY [Proxy] privately
+            for the owning group (never enters global_proxy_files).
         """
-        modes = {}
+        loaded = {}
+        global_proxy_files = set()
         root_abs = next(iter(self.files))
         if self.files[root_abs].is_abandoned:
-            return modes
-        stack = [(root_abs, "full")]
+            return loaded, global_proxy_files
+        loaded[root_abs] = None
+        global_proxy_files.add(root_abs)
+        stack = [root_abs]
         while stack:
-            cur, mode = stack.pop()
-            if modes.get(cur) == "full" or modes.get(cur) == mode:
-                continue
-            modes[cur] = mode
+            cur = stack.pop()
+            cur_loaded = loaded[cur]
             for ref, kind, section in self._live_local_refs(self.files[cur]):
-                if mode == "proxy" and section != "Proxy":
+                if not _section_is_loaded(cur_loaded, section):
                     continue
                 sub = self.files.get(ref)
                 if sub is None or sub.is_abandoned:
                     continue
-                sub_mode = "full" if (mode == "full" and kind == "include") else "proxy"
-                stack.append((ref, sub_mode))
-        return modes
+                target_sec = "Proxy" if kind == "policy-path" else section
+                changed = False
+                if (kind == "include" and target_sec == "Proxy"
+                        and cur in global_proxy_files and ref not in global_proxy_files):
+                    global_proxy_files.add(ref)
+                    changed = True
+                prev = loaded.get(ref)
+                if prev is None and ref in loaded:
+                    pass
+                elif prev is None:
+                    loaded[ref] = {target_sec}
+                    changed = True
+                elif target_sec not in prev:
+                    prev.add(target_sec)
+                    changed = True
+                if changed:
+                    stack.append(ref)
+        return loaded, global_proxy_files
 
-    def _compute_reachable(self):
-        """Files reachable from the root through live (non-commented,
-        non-stripped) references of non-abandoned files.
-
-        NOT the same thing as "not abandoned": a normal sub-file whose only
-        parent is an abandoned managed config is unreachable — it won't be
-        emitted, so names it defines don't exist in the output.
-        """
-        return set(self._reachable_modes())
+    def _loaded_sections(self):
+        return self._loaded_state()[0]
 
     def _live_names(self):
-        """Names that still have a surviving definition in the output.
-
-        Surge flattens every emitted file into ONE namespace, so a name is dead
-        only if no emitted file defines it any more. Withdrawing the names of an
-        abandoned or unreachable file must therefore not kill a same-named
-        definition that lives on elsewhere — a root config with its own
-        `Proxy` group keeps it even when an abandoned airport profile happens
-        to define a `Proxy` group too.
-
-        Being loaded does not make every definition in a file live: a file
-        imported in "proxy" mode contributes its [Proxy] entries but NOT its
-        groups, because that section never reaches the profile.
-        """
+        """Global policy names (proxies from global_proxy_files + loaded groups)
+        that still have a surviving definition in the output."""
         live = set()
-        for abs_path, mode in self._reachable_modes().items():
+        loaded_map, global_proxy_files = self._loaded_state()
+        for abs_path, loaded_set in loaded_map.items():
             state = self.files[abs_path]
             if state.is_abandoned:
                 continue
-            names = set(state.owned_proxies)
-            if mode == "full":
+            names = set()
+            if abs_path in global_proxy_files:
+                names |= state.owned_proxies
+            if _section_is_loaded(loaded_set, "Proxy Group"):
                 names |= state.owned_groups
             live |= names - state.self_deleted
         return live
 
     def _emitting(self):
-        """Files that get a -v4 copy in v4/: all-or-nothing over the profile.
-
-        v4/ must be self-contained — references inside it are bare -v4 names
-        — so once anything in the loaded profile needs conversion, every file
-        it loads is emitted, unchanged ones as verbatim copies. Emitting only
-        the changed ones would leave the root pointing at `x.dconf` inside
-        v4/, where no such file exists. If nothing needs conversion, nothing
-        is emitted.
-
-        Shared by the abandonment loop and the reference-rewrite pass: a
-        managed file in this set would need a -v4 copy that Surge's refresh
-        overwrites, so it is abandoned BEFORE any rewrite happens.
-        """
-        reachable = self._reachable_modes()
-        if not any(self._pending_change(self.files[p]) for p in reachable):
+        """All-or-nothing over the loaded profile: emit every loaded file iff
+        at least one loaded section has a pending change."""
+        loaded = self._loaded_sections()
+        if not any(self._pending_change(self.files[p], secs) for p, secs in loaded.items()):
             return set()
-        return set(reachable)
+        return set(loaded)
+
+    def _abandon_state(self, state, loaded_set=None, is_global_proxy=False, wildcard_wg=False):
+        if state.is_abandoned:
+            return
+        state.is_abandoned = True
+        self.abandoned_files.add(state.abs_path)
+        if is_global_proxy:
+            self.global_deleted |= state.owned_proxies
+            self.global_deleted |= state.deleted_names
+        if _section_is_loaded(loaded_set, "Proxy Group"):
+            self.global_deleted |= state.owned_groups
+        for wg_name in state.owned_wireguard_sections:
+            if wildcard_wg or _section_is_loaded(loaded_set, f"WireGuard {wg_name}"):
+                self.dead_wg_sections.add(wg_name)
+
+    def _expand_wildcard_sections(self):
+        """Expand local non-managed [WireGuard *] includes into v4-valid
+        concrete [WireGuard <name>] blocks, and catalog [Ruleset *] sources
+        so references to commented inline rulesets cascade cleanly."""
+        # 1. Catalog [Ruleset *] sources (always dead in v4, managed or unmanaged)
+        for state in list(self.files.values()):
+            if state.is_managed:
+                continue
+            orig_lines = state.original.splitlines()
+            base_dir = os.path.dirname(state.abs_path)
+            for i, line in enumerate(state.lines):
+                if (state.sections[i] != "Ruleset *"
+                        or not line.startswith("# [V5+] ")
+                        or (i < len(orig_lines) and line == orig_lines[i])):
+                    continue
+                inner = line[len("# [V5+] "):]
+                if not inner.lstrip().startswith("#!include"):
+                    continue
+                sources = self.ruleset_wildcard_sources.setdefault(state.abs_path, [])
+                for entry in parse_include_list(inner) or []:
+                    if entry.startswith(("http://", "https://")):
+                        state.has_unexpanded_ruleset_wildcard = True
+                        continue
+                    target_abs = os.path.normpath(os.path.join(base_dir, entry))
+                    target = self.files.get(target_abs)
+                    if target is None:
+                        state.has_unexpanded_ruleset_wildcard = True
+                    elif target_abs not in sources:
+                        sources.append(target_abs)
+
+        # 2. Expand [WireGuard *] to fixpoint (handles chained & split-file includes)
+        expanded_any = True
+        while expanded_any:
+            expanded_any = False
+            for state in list(self.files.values()):
+                if state.is_managed:
+                    continue
+                base_dir = os.path.dirname(state.abs_path)
+                basename = os.path.basename(state.abs_path)
+                existing_wg = set(state.owned_wireguard_sections)
+                insertions = []  # (after_idx, [(wg_name, [entries...]), ...])
+
+                i = 0
+                n = len(state.lines)
+                while i < n:
+                    if state.sections[i] != "WireGuard *":
+                        i += 1
+                        continue
+                    last_nonempty = i
+                    entries = []
+                    while i < n and state.sections[i] == "WireGuard *":
+                        line = state.lines[i]
+                        if line.strip():
+                            last_nonempty = i
+                        if line.startswith("# [V5+] "):
+                            inner = line[len("# [V5+] "):]
+                            if inner.lstrip().startswith("#!include"):
+                                entries.extend(parse_include_list(inner) or [])
+                        i += 1
+                    expanded_by_wg = {}
+                    for entry in entries:
+                        if entry.startswith(("http://", "https://")):
+                            state.has_unexpanded_wg_wildcard = True
+                            continue
+                        target_abs = os.path.normpath(os.path.join(base_dir, entry))
+                        target = self.files.get(target_abs)
+                        if target is None:
+                            state.has_unexpanded_wg_wildcard = True
+                        elif target.is_managed:
+                            state.has_unexpanded_wg_wildcard = True
+                            if target.owned_wireguard_sections:
+                                state.managed_wildcard_targets.add(target_abs)
+                        else:
+                            if target.has_unexpanded_wg_wildcard:
+                                state.has_unexpanded_wg_wildcard = True
+                            for wg_name in target.owned_wireguard_sections:
+                                if wg_name in existing_wg:
+                                    continue
+                                bucket = expanded_by_wg.setdefault(wg_name, [])
+                                if entry not in bucket:
+                                    bucket.append(entry)
+                    to_expand = []
+                    for wg_name, wg_entries in expanded_by_wg.items():
+                        existing_wg.add(wg_name)
+                        state.owned_wireguard_sections.append(wg_name)
+                        to_expand.append((wg_name, wg_entries))
+                    if to_expand:
+                        insertions.append((last_nonempty, to_expand))
+
+                if insertions:
+                    # Insert right-to-left and shift group_records indices accurately
+                    for after_idx, items in reversed(insertions):
+                        new_lines = []
+                        for wg_name, wg_entries in items:
+                            joined = ", ".join(wg_entries)
+                            new_lines.append(f"[WireGuard {wg_name}]")
+                            new_lines.append(f"#!include {joined}")
+                            self.stats.add_change(
+                                basename, after_idx + 2, f"WireGuard {wg_name}",
+                                "展开通配段", f"[WireGuard {wg_name}] ← {joined}",
+                            )
+                        shift = len(new_lines)
+                        state.lines[after_idx + 1:after_idx + 1] = new_lines
+                        state.group_records = {
+                            (idx + shift if idx > after_idx else idx): rec
+                            for idx, rec in state.group_records.items()
+                        }
+                    state.sections = compute_sections(state.lines, state.default_section)
+                    expanded_any = True
+
+    def _strip_remote_wireguard_includes(self, loaded_map):
+        """Strip v5+/v6 remote URL #!include entries inside loaded concrete
+        [WireGuard <name>] sections (Mac 6.0.0+ Linked Profiles, invalid in v4)."""
+        for abs_path, loaded_set in loaded_map.items():
+            state = self.files[abs_path]
+            if state.is_abandoned:
+                continue
+            basename = os.path.basename(abs_path)
+            for i, line in enumerate(state.lines):
+                sec = state.sections[i]
+                if not (sec and sec.startswith("WireGuard ") and sec != "WireGuard *"):
+                    continue
+                if not _section_is_loaded(loaded_set, sec):
+                    continue
+                if not line.lstrip().startswith("#!include"):
+                    continue
+                entries = parse_include_list(line) or []
+                local_entries = [e for e in entries if not e.startswith(("http://", "https://"))]
+                remote_entries = [e for e in entries if e.startswith(("http://", "https://"))]
+                if not remote_entries:
+                    continue
+                wg_name = sec[len("WireGuard "):].strip()
+                state.wg_lost_remote.add(wg_name)
+                if local_entries:
+                    new_line = format_include_list(local_entries, _include_trailing_comment(line))
+                    state.lines[i] = _preserve_indent(line, new_line)
+                    self.stats.add_change(
+                        basename, i + 1, sec, "移除远端 include", ", ".join(remote_entries)
+                    )
+                else:
+                    state.lines[i] = comment_line(line)
+                    self.stats.count_commented(basename)
+                    self.stats.add_change(
+                        basename, i + 1, sec, "注释", f"远端 include ({', '.join(remote_entries)})"
+                    )
+
+    def _inspect_wireguard_section(self, abs_path, section_name, visited=None):
+        """Inspect a concrete [WireGuard <name>] section across local non-abandoned
+        #!include links, returning (defined_keys, lost_supply)."""
+        if visited is None:
+            visited = set()
+        if abs_path in visited:
+            return set(), False
+        visited.add(abs_path)
+        state = self.files.get(abs_path)
+        if state is None or state.is_abandoned:
+            return set(), True
+        base_dir = os.path.dirname(abs_path)
+        keys = set()
+        wg_name = section_name[len("WireGuard "):].strip() if section_name.startswith("WireGuard ") else ""
+        lost_supply = wg_name in state.wg_lost_remote
+        for i, line in enumerate(state.lines):
+            if state.sections[i] != section_name:
+                continue
+            stripped = line.lstrip()
+            if not stripped or parse_section_header(line, include_v5_commented=True) is not None:
+                continue
+            if stripped.startswith(CASCADE_TAG + "#!include"):
+                lost_supply = True
+                continue
+            if stripped.startswith("#!include"):
+                for entry in parse_include_list(line) or []:
+                    if entry.startswith(("http://", "https://")):
+                        lost_supply = True
+                        continue
+                    target = os.path.normpath(os.path.join(base_dir, entry))
+                    sub_keys, sub_lost = self._inspect_wireguard_section(target, section_name, visited)
+                    keys |= sub_keys
+                    lost_supply = lost_supply or sub_lost
+                continue
+            if is_comment_line(stripped):
+                continue
+            if "=" in stripped:
+                k = stripped.split("=", 1)[0].strip().lower()
+                if k:
+                    keys.add(k)
+        return keys, lost_supply
+
+    def _cleanup_dead_wireguard_sections(self, root_state):
+        """Cascade-comment concrete [WireGuard <name>] sections in root that lost
+        a supply and no longer satisfy Surge's required fields."""
+        root_abs = root_state.abs_path
+        basename = os.path.basename(root_abs)
+        i = 0
+        n = len(root_state.lines)
+        changed_any = False
+        while i < n:
+            hdr = parse_section_header(root_state.lines[i], include_v5_commented=False)
+            if not (hdr and hdr.startswith("WireGuard ") and hdr != "WireGuard *"):
+                i += 1
+                continue
+            wg_name = hdr[len("WireGuard "):].strip()
+            sec_start = i
+            i += 1
+            while i < n and root_state.sections[i] == hdr:
+                i += 1
+            sec_end = i
+            keys, lost_supply = self._inspect_wireguard_section(root_abs, hdr)
+            if lost_supply and not _wireguard_keys_complete(keys):
+                self.dead_wg_sections.add(wg_name)
+                for idx in range(sec_start, sec_end):
+                    stripped = root_state.lines[idx].lstrip()
+                    if not stripped:
+                        continue
+                    if idx == sec_start or not is_comment_line(stripped) or stripped.startswith("#!include"):
+                        root_state.lines[idx] = CASCADE_TAG + stripped
+                        self.stats.count_commented(basename)
+                        changed_any = True
+                self.stats.add_change(
+                    basename, sec_start + 1, hdr, "级联注释",
+                    f"[{hdr}] 缺少必需 WireGuard 字段",
+                )
+        if changed_any:
+            root_state.sections = compute_sections(root_state.lines, root_state.default_section)
+
+    def _root_live_wireguard_sections(self):
+        """Concrete [WireGuard <name>] sections actually live and usable in root."""
+        root_abs = next(iter(self.files))
+        root_state = self.files[root_abs]
+        if root_state.is_abandoned:
+            return set()
+        live_headers = set()
+        for line in root_state.lines:
+            hdr = parse_section_header(line, include_v5_commented=False)
+            if hdr and hdr.startswith("WireGuard ") and hdr != "WireGuard *":
+                live_headers.add(hdr[len("WireGuard "):].strip())
+        live = set()
+        for wg_name in root_state.owned_wireguard_sections:
+            if wg_name not in live_headers:
+                continue
+            keys, lost_supply = self._inspect_wireguard_section(root_abs, f"WireGuard {wg_name}")
+            if lost_supply:
+                if _wireguard_keys_complete(keys):
+                    live.add(wg_name)
+            elif keys:
+                live.add(wg_name)
+        return live
+
+    def _root_dead_rulesets(self):
+        """Return (dead_ruleset_names, has_unexpanded_ruleset_wildcard) for
+        commented inline [Ruleset <name>] / [Ruleset *] sections reachable from root.
+
+        Built-in rule sets (SYSTEM / LAN) always take precedence in Surge and
+        are never added to dead_ruleset_names.
+        """
+        root_abs = next(iter(self.files))
+        root_state = self.files[root_abs]
+        if root_state.is_abandoned:
+            return set(), False
+        dead = set(root_state.owned_rulesets)
+        has_unexpanded = root_state.has_unexpanded_ruleset_wildcard
+        seen = {root_abs}
+        queue = list(self.ruleset_wildcard_sources.get(root_abs, []))
+        while queue:
+            src_abs = queue.pop(0)
+            if src_abs in seen:
+                continue
+            seen.add(src_abs)
+            src = self.files.get(src_abs)
+            if src is None:
+                continue
+            if src.has_unexpanded_ruleset_wildcard:
+                has_unexpanded = True
+            dead |= src.owned_rulesets
+            queue.extend(self.ruleset_wildcard_sources.get(src_abs, []))
+        dead = {r for r in dead if r.upper() not in BUILTIN_RULESETS}
+        return dead, has_unexpanded
+
+    def _has_live_final(self, loaded_map, use_original=False):
+        """Return True if any loaded [Rule] section contains an active FINAL rule."""
+        for abs_path, loaded_set in loaded_map.items():
+            if not _section_is_loaded(loaded_set, "Rule"):
+                continue
+            state = self.files.get(abs_path)
+            if state is None or state.is_abandoned:
+                continue
+            if use_original:
+                lines = state.original.splitlines()
+                sections = compute_sections(lines, state.default_section)
+            else:
+                lines = state.lines
+                sections = state.sections
+            for line, sec in zip(lines, sections):
+                if sec == "Rule" and _is_live_final_rule(line):
+                    return True
+        return False
 
     def analyze(self):
-        """Cross-file cascade: abandonment, deleted-name propagation, and
-        per-file cleanup, iterated to a global fixpoint.
+        """Cross-file cascade fixpoint, structured IR reference rewrite,
+        single-pass v4 render, and pre-emit path validation."""
+        initial_loaded, initial_global = self._loaded_state()
+        ever_loaded_sections = {
+            p: (None if s is None else set(s)) for p, s in initial_loaded.items()
+        }
+        ever_global_proxy = set(initial_global)
 
-        Abandonment (managed file + any change) can arise from direct hits
-        OR from cascade mutations. Abandoning a file removes its names from
-        the global namespace, which can cascade further and dirty additional
-        managed files — so the whole sequence loops until no new file gets
-        abandoned. Only then are include / policy-path references rewritten,
-        when every file's final status is known.
-        """
+        def _record_loaded(loaded_map, global_proxy_files):
+            ever_global_proxy.update(global_proxy_files)
+            for p, secs in loaded_map.items():
+                if secs is None:
+                    ever_loaded_sections[p] = None
+                elif p not in ever_loaded_sections:
+                    ever_loaded_sections[p] = set(secs)
+                elif ever_loaded_sections[p] is not None:
+                    ever_loaded_sections[p].update(secs)
+
+        had_initial_final = self._has_live_final(initial_loaded, use_original=True)
+        self._expand_wildcard_sections()
+        _record_loaded(*self._loaded_state())
+
         while True:
-            # 1. Abandon any managed file that would need a -v4 copy (see
-            # _emitting). A -v4 copy of a managed profile would be
-            # overwritten by Surge's periodic refresh, so it must never be
-            # written. Its discarded names vanish from the global namespace.
-            # Re-evaluated per file: one abandonment can make another
-            # managed file unreachable, and unreachable is not abandoned.
+            # 1. Abandon any managed file that would need a -v4 copy
+            cur_loaded, cur_global = self._loaded_state()
+            emitting_now = self._emitting()
             for state in self.files.values():
-                if state.is_managed and not state.is_abandoned and state.abs_path in self._emitting():
-                    state.is_abandoned = True
-                    self.abandoned_files.add(state.abs_path)
-                    self.global_deleted |= state.owned_proxies
-                    self.global_deleted |= state.owned_groups
-                    self.global_deleted |= state.deleted_names
+                if state.is_managed and not state.is_abandoned and state.abs_path in emitting_now:
+                    self._abandon_state(
+                        state,
+                        loaded_set=cur_loaded.get(state.abs_path, set()),
+                        is_global_proxy=state.abs_path in cur_global,
+                    )
+            emitting_now = self._emitting()
+            cur_loaded, cur_global = self._loaded_state()
+            for state in self.files.values():
+                if state.is_abandoned or state.abs_path not in emitting_now:
+                    continue
+                for target_abs in state.managed_wildcard_targets:
+                    target = self.files.get(target_abs)
+                    if target is not None and not target.is_abandoned:
+                        self._abandon_state(
+                            target,
+                            loaded_set=cur_loaded.get(target_abs, set()),
+                            is_global_proxy=target_abs in cur_global,
+                            wildcard_wg=True,
+                        )
 
-            # 2. Merge direct-hit deletions from ALL files into global_deleted,
-            # then seed every non-abandoned file. Without this, a proxy
-            # commented in file A would not cascade into groups in file B.
-            for state in self.files.values():
+            # 2. Seed global deletions ONLY from global_proxy_files (never policy-path-only)
+            loaded_map, global_proxy_files = self._loaded_state()
+            _record_loaded(loaded_map, global_proxy_files)
+            for abs_path in global_proxy_files:
+                state = self.files[abs_path]
                 if not state.is_abandoned:
-                    self.global_deleted |= state.deleted_names
+                    self.global_deleted |= state.self_deleted
             live = self._live_names()
-            for state in self.files.values():
+            effective_deleted = self.global_deleted - live
+            for abs_path in loaded_map:
+                state = self.files[abs_path]
                 if state.is_abandoned:
                     continue
-                state.deleted_names |= self.global_deleted - live
+                if abs_path in global_proxy_files:
+                    state.deleted_names = set(effective_deleted)
+                else:
+                    state.deleted_names = set(effective_deleted) | set(state.self_deleted)
 
-            # 2a. Strip policy-path options pointing at abandoned files.
-            # May seed additional deletions (groups left without any member
-            # source), which are propagated immediately.
-            for state in self.files.values():
+            # 2a. Strip abandoned policy-path options & abandoned/remote #!include entries
+            for abs_path, loaded_set in loaded_map.items():
+                state = self.files[abs_path]
                 if state.is_abandoned:
                     continue
-                self._strip_abandoned_policy_paths(state)
+                if _section_is_loaded(loaded_set, "Proxy Group"):
+                    self._strip_abandoned_policy_paths(state)
+                self._strip_abandoned_includes(state, loaded_set=loaded_set)
+            self._strip_remote_wireguard_includes(loaded_map)
+            root_state = self.files[next(iter(self.files))]
+            if not root_state.is_abandoned:
+                self._cleanup_dead_wireguard_sections(root_state)
 
-            # 2b. Strip #!include entries pointing at abandoned files.
-            for state in self.files.values():
-                if state.is_abandoned:
-                    continue
-                self._strip_abandoned_includes(state)
+            live_wg_sections = self._root_live_wireguard_sections()
+            has_unexpanded_wg = root_state.has_unexpanded_wg_wildcard
+            dead_rulesets, has_unexpanded_rs = self._root_dead_rulesets()
 
-            # 3. Fixpoint across all non-abandoned files: each file's cascade
-            # may produce new deletions that must propagate to other files.
+            # 3. Fixpoint across loaded non-abandoned files (loaded sections only)
             changed = True
             while changed:
                 changed = False
-                for state in self.files.values():
+                loaded_map, global_proxy_files = self._loaded_state()
+                _record_loaded(loaded_map, global_proxy_files)
+                for abs_path, loaded_set in loaded_map.items():
+                    state = self.files[abs_path]
                     if state.is_abandoned:
                         continue
-                    before = set(state.deleted_names)
-                    self._cascade_single_file(state)
-                    new_deletions = state.deleted_names - before
-                    if new_deletions:
-                        self.global_deleted |= new_deletions
-                        propagated = new_deletions - self._live_names()
-                        for other in self.files.values():
-                            if other is not state and not other.is_abandoned:
-                                other.deleted_names |= propagated
+                    live_now = self._live_names()
+                    eff = self.global_deleted - live_now
+                    is_global_proxy = abs_path in global_proxy_files
+                    state.deleted_names = (
+                        set(eff) if is_global_proxy else (set(eff) | set(state.self_deleted))
+                    )
+                    before_self = set(state.self_deleted)
+                    self._cascade_single_file(
+                        state,
+                        loaded_set=loaded_set,
+                        is_global_proxy_file=is_global_proxy,
+                        live_wg_sections=live_wg_sections,
+                        has_unexpanded_wg=has_unexpanded_wg,
+                        dead_rulesets=dead_rulesets,
+                        has_unexpanded_rs=has_unexpanded_rs,
+                    )
+                    if state.self_deleted - before_self:
                         changed = True
 
-            # 3b. Withdraw names defined only in unreachable subtrees. A
-            # non-abandoned file whose every path from the root runs through
-            # an abandoned file is never emitted — names it defines don't
-            # exist in the output, so references to them must cascade too.
-            # New withdrawals need another full round (seed + strip + cascade).
-            self.reachable = self._compute_reachable()
+            # 3b. Withdraw names defined only in previously-loaded unreachable subtrees
+            self.reachable = set(self._loaded_sections())
             new_withdrawn = set()
             for state in self.files.values():
-                if state.is_abandoned or state.abs_path in self.reachable:
+                if (state.is_abandoned
+                        or state.abs_path in self.reachable
+                        or state.abs_path not in ever_loaded_sections):
                     continue
-                names = state.owned_proxies | state.owned_groups | state.deleted_names
+                names = set()
+                if state.abs_path in ever_global_proxy:
+                    names |= state.owned_proxies | state.deleted_names
+                if _section_is_loaded(ever_loaded_sections[state.abs_path], "Proxy Group"):
+                    names |= state.owned_groups
                 new_withdrawn |= names - self.global_deleted
             if new_withdrawn:
                 self.global_deleted |= new_withdrawn
                 continue
 
-            # 4. If the cascade just put a managed file into the emitting set
-            # (the profile became dirty, or the file itself changed), its
-            # abandonment must be processed by another round; otherwise
-            # we're stable.
+            # 4. Stop when no remaining non-abandoned managed file entered emitting set
             emitting = self._emitting()
             if not any(
                 s.is_managed and not s.is_abandoned and s.abs_path in emitting
@@ -1097,231 +1946,338 @@ class Pipeline:
             ):
                 break
 
-        # 5. Settle the emitting set, then rewrite include / policy-path
-        # references to -v4 names. Settled BEFORE the rewrite: afterwards
-        # references name -v4 files, and reachability can't be recomputed.
+        # 5. Global fixpoint converged: check FINAL invariant, rewrite references
+        #    on structured IR, then render modified [Proxy Group] IR ONCE to v4.
+        final_loaded = self._loaded_sections()
         self.emitting = self._emitting()
-        self._rewrite_references()
+        if self.emitting:
+            if had_initial_final and not self._has_live_final(final_loaded, use_original=False):
+                self.stats.errors.append(
+                    "级联清理后 [Rule] 缺少可用的 FINAL 规则（原 FINAL 指向已删除的策略或已放弃的文件），"
+                    "请为 v4 指定替代兜底策略；已停止导出。"
+                )
+            self._rewrite_references(final_loaded)
+            self._render_group_records(final_loaded)
 
-        # 6. Convert commented-out nodes in emitted files, then re-serialize
-        # converted content from mutated lines. Done after every decision so
-        # a comment alone never dirties a file (or abandons a managed one).
+        if self.stats.errors:
+            self.emitting = set()
+            return
+
+        # 6. Convert commented-out nodes in emitted files (loaded [Proxy] only),
+        #    serialize final text, and validate ALL planned output/backup paths.
         for state in self.files.values():
             if state.is_abandoned:
                 continue
             if state.abs_path in self.emitting:
-                self._convert_commented_proxies(state)
+                if _section_is_loaded(final_loaded.get(state.abs_path), "Proxy"):
+                    self._convert_commented_proxies(state)
             state.converted = _serialize_lines(state.lines, state.original)
 
+        if self.emitting:
+            self._validate_planned_output_paths()
+            if self.stats.errors:
+                self.emitting = set()
+
+    def _render_group_records(self, loaded_map):
+        """Render dirty or v5-escape-bearing [Proxy Group] IR records ONCE into
+        final Surge v4 syntax. No parser ever re-parses the line afterwards."""
+        for abs_path, loaded_set in loaded_map.items():
+            if not _section_is_loaded(loaded_set, "Proxy Group"):
+                continue
+            state = self.files[abs_path]
+            if state.is_abandoned:
+                continue
+            basename = os.path.basename(abs_path)
+            for idx, rec in sorted(state.group_records.items()):
+                if not rec.needs_v4_writeback():
+                    continue
+                if rec.commented_out:
+                    state.lines[idx] = rec.render_v4(allow_raw_iog=True)
+                    continue
+                try:
+                    new_line = rec.render_v4(allow_raw_iog=False)
+                except ValueError as exc:
+                    err_msg = f"{basename}:{idx + 1} [{rec.name}] {exc}"
+                    if err_msg not in self.stats.errors:
+                        self.stats.errors.append(err_msg)
+                    continue
+                if new_line != state.lines[idx]:
+                    if not rec.dirty and any(opt.iog_had_v5_escape for opt in rec.options):
+                        self.stats.count_params(basename)
+                        self.stats.add_change(
+                            basename, idx + 1, "Proxy Group", "v4 语法改写", rec.name
+                        )
+                    state.lines[idx] = new_line
+
     def _convert_commented_proxies(self, state):
-        """Give commented-out [Proxy] nodes the same transforms as live ones,
-        so uncommenting a node in the v4 copy yields a v4-valid line."""
         basename = os.path.basename(state.abs_path)
         for i, line in enumerate(state.lines):
             if state.sections[i] == "Proxy":
                 state.lines[i] = transform_commented_proxy_line(
-                    line, self.stats, basename, i + 1, "Proxy")
+                    line, self.stats, basename, i + 1, "Proxy"
+                )
 
-    def _rewrite_references(self):
-        """Point include / policy-path references at the -v4 names of files
-        that will actually be emitted, recording each rewrite in the
-        per-file change detail."""
-        for state in self.files.values():
+    def _rewrite_references(self, loaded_map):
+        """Point live #!include lines and [Proxy Group] policy-path IR options
+        at the -v4 names of files that will actually be emitted."""
+        for abs_path, loaded_set in loaded_map.items():
+            state = self.files[abs_path]
             if state.is_abandoned:
                 continue
-            base_dir = os.path.dirname(state.abs_path)
-            basename = os.path.basename(state.abs_path)
+            base_dir = os.path.dirname(abs_path)
+            basename = os.path.basename(abs_path)
             for i, line in enumerate(state.lines):
-                new_line, notes = self._rewrite_line_refs(line, state.sections[i], base_dir)
-                if new_line != line:
-                    state.lines[i] = new_line
-                    for note in notes:
-                        self.stats.add_change(
-                            basename, i + 1, state.sections[i] or "-", "引用改写", note)
-
-    def _rewrite_line_refs(self, line, section, base_dir):
-        """Rewrite one line's local references to -v4 names.
-
-        Returns (new_line, notes). policy-path handling is STRUCTURED
-        (parse_proxy_group_line options only) — quoted member names that
-        merely contain "policy-path=" are identifiers and must stay intact.
-        """
-        notes = []
-        stripped = line.lstrip()
-        if stripped.startswith("#!include"):
-            entries = parse_include_list(line)
-            if not entries:
-                return line, notes
-            new_entries = []
-            for entry in entries:
-                if not entry.startswith(("http://", "https://")):
-                    abs_path = os.path.normpath(os.path.join(base_dir, entry))
-                    if abs_path in self.emitting:
-                        new_entries.append(make_v4_relname(entry))
-                        notes.append(f"{entry} → {make_v4_relname(entry)}")
+                sec = state.sections[i]
+                if not _section_is_loaded(loaded_set, sec):
+                    continue
+                if line.lstrip().startswith("#!include"):
+                    entries = parse_include_list(line)
+                    if not entries:
                         continue
-                new_entries.append(entry)
-            if not notes:
-                return line, notes
-            return _preserve_indent(line, format_include_list(new_entries)), notes
-
-        if section == "Proxy Group" and not stripped.startswith("#"):
-            pgl = parse_proxy_group_line(line)
-            if pgl is None:
-                return line, notes
-            new_options = []
-            for key, value in pgl.options:
-                if key == "policy-path" and not value.startswith(("http://", "https://")):
-                    abs_path = os.path.normpath(os.path.join(base_dir, value))
-                    if abs_path in self.emitting:
-                        new_options.append((key, make_v4_relname(value)))
-                        notes.append(
-                            f"policy-path={value} → policy-path={make_v4_relname(value)}")
+                    new_entries = []
+                    notes = []
+                    for entry in entries:
+                        if not entry.startswith(("http://", "https://")):
+                            ref_abs = os.path.normpath(os.path.join(base_dir, entry))
+                            if ref_abs in self.emitting:
+                                rel_v4 = make_v4_relname(entry)
+                                new_entries.append(rel_v4)
+                                notes.append(f"{entry} → {rel_v4}")
+                                continue
+                        new_entries.append(entry)
+                    if notes:
+                        trailing = _include_trailing_comment(line)
+                        state.lines[i] = _preserve_indent(
+                            line, format_include_list(new_entries, trailing)
+                        )
+                        for note in notes:
+                            self.stats.add_change(basename, i + 1, sec or "-", "引用改写", note)
+                elif i in state.group_records:
+                    rec = state.group_records[i]
+                    if rec.commented_out:
                         continue
-                new_options.append((key, value))
-            if not notes:
-                return line, notes
-            pgl.options = new_options
-            return _preserve_indent(line, format_proxy_group_line(pgl)), notes
+                    for opt in rec.options:
+                        if (opt.key.lower() == "policy-path"
+                                and opt.policy_path is not None
+                                and not opt.policy_path.startswith(("http://", "https://"))):
+                            ref_abs = os.path.normpath(os.path.join(base_dir, opt.policy_path))
+                            if ref_abs in self.emitting:
+                                old_val = opt.policy_path
+                                rel_v4 = make_v4_relname(old_val)
+                                opt.policy_path = rel_v4
+                                opt.policy_path_dirty = True
+                                rec.dirty = True
+                                self.stats.add_change(
+                                    basename, i + 1, "Proxy Group", "引用改写",
+                                    f"policy-path={old_val} → policy-path={rel_v4}",
+                                )
 
-        return line, notes
+    def _cascade_single_file(self, state, loaded_set=None, is_global_proxy_file=True,
+                             live_wg_sections=None, has_unexpanded_wg=False,
+                             dead_rulesets=None, has_unexpanded_rs=False):
+        """Fixpoint over loaded sections: cascade deleted proxies/groups through
+        underlying-proxy, dead WireGuard sections, structured ProxyGroup IR, and
+        Rule AST policies & dead RULE-SET references."""
+        live_wg_sections = live_wg_sections if live_wg_sections is not None else set()
+        dead_rulesets = dead_rulesets if dead_rulesets is not None else set()
+        basename = os.path.basename(state.abs_path)
 
-    def _cascade_single_file(self, state):
-        """Fixpoint: remove deleted members from Proxy Group lines; if a group
-        loses all effective members due to OUR removals, tag it cascade and
-        add its name to deleted_names so it propagates in the next iteration."""
+        def _mark_deleted(deleted_name, global_scope=True):
+            state.self_deleted.add(deleted_name)
+            if global_scope:
+                self.global_deleted.add(deleted_name)
+                if deleted_name not in self._live_names():
+                    state.deleted_names.add(deleted_name)
+            else:
+                state.deleted_names.add(deleted_name)
+
         changed = True
         while changed:
             changed = False
             for i, line in enumerate(state.lines):
-                if state.sections[i] != "Proxy Group":
+                section = state.sections[i]
+                if not _section_is_loaded(loaded_set, section):
                     continue
-                if line.lstrip().startswith("#"):
+
+                if section == "Proxy":
+                    stripped = line.lstrip()
+                    if not stripped or is_comment_line(stripped) or "=" not in line:
+                        continue
+                    name = line.split("=", 1)[0].strip()
+                    if not name:
+                        continue
+                    underlying = extract_proxy_option(line, "underlying-proxy")
+                    if underlying and underlying in state.deleted_names:
+                        state.lines[i] = CASCADE_TAG + stripped
+                        _mark_deleted(unquote(name), global_scope=is_global_proxy_file)
+                        self.stats.count_commented(basename)
+                        self.stats.add_change(
+                            basename, i + 1, "Proxy", "级联注释",
+                            f"{name} (underlying-proxy={underlying})",
+                        )
+                        changed = True
+                        continue
+                    if extract_proxy_type(line) == "wireguard":
+                        wg_sec = extract_proxy_option(line, "section-name")
+                        if (wg_sec and wg_sec not in live_wg_sections
+                                and (wg_sec in self.dead_wg_sections or has_unexpanded_wg)):
+                            state.lines[i] = CASCADE_TAG + stripped
+                            _mark_deleted(unquote(name), global_scope=is_global_proxy_file)
+                            self.stats.count_commented(basename)
+                            self.stats.add_change(
+                                basename, i + 1, "Proxy", "级联注释",
+                                f"{name} (WireGuard {wg_sec})",
+                            )
+                            changed = True
                     continue
-                pgl = parse_proxy_group_line(line)
-                if pgl is None:
+
+                if section != "Proxy Group" or i not in state.group_records:
                     continue
-                original_members = list(pgl.members)
-                pgl.members = [
-                    m for m in original_members
-                    if unquote(m) not in state.deleted_names
-                ]
-                # include-other-group pointing at a deleted group is dead supply
-                original_options = list(pgl.options)
-                pgl.options = [
-                    (k, v) for k, v in original_options
-                    if not (k == "include-other-group"
-                            and unquote(v.strip()) in state.deleted_names)
-                ]
-                removed_tokens = (
-                    [m for m in original_members if m not in pgl.members]
-                    + [f"{k}={v}" for k, v in original_options if (k, v) not in pgl.options]
-                )
+                rec = state.group_records[i]
+                if rec.commented_out:
+                    continue
+
+                # Group-level underlying-proxy relay deleted -> cascade whole group
+                dead_relay = None
+                for opt in rec.options:
+                    if opt.key.lower() == "underlying-proxy":
+                        relay = unquote(opt.raw_value.strip())
+                        if relay in state.deleted_names:
+                            dead_relay = relay
+                            break
+                if dead_relay is not None:
+                    rec.commented_out = True
+                    rec.dirty = True
+                    _mark_deleted(unquote(rec.name), global_scope=True)
+                    self.stats.count_commented(basename)
+                    self.stats.add_change(
+                        basename, i + 1, "Proxy Group", "级联注释",
+                        f"{rec.name} (underlying-proxy={dead_relay})",
+                    )
+                    changed = True
+                    continue
+
+                orig_members = list(rec.members)
+                rec.members = [m for m in orig_members if unquote(m) not in state.deleted_names]
+                removed_tokens = [m for m in orig_members if m not in rec.members]
+
+                new_opts = []
+                for opt in rec.options:
+                    if opt.key.lower() == "include-other-group" and opt.iog_groups is not None:
+                        kept = [g for g in opt.iog_groups if g not in state.deleted_names]
+                        dropped = [g for g in opt.iog_groups if g in state.deleted_names]
+                        if not dropped:
+                            new_opts.append(opt)
+                        elif kept:
+                            opt.iog_groups = kept
+                            opt.iog_dirty = True
+                            new_opts.append(opt)
+                            removed_tokens.append(f"{opt.key}:{', '.join(dropped)}")
+                        else:
+                            removed_tokens.append(f"{opt.key}={opt.raw_value}")
+                    else:
+                        new_opts.append(opt)
+                rec.options = new_opts
+
                 if not removed_tokens:
                     continue  # D6: pre-existing empty groups left alone
-                if has_effective_members(pgl, state.deleted_names, abandoned_basenames=set()):
-                    new_line = _preserve_indent(line, format_proxy_group_line(pgl))
-                    if new_line != line:
-                        state.lines[i] = new_line
-                        basename = os.path.basename(state.abs_path)
-                        self.stats.add_change(
-                            basename, i + 1, "Proxy Group", "级联移除成员",
-                            f"{pgl.name}: {', '.join(removed_tokens)}")
-                        changed = True
+                rec.dirty = True
+                if rec.has_effective_members(state.deleted_names, self.abandoned_files, base_dir=os.path.dirname(state.abs_path)):
+                    self.stats.add_change(
+                        basename, i + 1, "Proxy Group", "级联移除成员",
+                        f"{rec.name}: {', '.join(removed_tokens)}",
+                    )
+                    changed = True
                 else:
-                    # Tag the REFORMATTED (post-cleanup) line so the cascade
-                    # comment shows the group in its cleaned state.
-                    reformatted = _preserve_indent(line, format_proxy_group_line(pgl))
-                    state.lines[i] = CASCADE_TAG + reformatted.lstrip()
-                    deleted_name = unquote(pgl.name)
-                    state.deleted_names.add(deleted_name)
-                    state.self_deleted.add(deleted_name)
-                    basename = os.path.basename(state.abs_path)
+                    rec.commented_out = True
+                    _mark_deleted(unquote(rec.name), global_scope=True)
                     self.stats.count_commented(basename)
-                    self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", pgl.name)
+                    self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", rec.name)
                     changed = True
 
-        # Post-fixpoint: comment out Rule lines whose policy is now deleted.
-        # Rules are leaf nodes — no secondary cascade can come from here.
+        # Post-fixpoint: comment out loaded [Rule] lines whose policy or RULE-SET is dead
+        if not _section_is_loaded(loaded_set, "Rule"):
+            return
+        base_dir = os.path.dirname(state.abs_path)
         for i, line in enumerate(state.lines):
             if state.sections[i] != "Rule":
                 continue
-            if line.lstrip().startswith("#"):
+            node = parse_rule_line(line)
+            if node is None:
                 continue
-            policy = extract_rule_policy(line)
-            if policy is None:
-                continue
-            if unquote(policy) in state.deleted_names:
-                state.lines[i] = CASCADE_TAG + line.lstrip()
-                basename = os.path.basename(state.abs_path)
+            stripped = line.lstrip()
+            if node.policy is not None and unquote(node.policy) in state.deleted_names:
+                state.lines[i] = CASCADE_TAG + stripped
                 self.stats.count_commented(basename)
                 self.stats.add_change(basename, i + 1, "Rule", "级联注释", line.strip())
+                continue
+            dead_rs = None
+            for target in _collect_rule_ruleset_targets(node):
+                if target.upper() in BUILTIN_RULESETS:
+                    continue
+                if target in dead_rulesets:
+                    dead_rs = f"内联规则集 {target} 在 v4 不可用"
+                    break
+                if (has_unexpanded_rs
+                        and not target.startswith(("http://", "https://"))
+                        and not os.path.isfile(os.path.normpath(os.path.join(base_dir, target)))):
+                    dead_rs = f"规则集 {target} 来源在 v4 不可用"
+                    break
+            if dead_rs is not None:
+                state.lines[i] = CASCADE_TAG + stripped
+                self.stats.count_commented(basename)
+                self.stats.add_change(
+                    basename, i + 1, "Rule", "级联注释", f"{line.strip()} ({dead_rs})"
+                )
 
     def _strip_abandoned_policy_paths(self, state):
-        """Remove policy-path=<abandoned> options from Proxy Group lines.
-
-        If a group becomes empty after the strip (no explicit members, no
-        include-all-proxies, no other valid policy-path), tag it cascade
-        and propagate the group name to global_deleted AND every other
-        file's deleted_names so the downstream fixpoint sees it.
-        """
-        abandoned_basenames = {os.path.basename(p) for p in self.abandoned_files}
-        if not abandoned_basenames:
+        if not self.abandoned_files:
             return
-        for i, line in enumerate(state.lines):
-            if state.sections[i] != "Proxy Group":
+        base_dir = os.path.dirname(state.abs_path)
+        basename = os.path.basename(state.abs_path)
+        for i, rec in state.group_records.items():
+            if rec.commented_out or state.sections[i] != "Proxy Group":
                 continue
-            if line.lstrip().startswith("#"):
-                continue
-            pgl = parse_proxy_group_line(line)
-            if pgl is None:
-                continue
-            new_options = []
+            new_opts = []
             removed_values = []
-            for key, value in pgl.options:
-                if key == "policy-path":
-                    if value.startswith("http://") or value.startswith("https://"):
-                        new_options.append((key, value))
-                        continue
-                    if os.path.basename(value) in abandoned_basenames:
-                        removed_values.append(value)
-                        continue
-                new_options.append((key, value))
+            for opt in rec.options:
+                if (opt.key.lower() == "policy-path"
+                        and opt.policy_path is not None
+                        and not opt.policy_path.startswith(("http://", "https://"))
+                        and os.path.normpath(os.path.join(base_dir, opt.policy_path)) in self.abandoned_files):
+                    removed_values.append(opt.policy_path)
+                    continue
+                new_opts.append(opt)
             if not removed_values:
                 continue
-            pgl.options = new_options
-            if has_effective_members(pgl, state.deleted_names, abandoned_basenames):
-                state.lines[i] = _preserve_indent(line, format_proxy_group_line(pgl))
+            rec.options = new_opts
+            rec.dirty = True
+            if rec.has_effective_members(state.deleted_names, self.abandoned_files, base_dir=base_dir):
                 self.stats.add_change(
-                    os.path.basename(state.abs_path), i + 1, "Proxy Group",
-                    "移除 policy-path", f"{pgl.name}: {', '.join(removed_values)}")
+                    basename, i + 1, "Proxy Group",
+                    "移除 policy-path", f"{rec.name}: {', '.join(removed_values)}",
+                )
             else:
-                reformatted = _preserve_indent(line, format_proxy_group_line(pgl))
-                state.lines[i] = CASCADE_TAG + reformatted.lstrip()
-                deleted_name = unquote(pgl.name)
+                rec.commented_out = True
+                deleted_name = unquote(rec.name)
                 state.deleted_names.add(deleted_name)
                 state.self_deleted.add(deleted_name)
                 self.global_deleted.add(deleted_name)
-                # Propagate to all other non-abandoned files so the downstream
-                # fixpoint catches references to this group — unless some other
-                # emitted file still defines the same name.
                 if deleted_name not in self._live_names():
                     for other in self.files.values():
                         if other is not state and not other.is_abandoned:
                             other.deleted_names.add(deleted_name)
-                basename = os.path.basename(state.abs_path)
                 self.stats.count_commented(basename)
-                self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", pgl.name)
+                self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", rec.name)
 
-    def _strip_abandoned_includes(self, state):
-        """Remove entries in #!include lines that point at abandoned files.
-
-        If the list becomes empty after stripping, tag the whole line cascade.
-        """
-        abandoned_basenames = {os.path.basename(p) for p in self.abandoned_files}
-        if not abandoned_basenames:
+    def _strip_abandoned_includes(self, state, loaded_set=None):
+        if not self.abandoned_files:
             return
+        base_dir = os.path.dirname(state.abs_path)
+        basename = os.path.basename(state.abs_path)
         for i, line in enumerate(state.lines):
+            if not _section_is_loaded(loaded_set, state.sections[i]):
+                continue
             if not line.lstrip().startswith("#!include"):
                 continue
             entries = parse_include_list(line)
@@ -1329,55 +2285,81 @@ class Pipeline:
                 continue
             kept = [
                 e for e in entries
-                # URLs are never abandoned local files — a remote entry whose
-                # basename happens to collide with an abandoned local file
-                # (e.g. a local mirror named after its source URL) must stay.
                 if e.startswith(("http://", "https://"))
-                or os.path.basename(e) not in abandoned_basenames
+                or os.path.normpath(os.path.join(base_dir, e)) not in self.abandoned_files
             ]
             if len(kept) == len(entries):
                 continue
             if not kept:
                 state.lines[i] = CASCADE_TAG + line.lstrip()
-                basename = os.path.basename(state.abs_path)
                 self.stats.count_commented(basename)
                 self.stats.add_change(basename, i + 1, "#!include", "级联注释", line.strip())
             else:
-                new_line = format_include_list(kept)
+                new_line = format_include_list(kept, _include_trailing_comment(line))
                 state.lines[i] = _preserve_indent(line, new_line)
                 removed_entries = [e for e in entries if e not in kept]
                 self.stats.add_change(
-                    os.path.basename(state.abs_path), i + 1, "#!include",
-                    "移除 include 条目", ", ".join(removed_entries))
+                    basename, i + 1, "#!include",
+                    "移除 include 条目", ", ".join(removed_entries),
+                )
+
+    def _validate_planned_output_paths(self):
+        """Verify every planned output path is collision-free and accepted by
+        the target filesystem (including any needed -deprecated backup) BEFORE
+        emit() writes anything to disk."""
+        seen_outputs = {}
+        for abs_path in sorted(self.emitting):
+            state = self.files[abs_path]
+            if state.is_abandoned or abs_path not in self.reachable:
+                continue
+            out_path = self._output_path(abs_path)
+            if out_path in seen_outputs:
+                self.stats.errors.append(
+                    f"多个源文件映射到同一输出路径: {seen_outputs[out_path]} 与 {abs_path} → {out_path}"
+                )
+                continue
+            seen_outputs[out_path] = abs_path
+            out_dir = os.path.dirname(out_path)
+            out_name = os.path.basename(out_path)
+            if _filename_too_long(out_dir, out_name):
+                self.stats.errors.append(f"输出文件名超出文件系统长度上限: {out_name}")
+                continue
+            if os.path.exists(out_path):
+                try:
+                    with open(out_path, "r", encoding="utf-8") as f:
+                        existing = f.read()
+                except OSError:
+                    existing = None
+                if existing != state.converted:
+                    p = Path(out_path)
+                    backup_name = p.stem + "-deprecated" + p.suffix
+                    if _filename_too_long(out_dir, backup_name):
+                        self.stats.errors.append(
+                            f"备份文件名超出文件系统长度上限: {backup_name}"
+                        )
 
     def emit(self):
         """Write -v4 files based on FileState decisions. Returns root output path."""
-        root_output = None
-        root_abs = next(iter(self.files))  # first discovered = root
+        if self.stats.errors:
+            for err in self.stats.errors:
+                print(f"错误: {err}", file=sys.stderr)
+            return None
 
-        # Reachability was settled by analyze() (it can't be recomputed here:
-        # references are already rewritten to -v4 names). A sub-file only
-        # reachable via an abandoned managed config is never emitted — and
-        # analyze() has already withdrawn its names from the namespace.
+        root_output = None
+        root_abs = next(iter(self.files))
         reachable = self.reachable
 
         for abs_path, state in self.files.items():
-            output_path = make_v4_filename(abs_path)
+            output_path = self._output_path(abs_path)
 
-            # Abandon decision was made in discover(). Just act on it here:
-            # refuse to write, surface stale -v4 (don't delete).
             if state.is_abandoned:
                 self.stats.abandoned_files.append(abs_path)
                 self.processed_files[abs_path] = None
-                # Its recorded edits were discarded along with the conversion.
                 self.stats.discard_file(os.path.basename(abs_path))
                 print(f"已放弃托管配置（含 v5+ 内容）: {abs_path}")
-                # Check both layouts: the current v4/ subdirectory and the
-                # pre-v4/-subdir layout (-v4 file next to the source), which
-                # is where every file from older converter versions lives.
                 src = Path(abs_path)
                 old_layout = str(src.with_stem(src.stem + "-v4"))
-                for stale in (output_path, old_layout):
+                for stale in dict.fromkeys((output_path, old_layout)):
                     if os.path.exists(stale):
                         self.stats.stale_v4_files.append(stale)
                         print(f"  ⚠️  检测到旧的 v4 文件（未自动删除）: {stale}")
@@ -1385,21 +2367,18 @@ class Pipeline:
                     root_output = None
                 continue
 
-            # Discovered only through an abandoned file — nothing in the
-            # emitted output references it; skip to avoid orphan files.
             if abs_path not in reachable:
                 self.processed_files[abs_path] = None
                 self.stats.discard_file(os.path.basename(abs_path))
                 continue
 
-            # Not part of the output: nothing in the profile needs conversion.
             if abs_path not in self.emitting:
                 self.processed_files[abs_path] = None
+                self.stats.discard_file(os.path.basename(abs_path))
                 if abs_path == root_abs:
                     root_output = None
                 continue
 
-            # Skip if existing -v4 already has correct content
             if os.path.exists(output_path):
                 with open(output_path, "r", encoding="utf-8") as f:
                     existing = f.read()
@@ -1436,21 +2415,18 @@ class Pipeline:
     def run(self, root_path, default_section=None):
         state = self.discover(root_path, default_section)
         if state is None:
-            # discover already printed the reason (unreadable / undecodable)
             sys.exit(1)
         self.analyze()
         return self.emit()
 
 
-def convert_file(input_path, stats=None, processed_files=None, default_section=None,
-                 snell_legacy=None):
-    """Convert a Surge config file from v5+ to v4 (top-level entry point).
+# ---------------------------------------------------------------------------
+# Public Entry Points & CLI
+# ---------------------------------------------------------------------------
 
-    Creates a Pipeline, runs discover → analyze → emit over this file and
-    every transitively referenced local file, and returns the root file's
-    output path (or None if abandoned / unchanged). snell_legacy is the
-    table from load_snell_legacy (None: feature off).
-    """
+def convert_file(input_path, stats=None, processed_files=None, default_section=None,
+                 snell_legacy=None, output_dir=None):
+    """Convert a Surge config file from v5+ to v4 (top-level entry point)."""
     if stats is None:
         stats = ConversionStats()
 
@@ -1462,7 +2438,7 @@ def convert_file(input_path, stats=None, processed_files=None, default_section=N
             print(f"错误: 文件不存在: {input_path}", file=sys.stderr)
         sys.exit(1)
 
-    pipeline = Pipeline(stats, processed_files, snell_legacy)
+    pipeline = Pipeline(stats, processed_files, snell_legacy, output_dir=output_dir)
     return pipeline.run(input_path, default_section=default_section)
 
 
@@ -1484,12 +2460,7 @@ def _check_legacy_section(path, name, fields):
 
 
 def load_snell_legacy(path):
-    """Parse a snell legacy override file into {source basename: {field: value}}.
-
-    INI sections are source basenames; keys are server / port / psk. Parse
-    errors report only the exception type: configparser messages quote the
-    offending line, which may hold a secret.
-    """
+    """Parse a snell legacy override file into {source basename: {field: value}}."""
     parser = configparser.RawConfigParser()
     parser.optionxform = str
     try:
@@ -1508,7 +2479,7 @@ def load_snell_legacy(path):
 
 
 def resolve_snell_legacy(arg_path):
-    """Explicit --snell-legacy path, else the default path if it exists, else None."""
+    """Explicit --snell-legacy path, else default path if it exists, else None."""
     if arg_path:
         return load_snell_legacy(arg_path)
     default = default_snell_legacy_path()
@@ -1520,13 +2491,24 @@ def main():
     parser.add_argument("input_path")
     parser.add_argument("--snell-legacy", metavar="PATH",
                         help=f"snell 旧版覆盖文件（默认 {default_snell_legacy_path()}，存在才加载）")
+    parser.add_argument("-o", "--output-dir", metavar="DIR",
+                        help="输出目录（默认写入源文件旁的 v4/ 子目录；多套主配置共用子文件需隔离时可指定独立目录）")
     args = parser.parse_args()
 
     input_path = args.input_path
     snell_legacy = resolve_snell_legacy(args.snell_legacy)
     stats = ConversionStats()
     processed_files = {os.path.abspath(input_path): None}
-    result = convert_file(input_path, stats, processed_files, snell_legacy=snell_legacy)
+    result = convert_file(
+        input_path, stats, processed_files,
+        snell_legacy=snell_legacy,
+        output_dir=args.output_dir,
+    )
+    if stats.errors:
+        print("\n转换中止（未生成不完整的 v4 文件）:", file=sys.stderr)
+        for err in stats.errors:
+            print(f"  - {err}", file=sys.stderr)
+        sys.exit(1)
     if result is None and not stats.abandoned_files:
         print("未发现 v5+ 内容，无需转换。")
     stats.print_summary()
@@ -1549,9 +2531,6 @@ def main():
         for f in stats.deprecated_files:
             print(f"  - {f}")
         if not sys.stdin.isatty():
-            # Non-interactive run (cron / pipe): keep the backups. Deleting
-            # files requires an explicit human answer — pipe content (even a
-            # stray blank line) must never count as consent.
             print("检测到非交互运行，已保留 deprecated 文件。")
             return
         try:
