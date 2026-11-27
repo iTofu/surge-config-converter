@@ -5439,3 +5439,89 @@ class TestRound5Regressions:
         assert "# [V5+ cascade] Words = select" in out
         assert "# [V5+ cascade] DOMAIN,w.example,Words" in out
         assert "\nFINAL,DIRECT\n" in out
+
+
+# --- T94: Round-6 Codex review regression suite (2 P1 root-cause fixes) ---
+
+class TestRound6Regressions:
+    def test_fallback_regex_rejects_icu_charset_ops_without_warning(self, tmp_path, monkeypatch):
+        """P1: positive-grammar fallback must mark ICU character-class set
+        operations (`&&`, `--`, `~~`, `||`) and `{,n}` unverifiable without
+        emitting Python `FutureWarning`, instead of letting stdlib `re` mis-match."""
+        import warnings
+        import converter as conv_mod
+        monkeypatch.setattr(conv_mod.sys, "platform", "linux")
+
+        for tag, pat in [
+            ("intersect", "^[a-z&&m-o]$"),
+            ("subtract", "^[a-z--a-l]$"),
+            ("symdiff", "^[a-z~~a-l]$"),
+            ("union", "^[m-o||p-q]$"),
+            ("brace_omit_min", "^n{,2}$"),
+        ]:
+            d = tmp_path / tag
+            d.mkdir()
+            main = d / "main.conf"
+            main.write_text(
+                "[Proxy]\n"
+                "n = anytls, 1.1.1.1, 443, password=p\n"
+                "a = trojan, 2.2.2.2, 443, password=p\n"
+                "[Proxy Group]\n"
+                f'Pool = select, include-all-proxies=1, policy-regex-filter="{pat}"\n'
+                "[Rule]\n"
+                "FINAL,Pool\n"
+            )
+            stats = ConversionStats()
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                res = convert_file(str(main), stats, {str(main): None})
+            assert res is None, f"{tag}: expected fail-closed"
+            assert any("ICU" in e and "policy-regex-filter" in e for e in stats.errors)
+            assert not any(issubclass(w.category, FutureWarning) for w in caught)
+
+    def test_same_name_unverifiable_candidate_cannot_mask_deleted_definite_member(self, tmp_path, monkeypatch):
+        """P1: when Pool includes A (definite global `Node`, deleted) and B
+        (private policy-path `Node` behind unverifiable `^\\p{Han}+$`), B's
+        uncertain `Node` must NOT collide with A's definite `Node` to hide the
+        supply loss and silently export an empty `FINAL,Pool`."""
+        import converter as conv_mod
+        monkeypatch.setattr(conv_mod.sys, "platform", "linux")
+
+        priv = tmp_path / "priv.dconf"
+        priv.write_text("[Proxy]\nNode = trojan, 2.2.2.2, 443, password=p\n")
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Node = anytls, 1.1.1.1, 443, password=p\n"
+            "[Proxy Group]\n"
+            "A = select, Node\n"
+            r"B = select, policy-path=priv.dconf, policy-regex-filter=^\p{Han}+$" + "\n"
+            'Pool = select, include-other-group="A, B"\n'
+            "[Rule]\n"
+            "FINAL,Pool\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is None
+        assert any("ICU" in e and "B" in e and r"\p{Han}" in e for e in stats.errors)
+
+    def test_unverifiable_initial_only_candidates_fail_closed_not_falsely_deleted(self, tmp_path, monkeypatch):
+        """P1: a group whose only initial candidates were behind an unverifiable
+        regex (e.g. ASCII `Old` under `^\\p{Han}+$`) must NOT be falsely deleted
+        as proven non-empty when `Old` is removed; fallback must fail closed."""
+        import converter as conv_mod
+        monkeypatch.setattr(conv_mod.sys, "platform", "linux")
+
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Old = anytls, 1.1.1.1, 443, password=p\n"
+            "[Proxy Group]\n"
+            r"Bad = select, include-all-proxies=1, policy-regex-filter=^\p{Han}+$" + "\n"
+            "[Rule]\n"
+            "DOMAIN,x.example,Bad\n"
+            "FINAL,DIRECT\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is None
+        assert any("ICU" in e and "Bad" in e for e in stats.errors)
+        assert not (tmp_path / "v4" / "main-v4.conf").exists()

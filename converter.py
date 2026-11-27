@@ -482,22 +482,223 @@ class _UnverifiableRegex:
         self.pattern = pattern
 
     def match_set(self, names):
-        return set(names), bool(names)
+        """Return (definite_matched, uncertain_candidates)."""
+        return set(), set(names)
 
 
-# Syntax guards for the non-macOS stdlib `re` fallback whitelist:
-#  - _ICU_ONLY_OR_NON_ASCII_ESCAPE_RE catches ICU-specific tokens (\p/\P/\X/\N,
-#    POSIX [:...:], possessive quantifiers) and hex/Unicode escapes that can
-#    introduce non-ASCII codepoints into an otherwise ASCII pattern string.
-#  - _NON_ASCII_UNSAFE_REGEX_RE rejects any inline/scoped flags `(?`, escapes
-#    `\`, character classes `[`, or `.` whenever either pattern or candidate
-#    names contain non-ASCII characters (only plain literal/anchor/alternation
-#    is guaranteed 100% identical to ICU without a native ICU engine).
-_ICU_ONLY_OR_NON_ASCII_ESCAPE_RE = re.compile(
-    r'\\[pPXN]|\[[^\]]*\[|[+*?}]\+|\\u[0-9a-fA-F]{4}|\\U[0-9a-fA-F]{8}'
-    r'|\\x[89a-fA-F][0-9a-fA-F]|\\(?:0[0-7]{1,3}|[2-7][0-7]{2})|\(\?[a-zA-Z-]*x'
-)
-_NON_ASCII_UNSAFE_REGEX_RE = re.compile(r'\(\?|\\|\[|\.')
+# Positive-grammar validator for the non-macOS stdlib `re` fallback.
+# Instead of blacklisting ICU features (which inevitably misses syntax such as
+# `[a-z&&m-o]` set intersection, `--` subtraction, `{,n}`, `\337`, or `(?x)`),
+# we tokenize the pattern and ONLY accept constructs proven identical between
+# Apple libicucore ICU and Python stdlib `re`:
+#   - Mode A (ascii_safe): printable ASCII + `\t` pattern evaluated against
+#     printable ASCII + `\t` candidate names. Allows literals, punctuation
+#     escapes, `\d/\D/\w/\W/\s/\S/\b/\B/\t`, simple non-nested character classes
+#     (no `[`, `&`, `~`, `|`, `--`), `(`, `(?:`, `(?i)`/`(?-i)` at start,
+#     `(?i:...)`/`(?-i:...)`, `^`, `$`, `|`, `.`, and non-possessive quantifiers
+#     `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}` (optional lazy `?`).
+#   - Mode B (unicode_literal_safe): exact codepoint literal/anchor/alternation/
+#     group/quantifier subset (no flags, no `.`, no `[...]`, no shorthand
+#     escapes — only punctuation literal escapes).
+_FALLBACK_PUNCT_ESCAPES = frozenset(r"\.+*?^$()[]{}|/-")
+_FALLBACK_CLASS_PUNCT_ESCAPES = frozenset(r"\.+*?^$()[]{}|/-&~")
+_FALLBACK_ASCII_SHORTHANDS = frozenset("dDwWsSbBt")
+_FALLBACK_CLASS_SHORTHANDS = frozenset("dDwWsS")
+_FALLBACK_LINE_BREAKS = frozenset("\r\n\x0b\x0c\x85\u2028\u2029")
+
+
+def _is_printable_ascii(text):
+    return all(ch == "\t" or 0x20 <= ord(ch) <= 0x7E for ch in text)
+
+
+def _is_safe_unicode_text(text):
+    return all(
+        (ch == "\t" or (ord(ch) >= 0x20 and ord(ch) != 0x7F))
+        and ch not in _FALLBACK_LINE_BREAKS
+        for ch in text
+    )
+
+
+def _parse_positive_char_class(pattern, start):
+    """Parse a simple printable-ASCII `[...]` class with zero ICU set operators
+    (`&&`, `--`, `~~`, `||`, nested `[...]`, POSIX `[:...:]`). Returns the index
+    after the closing `]` or -1 if rejected."""
+    n = len(pattern)
+    j = start + 1
+    if j < n and pattern[j] == "^":
+        j += 1
+    if j >= n or pattern[j] == "]":
+        return -1
+
+    items = []
+    while j < n and pattern[j] != "]":
+        c = pattern[j]
+        if c in "[&~|":
+            return -1
+        if c == "\\":
+            if j + 1 >= n:
+                return -1
+            nxt = pattern[j + 1]
+            if nxt in _FALLBACK_CLASS_PUNCT_ESCAPES:
+                items.append(("char", nxt))
+            elif nxt == "t":
+                items.append(("char", "\t"))
+            elif nxt in _FALLBACK_CLASS_SHORTHANDS:
+                items.append(("class", nxt))
+            else:
+                return -1
+            j += 2
+        elif c == "-":
+            items.append(("dash",))
+            j += 1
+        else:
+            items.append(("char", c))
+            j += 1
+
+    if j >= n or pattern[j] != "]" or not items:
+        return -1
+
+    # Validate unescaped dashes: only single valid ASCII `lo-hi` ranges or
+    # solitary leading/trailing `-` (never `--`, `a-b-c`, `z-a`, or `\d-a`).
+    k = 0
+    m = len(items)
+    while k < m:
+        kind = items[k][0]
+        if kind == "dash":
+            if k == 0 and (m == 1 or items[1][0] != "dash"):
+                k += 1
+                continue
+            if k == m - 1:
+                k += 1
+                continue
+            return -1
+        if kind == "char" and k + 2 < m and items[k + 1][0] == "dash":
+            if items[k + 2][0] != "char":
+                return -1
+            if ord(items[k][1]) > ord(items[k + 2][1]):
+                return -1
+            if k + 3 < m and items[k + 3][0] == "dash":
+                return -1
+            k += 3
+            continue
+        if kind == "class":
+            if k + 1 < m and items[k + 1][0] == "dash":
+                return -1
+            k += 1
+            continue
+        k += 1
+
+    return j + 1
+
+
+def _parse_positive_brace_quantifier(pattern, start):
+    """Parse strict `{m}`, `{m,}`, `{m,n}` (`m` required, `m <= n`), optional
+    single lazy `?` (never possessive `+`). Returns next index or -1."""
+    n = len(pattern)
+    j = start + 1
+    m_start = j
+    while j < n and pattern[j].isascii() and pattern[j].isdigit():
+        j += 1
+    if j == m_start or j >= n:
+        return -1
+    m_val = int(pattern[m_start:j])
+    if pattern[j] == ",":
+        j += 1
+        n_start = j
+        while j < n and pattern[j].isascii() and pattern[j].isdigit():
+            j += 1
+        if j >= n or pattern[j] != "}":
+            return -1
+        if j > n_start and int(pattern[n_start:j]) < m_val:
+            return -1
+    elif pattern[j] != "}":
+        return -1
+    j += 1
+    if j < n and pattern[j] == "?":
+        j += 1
+    if j < n and pattern[j] in "*+?{":
+        return -1
+    return j
+
+
+def _is_positive_fallback_regex(pattern, allow_ascii_ext):
+    """Return True iff every token in `pattern` belongs to the proven
+    ICU-equivalent stdlib `re` subset."""
+    if allow_ascii_ext:
+        if not _is_printable_ascii(pattern):
+            return False
+    elif not _is_safe_unicode_text(pattern):
+        return False
+
+    n = len(pattern)
+    i = 0
+    paren_depth = 0
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\":
+            if i + 1 >= n:
+                return False
+            nxt = pattern[i + 1]
+            if nxt in _FALLBACK_PUNCT_ESCAPES:
+                i += 2
+            elif allow_ascii_ext and nxt in _FALLBACK_ASCII_SHORTHANDS:
+                i += 2
+            else:
+                return False
+        elif ch == "[":
+            if not allow_ascii_ext:
+                return False
+            nxt_i = _parse_positive_char_class(pattern, i)
+            if nxt_i < 0:
+                return False
+            i = nxt_i
+        elif ch in "]}":
+            return False
+        elif ch == "(":
+            if i + 1 < n and pattern[i + 1] == "?":
+                if pattern.startswith("(?:", i):
+                    paren_depth += 1
+                    i += 3
+                elif allow_ascii_ext and i == 0 and pattern.startswith("(?i)", i):
+                    i += 4
+                elif allow_ascii_ext and i == 0 and pattern.startswith("(?-i)", i):
+                    i += 5
+                elif allow_ascii_ext and pattern.startswith("(?i:", i):
+                    paren_depth += 1
+                    i += 4
+                elif allow_ascii_ext and pattern.startswith("(?-i:", i):
+                    paren_depth += 1
+                    i += 5
+                else:
+                    return False
+            else:
+                paren_depth += 1
+                i += 1
+        elif ch == ")":
+            if paren_depth == 0:
+                return False
+            paren_depth -= 1
+            i += 1
+        elif ch in "*+?":
+            i += 1
+            if i < n and pattern[i] == "?":
+                i += 1
+            if i < n and pattern[i] in "*+?{":
+                return False
+        elif ch == "{":
+            nxt_i = _parse_positive_brace_quantifier(pattern, i)
+            if nxt_i < 0:
+                return False
+            i = nxt_i
+        elif ch == ".":
+            if not allow_ascii_ext:
+                return False
+            i += 1
+        else:
+            # Literal character or `^`, `$`, `|`
+            i += 1
+
+    return paren_depth == 0
 
 
 class _ExactRegexMatcher:
@@ -508,60 +709,62 @@ class _ExactRegexMatcher:
         self._engine = engine
 
     def match_set(self, names):
-        return {n for n in names if self._engine.search(n)}, False
+        return {n for n in names if self._engine.search(n)}, set()
 
 
 class _FallbackRegexMatcher:
-    """Strict whitelist stdlib `re` matcher used only when native ICU is unavailable.
+    """Positive-grammar stdlib `re` matcher used only when native ICU is unavailable.
 
-    Only verifies:
-      1. Pure 7-bit ASCII patterns (no ICU-only syntax or non-ASCII escapes)
-         evaluated against pure 7-bit ASCII candidate names (where stdlib `re`
-         and ICU are identical, including local `(?i:...)` flags and `\\w`), OR
-      2. Non-ASCII patterns/names using strictly plain literal/anchor/alternation
-         syntax (no flags, no escapes, no character classes, no `.`).
-    Everything else is marked unverifiable so conversion fails closed with a
-    targeted diagnostic instead of misclassifying a live Surge group.
+    Evaluates each candidate name independently and returns
+    `(definite_matched, uncertain_candidates)`:
+      - A candidate is verified exactly iff either the pattern is in the
+        Unicode-literal-safe grammar (and the candidate has no line-break
+        control chars), OR the pattern is in the printable-ASCII-safe grammar
+        and the candidate is printable ASCII + `\\t`.
+      - Any other candidate is placed in `uncertain_candidates` so downstream
+        cascade/validation preserves certainty and fails closed when needed.
     """
 
-    def __init__(self, pattern, compiled):
+    def __init__(self, pattern, compiled, ascii_safe, unicode_literal_safe):
         self.pattern = pattern
         self._compiled = compiled
-        self._pattern_ascii_safe = (
-            pattern.isascii() and not _ICU_ONLY_OR_NON_ASCII_ESCAPE_RE.search(pattern)
-        )
-        self._non_ascii_literal_safe = (
-            not _ICU_ONLY_OR_NON_ASCII_ESCAPE_RE.search(pattern)
-            and not _NON_ASCII_UNSAFE_REGEX_RE.search(pattern)
-        )
+        self._ascii_safe = ascii_safe
+        self._unicode_literal_safe = unicode_literal_safe
 
     def match_set(self, names):
-        if not names:
-            return set(), False
-        all_names_ascii = all(n.isascii() for n in names)
-        if self._pattern_ascii_safe and all_names_ascii:
-            return {n for n in names if self._compiled.search(n)}, False
-        if self._non_ascii_literal_safe:
-            return {n for n in names if self._compiled.search(n)}, False
-        return set(names), True
+        definite = set()
+        uncertain = set()
+        for n in names:
+            if (self._unicode_literal_safe and _is_safe_unicode_text(n)) or (
+                self._ascii_safe and _is_printable_ascii(n)
+            ):
+                if self._compiled.search(n):
+                    definite.add(n)
+            else:
+                uncertain.add(n)
+        return definite, uncertain
 
 
 def _compile_surge_regex(pattern):
     """Compile a Surge policy-regex-filter using Surge's native ICU engine on
-    macOS, or a semantics-guarded stdlib fallback elsewhere.
+    macOS, or a positive-grammar-validated stdlib fallback elsewhere.
 
-    Returns a matcher with `.match_set(names) -> (matched_set, unverifiable)`.
+    Returns a matcher with `.match_set(names) -> (definite_set, uncertain_set)`.
     """
     if sys.platform == "darwin" and _ICURegex._load_lib() is not None:
         try:
             return _ExactRegexMatcher(pattern, _ICURegex(pattern))
         except (ValueError, RuntimeError):
             return _UnverifiableRegex(pattern)
+    ascii_safe = _is_positive_fallback_regex(pattern, allow_ascii_ext=True)
+    unicode_literal_safe = _is_positive_fallback_regex(pattern, allow_ascii_ext=False)
+    if not ascii_safe and not unicode_literal_safe:
+        return _UnverifiableRegex(pattern)
     try:
         compiled = re.compile(pattern)
     except re.error:
         return _UnverifiableRegex(pattern)
-    return _FallbackRegexMatcher(pattern, compiled)
+    return _FallbackRegexMatcher(pattern, compiled, ascii_safe, unicode_literal_safe)
 
 
 @dataclass
@@ -2009,9 +2212,17 @@ class Pipeline:
 
     def _group_member_supply(self, state, rec, group_index, global_deleted,
                              global_proxies, use_initial, visited=None, memo=None):
-        """Recursively compute (known_members, has_unknown_supply,
-        unverifiable_patterns, hit_cycle) for a [Proxy Group] either BEFORE
-        conversion (use_initial=True) or AFTER current deletions (use_initial=False).
+        """Recursively compute:
+          (definite_items, uncertain_items, has_unknown_supply,
+           unverifiable_patterns, hit_cycle)
+        for a [Proxy Group] either BEFORE conversion (use_initial=True) or
+        AFTER current deletions (use_initial=False).
+
+        Each item in `definite_items` / `uncertain_items` is a flat 3-tuple:
+          (origin_tag, last_unv_group_key, exposed_name)
+        preserving both member certainty (Kleene 3-valued logic across nested
+        filters) and leaf source provenance (explicit / policy-path / global)
+        without exponential blowup in shared-subgroup diamond DAGs.
 
         Per Surge semantics:
           - Explicit static members are unfiltered.
@@ -2020,44 +2231,46 @@ class Pipeline:
             exposed to parent include-other-group consumers.
           - include-all-proxies and include-other-group members are filtered by
             this group's policy-regex-filter.
-        Memoizes acyclic subgraphs in `memo` to keep shared-subgroup DAGs O(V+E).
         """
         if visited is None:
             visited = set()
         visit_key = (state.abs_path, id(rec))
         if memo is not None and visit_key in memo:
-            m_known, m_unk, m_unv = memo[visit_key]
-            return m_known, m_unk, m_unv, False
+            m_def, m_unc, m_unk, m_unv = memo[visit_key]
+            return m_def, m_unc, m_unk, m_unv, False
         if visit_key in visited:
-            return frozenset(), False, (), True
+            return frozenset(), frozenset(), False, (), True
         visited = visited | {visit_key}
 
         base_dir = os.path.dirname(state.abs_path)
         matcher = rec.compiled_regex_filter()
         prefix = rec.external_policy_name_prefix()
-        unverifiable = []
 
-        def _filter_names(names):
-            if not names:
-                return set(), False
-            if matcher is None:
-                return set(names), False
-            return matcher.match_set(names)
-
-        known = set()
+        definite = set()
+        uncertain = set()
         has_unknown = False
         hit_cycle = False
+        unverifiable = []
 
-        # 1. Explicit static members (unfiltered by policy-regex-filter)
+        # 1. Explicit static members (definite, unfiltered by policy-regex-filter)
+        explicit_origin = ("explicit", state.abs_path, id(rec))
         if use_initial:
-            known |= {unquote(m) for m in (rec.initial_members or rec.members)}
+            for m in (rec.initial_members or rec.members):
+                definite.add((explicit_origin, None, unquote(m)))
         else:
-            known |= {unquote(m) for m in rec.members if unquote(m) not in global_deleted}
+            for m in rec.members:
+                nm = unquote(m)
+                if nm not in global_deleted:
+                    definite.add((explicit_origin, None, nm))
 
-        # 2. Dynamic imported sources: separate policy-path (gets prefix after filter)
-        #    from include-all-proxies / include-other-group.
-        pp_dynamic = set()
-        other_dynamic = set()
+        # 2. Dynamic imported sources: keep policy-path (prefixed after filter)
+        #    and definite vs uncertain streams separate.
+        pp_def_items = set()
+        other_def_items = set()
+        other_unc_items = set()
+        child_unc_sources = []
+        all_origin = ("all", state.abs_path, id(rec))
+
         opts = (rec.initial_options or rec.options) if use_initial else rec.options
         for opt in opts:
             kl = opt.key.lower()
@@ -2065,7 +2278,8 @@ class Pipeline:
                 if self._root_has_remote_proxy_include():
                     has_unknown = True
                 else:
-                    other_dynamic |= set(global_proxies)
+                    for p in global_proxies:
+                        other_def_items.add((all_origin, None, p))
             elif kl == "policy-path" and opt.policy_path is not None:
                 if opt.policy_path.startswith(("http://", "https://")):
                     has_unknown = True
@@ -2076,11 +2290,18 @@ class Pipeline:
                         if ref_abs not in self.abandoned_files:
                             has_unknown = True
                     elif use_initial:
-                        pp_dynamic |= st.initial_proxies
+                        pp_origin = ("pp", state.abs_path, id(rec), ref_abs)
+                        for p in st.initial_proxies:
+                            pp_def_items.add((pp_origin, None, p))
                     elif not st.is_abandoned:
-                        pp_dynamic |= (st.owned_proxies - st.self_deleted_proxies)
+                        pp_origin = ("pp", state.abs_path, id(rec), ref_abs)
+                        for p in (st.owned_proxies - st.self_deleted_proxies):
+                            pp_def_items.add((pp_origin, None, p))
             elif kl == "include-other-group" and opt.iog_groups is not None:
-                groups = (opt.initial_iog_groups if opt.initial_iog_groups is not None else opt.iog_groups) if use_initial else opt.iog_groups
+                groups = (
+                    (opt.initial_iog_groups if opt.initial_iog_groups is not None else opt.iog_groups)
+                    if use_initial else opt.iog_groups
+                )
                 for g in groups:
                     if not use_initial and g in global_deleted:
                         continue
@@ -2091,60 +2312,119 @@ class Pipeline:
                     for sub_state, _, sub_rec in targets:
                         if not use_initial and sub_rec.commented_out:
                             continue
-                        sub_known, sub_unk, sub_unv, sub_cycle = self._group_member_supply(
+                        sub_def, sub_unc, sub_unk, sub_unv, sub_cycle = self._group_member_supply(
                             sub_state, sub_rec, group_index, global_deleted,
                             global_proxies, use_initial, visited=visited, memo=memo,
                         )
-                        other_dynamic |= sub_known
+                        other_def_items |= sub_def
+                        other_unc_items |= sub_unc
                         has_unknown = has_unknown or sub_unk
                         hit_cycle = hit_cycle or sub_cycle
-                        unverifiable.extend(sub_unv)
+                        if sub_unc and sub_unv:
+                            child_unc_sources.append((sub_unc, sub_unv))
 
-        pp_matched, pp_unv = _filter_names(pp_dynamic)
-        other_matched, other_unv = _filter_names(other_dynamic)
-        if (pp_unv or other_unv) and matcher is not None:
+        def _apply_matcher(def_items, unc_items, apply_prefix=""):
+            if not def_items and not unc_items:
+                return set(), set(), set(), False
+            if matcher is None:
+                out_def = {(o, u, apply_prefix + nm) for (o, u, nm) in def_items}
+                out_unc = {(o, u, apply_prefix + nm) for (o, u, nm) in unc_items}
+                kept_names = {nm for (_, _, nm) in unc_items}
+                return out_def, out_unc, kept_names, False
+            all_names = {nm for (_, _, nm) in def_items} | {nm for (_, _, nm) in unc_items}
+            m_def, m_unc = matcher.match_set(all_names)
+            out_def = set()
+            out_unc = set()
+            self_unv = False
+            for o, u, nm in def_items:
+                if nm in m_def:
+                    out_def.add((o, u, apply_prefix + nm))
+                elif nm in m_unc:
+                    out_unc.add((o, visit_key, apply_prefix + nm))
+                    self_unv = True
+            for o, u, nm in unc_items:
+                if nm in m_def:
+                    out_unc.add((o, u, apply_prefix + nm))
+                elif nm in m_unc:
+                    out_unc.add((o, visit_key, apply_prefix + nm))
+                    self_unv = True
+            return out_def, out_unc, m_def | m_unc, self_unv
+
+        pp_def, pp_unc, _, pp_self_unv = _apply_matcher(pp_def_items, set(), apply_prefix=prefix)
+        other_def, other_unc, other_kept_names, other_self_unv = _apply_matcher(
+            other_def_items, other_unc_items, apply_prefix=""
+        )
+
+        for sub_unc, sub_unv in child_unc_sources:
+            if any(nm in other_kept_names for (_, _, nm) in sub_unc):
+                unverifiable.extend(sub_unv)
+        if (pp_self_unv or other_self_unv) and matcher is not None:
             unverifiable.append((os.path.basename(state.abs_path), rec.name, matcher.pattern))
 
-        if prefix:
-            known |= {prefix + n for n in pp_matched}
-        else:
-            known |= pp_matched
-        known |= other_matched
+        definite |= pp_def | other_def
+        uncertain |= pp_unc | other_unc
 
-        res = (frozenset(known), has_unknown, tuple(dict.fromkeys(unverifiable)))
+        res = (
+            frozenset(definite),
+            frozenset(uncertain),
+            has_unknown,
+            tuple(dict.fromkeys(unverifiable)),
+        )
         if memo is not None and not hit_cycle:
             memo[visit_key] = res
-        return res[0], res[1], res[2], hit_cycle
+        return res[0], res[1], res[2], res[3], hit_cycle
 
     def _group_lost_all_members(self, state, rec, initial_group_index, current_group_index,
                                 global_deleted, initial_global_proxies, current_global_proxies,
                                 initial_memo=None, current_memo=None):
-        """Return (had_initial, has_current, unverifiable_error_list) for rec.
+        """Return (had_initial, has_current, unverifiable_error_list) using
+        3-valued member certainty (definite vs uncertain) with source provenance:
 
-        If a group's policy-regex-filter cannot be verified with Surge/ICU
-        semantics AND the group has no surviving explicit member AND its
-        unfiltered dynamic pool shrank during conversion, returns a diagnostic
-        error so conversion fails closed instead of misclassifying the group.
+          - Cascade (`had_initial and not has_current`) ONLY when the group is
+            PROVEN non-empty before conversion (`init_def` or `init_unk`) AND
+            PROVEN empty after conversion (empty `cur_def`, `cur_unc`, `not cur_unk`).
+          - Fail closed (report `unv_errors`) when the group has NO definite
+            surviving member (`not cur_def and not cur_unk`) AND either:
+              1. `cur_unc` is non-empty and the group's provenance-tagged supply
+                 shrank during conversion, OR
+              2. `cur_unc` is empty, `init_def` was empty (`not init_unk`), and
+                 `init_unc` was non-empty (all uncertain initial candidates were
+                 deleted, so we cannot prove whether the group was originally
+                 non-empty and must cascade or originally empty and must stay).
         """
-        init_known, init_unk, _, _ = self._group_member_supply(
+        init_def, init_unc, init_unk, init_unv, _ = self._group_member_supply(
             state, rec, initial_group_index, set(), initial_global_proxies,
             use_initial=True, memo=initial_memo,
         )
-        cur_known, cur_unk, cur_unv, _ = self._group_member_supply(
+        cur_def, cur_unc, cur_unk, cur_unv, _ = self._group_member_supply(
             state, rec, current_group_index, global_deleted, current_global_proxies,
             use_initial=False, memo=current_memo,
         )
-        had_initial = init_unk or bool(init_known)
-        has_current = cur_unk or bool(cur_known)
+        init_definitely_nonempty = init_unk or bool(init_def)
+        cur_definitely_nonempty = cur_unk or bool(cur_def)
+        cur_might_be_nonempty = cur_definitely_nonempty or bool(cur_unc)
+
+        had_initial = init_definitely_nonempty
+        has_current = cur_might_be_nonempty
 
         unv_errors = []
-        if cur_unv:
-            surviving_explicit = [m for m in rec.members if unquote(m) not in global_deleted]
-            if not surviving_explicit and not cur_unk and has_current and init_known != cur_known:
+        if not cur_definitely_nonempty:
+            supply_shrank = (
+                (init_unk and not cur_unk)
+                or bool(init_def - cur_def)
+                or bool(init_unc - cur_unc)
+            )
+            if cur_unc and supply_shrank:
                 for fname, gname, pat in cur_unv:
                     unv_errors.append(
                         f"{fname} [{gname}] 无法按 Surge ICU 正则语义验证 policy-regex-filter={pat!r}，"
                         "动态代理池已删减且无法确认剩余匹配成员；已停止导出。"
+                    )
+            elif not cur_unc and not init_definitely_nonempty and init_unc:
+                for fname, gname, pat in init_unv:
+                    unv_errors.append(
+                        f"{fname} [{gname}] 无法按 Surge ICU 正则语义验证 policy-regex-filter={pat!r}，"
+                        "动态代理池已删减且无法确认原策略组是否非空；已停止导出。"
                     )
         return had_initial, has_current, unv_errors
 
