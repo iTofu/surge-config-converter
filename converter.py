@@ -30,6 +30,7 @@ Limitation:
 """
 
 import argparse
+from collections import Counter
 import configparser
 import os
 import re
@@ -124,9 +125,11 @@ HOST_PORT_PROXY_TYPES = {
 } | (V5PLUS_ONLY_PROXY_TYPES - {"tailscale"})
 
 
-# Built-in Surge policies that always exist in [Rule] regardless of config sections
+# Built-in Surge policies (macOS + iOS) that always exist in [Rule] regardless
+# of config sections
 BUILTIN_POLICIES = {
     "DIRECT", "REJECT", "REJECT-TINYGIF", "REJECT-DROP", "REJECT-NO-DROP",
+    "CELLULAR", "CELLULAR-ONLY", "HYBRID", "NO-HYBRID",
 }
 
 
@@ -971,6 +974,7 @@ class Pipeline:
         self.global_deleted = set()     # union of all names deleted anywhere
         self.reachable = set()          # final root-reachable set, settled by analyze()
         self.emitting = set()           # files that get a -v4 copy, settled by analyze()
+        self._full_files = set()        # files ever reached in "full" mode
 
     def discover(self, input_path, default_section=None):
         """Read a file, apply direct v5+ hits, and recurse into dependencies.
@@ -1186,29 +1190,40 @@ class Pipeline:
         """
         return set(self._reachable_modes())
 
-    def _live_names(self):
-        """Names that still have a surviving definition in the output.
+    def _live_name_counts(self, modes):
+        """Return `(global_counts, proxy_counts)` Counters of surviving
+        definitions for `modes`.
 
-        Surge flattens every emitted file into ONE namespace, so a name is dead
-        only if no emitted file defines it any more. Withdrawing the names of an
-        abandoned or unreachable file must therefore not kill a same-named
-        definition that lives on elsewhere — a root config with its own
-        `Proxy` group keeps it even when an abandoned airport profile happens
-        to define a `Proxy` group too.
+        Surge distinguishes two visibility scopes:
+          - `global_counts`: definitions from `"full"` files (root + `#!include`).
+            Visible everywhere — including top-level `[Proxy]` `underlying-proxy`,
+            `[Proxy Group]`, and `[Rule]`.
+          - `proxy_counts`: `global_counts` plus `[Proxy]` entries from `"proxy"`
+            (`policy-path`) files. Surge keeps `policy-path` nodes in an external
+            pool that can satisfy `underlying-proxy` inside `policy-path` files,
+            but NOT top-level static `underlying-proxy` or `[Rule]` targets.
 
-        Being loaded does not make every definition in a file live: a file
-        imported in "proxy" mode contributes its [Proxy] entries but NOT its
-        groups, because that section never reaches the profile.
+        Maintaining per-name counts lets per-line cascade updates decrement and
+        test liveness in O(1) without rescanning the reachability graph.
         """
-        live = set(BUILTIN_POLICIES)
-        for abs_path, mode in self._reachable_modes().items():
+        global_counts = Counter()
+        proxy_counts = Counter()
+        for abs_path, mode in modes.items():
             state = self.files[abs_path]
             if state.is_abandoned:
                 continue
-            live |= state.owned_proxies - state.self_deleted_proxies
+            surviving_proxies = state.owned_proxies - state.self_deleted_proxies
             if mode == "full":
-                live |= state.owned_groups - state.self_deleted_groups
-        return live
+                for name in surviving_proxies:
+                    global_counts[name] += 1
+                    proxy_counts[name] += 1
+                for name in state.owned_groups - state.self_deleted_groups:
+                    global_counts[name] += 1
+                    proxy_counts[name] += 1
+            else:
+                for name in surviving_proxies:
+                    proxy_counts[name] += 1
+        return global_counts, proxy_counts
 
     def _emitting(self):
         """Files that get a -v4 copy in v4/: all-or-nothing over the profile.
@@ -1249,24 +1264,32 @@ class Pipeline:
             # managed file unreachable, and unreachable is not abandoned.
             for state in self.files.values():
                 if state.is_managed and not state.is_abandoned and state.abs_path in self._emitting():
+                    abandoned_mode = self._reachable_modes().get(state.abs_path, "full")
                     state.is_abandoned = True
                     self.abandoned_files.add(state.abs_path)
                     self.global_deleted |= state.owned_proxies
-                    self.global_deleted |= state.owned_groups
+                    if abandoned_mode == "full":
+                        self.global_deleted |= state.owned_groups
                     self.global_deleted |= state.deleted_names
 
             # 2. Merge direct-hit deletions from reachable files into
-            # global_deleted, then seed every non-abandoned file. Without this,
-            # a proxy commented in file A would not cascade into groups in file B.
+            # global_deleted, then seed every reachable non-abandoned file
+            # according to its visibility scope (`global_live` for "full" files,
+            # `proxy_live` for "proxy" files).
             modes = self._reachable_modes()
+            self._full_files |= {p for p, m in modes.items() if m == "full"}
             for abs_path in modes:
                 state = self.files[abs_path]
                 if not state.is_abandoned:
                     self.global_deleted |= state.deleted_names
-            live = self._live_names()
-            for state in self.files.values():
+            global_counts, proxy_counts = self._live_name_counts(modes)
+            global_live = BUILTIN_POLICIES | {n for n, c in global_counts.items() if c > 0}
+            proxy_live = BUILTIN_POLICIES | {n for n, c in proxy_counts.items() if c > 0}
+            for abs_path, mode in modes.items():
+                state = self.files[abs_path]
                 if state.is_abandoned:
                     continue
+                live = global_live if mode == "full" else proxy_live
                 state.deleted_names = (state.deleted_names | self.global_deleted) - live
 
             # 2a. Strip policy-path options pointing at abandoned files (only in
@@ -1275,7 +1298,7 @@ class Pipeline:
                 state = self.files[abs_path]
                 if state.is_abandoned or mode != "full":
                     continue
-                self._strip_abandoned_policy_paths(state)
+                self._strip_abandoned_policy_paths(state, modes, global_counts, proxy_counts)
 
             # 2b. Strip #!include entries pointing at abandoned files.
             for abs_path, mode in modes.items():
@@ -1292,19 +1315,26 @@ class Pipeline:
             while changed:
                 changed = False
                 modes = self._reachable_modes()
+                self._full_files |= {p for p, m in modes.items() if m == "full"}
+                global_counts, proxy_counts = self._live_name_counts(modes)
                 for abs_path, mode in modes.items():
                     state = self.files[abs_path]
                     if state.is_abandoned:
                         continue
                     before = set(state.deleted_names)
-                    self._cascade_single_file(state, mode=mode)
+                    self._cascade_single_file(state, mode, global_counts, proxy_counts)
                     new_deletions = state.deleted_names - before
                     if new_deletions:
                         self.global_deleted |= new_deletions
-                        propagated = new_deletions - self._live_names()
-                        for other in self.files.values():
-                            if other is not state and not other.is_abandoned:
-                                other.deleted_names |= propagated
+                        for other_abs, other_mode in modes.items():
+                            other = self.files[other_abs]
+                            if other is state or other.is_abandoned:
+                                continue
+                            other_counts = global_counts if other_mode == "full" else proxy_counts
+                            other.deleted_names |= {
+                                n for n in new_deletions
+                                if n not in BUILTIN_POLICIES and other_counts[n] <= 0
+                            }
                         changed = True
 
             # 3b. Withdraw names defined only in unreachable subtrees. A
@@ -1317,7 +1347,9 @@ class Pipeline:
             for state in self.files.values():
                 if state.is_abandoned or state.abs_path in self.reachable:
                     continue
-                names = state.owned_proxies | state.owned_groups | state.deleted_names
+                names = state.owned_proxies | state.deleted_names
+                if state.abs_path in self._full_files:
+                    names |= state.owned_groups
                 new_withdrawn |= names - self.global_deleted
             if new_withdrawn:
                 self.global_deleted |= new_withdrawn
@@ -1425,7 +1457,7 @@ class Pipeline:
 
         return line, notes
 
-    def _cascade_single_file(self, state, mode="full"):
+    def _cascade_single_file(self, state, mode="full", global_counts=None, proxy_counts=None):
         """Fixpoint: cascade deleted proxies/groups through underlying-proxy,
         Proxy Group members, and multi-group include-other-group; then comment
         out Rule lines pointing at deleted policies.
@@ -1434,6 +1466,9 @@ class Pipeline:
         [Proxy], so [Proxy Group] and [Rule] lines in this file are ignored.
         """
         basename = os.path.basename(state.abs_path)
+        if global_counts is None or proxy_counts is None:
+            global_counts, proxy_counts = self._live_name_counts(self._reachable_modes())
+        counts = global_counts if mode == "full" else proxy_counts
 
         changed = True
         while changed:
@@ -1459,9 +1494,16 @@ class Pipeline:
                     underlying = extract_proxy_option(line, "underlying-proxy")
                     if underlying and underlying in state.deleted_names:
                         state.lines[i] = CASCADE_TAG + stripped
+                        if (
+                            deleted_name in state.owned_proxies
+                            and deleted_name not in state.self_deleted_proxies
+                        ):
+                            if mode == "full":
+                                global_counts[deleted_name] -= 1
+                            proxy_counts[deleted_name] -= 1
                         state.self_deleted.add(deleted_name)
                         state.self_deleted_proxies.add(deleted_name)
-                        if deleted_name not in self._live_names():
+                        if deleted_name not in BUILTIN_POLICIES and counts[deleted_name] <= 0:
                             state.deleted_names.add(deleted_name)
                         self.stats.count_commented(basename)
                         self.stats.add_change(
@@ -1523,9 +1565,15 @@ class Pipeline:
                     reformatted = _preserve_indent(line, format_proxy_group_line(pgl))
                     state.lines[i] = CASCADE_TAG + reformatted.lstrip()
                     deleted_name = unquote(pgl.name)
+                    if (
+                        deleted_name in state.owned_groups
+                        and deleted_name not in state.self_deleted_groups
+                    ):
+                        global_counts[deleted_name] -= 1
+                        proxy_counts[deleted_name] -= 1
                     state.self_deleted.add(deleted_name)
                     state.self_deleted_groups.add(deleted_name)
-                    if deleted_name not in self._live_names():
+                    if deleted_name not in BUILTIN_POLICIES and counts[deleted_name] <= 0:
                         state.deleted_names.add(deleted_name)
                     self.stats.count_commented(basename)
                     self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", pgl.name)
@@ -1551,7 +1599,7 @@ class Pipeline:
                 self.stats.count_commented(basename)
                 self.stats.add_change(basename, i + 1, "Rule", "级联注释", line.strip())
 
-    def _strip_abandoned_policy_paths(self, state):
+    def _strip_abandoned_policy_paths(self, state, modes, global_counts, proxy_counts):
         """Remove policy-path=<abandoned> options from Proxy Group lines.
 
         If a group becomes empty after the strip (no explicit members, no
@@ -1594,16 +1642,26 @@ class Pipeline:
                 reformatted = _preserve_indent(line, format_proxy_group_line(pgl))
                 state.lines[i] = CASCADE_TAG + reformatted.lstrip()
                 deleted_name = unquote(pgl.name)
+                if (
+                    deleted_name in state.owned_groups
+                    and deleted_name not in state.self_deleted_groups
+                ):
+                    global_counts[deleted_name] -= 1
+                    proxy_counts[deleted_name] -= 1
                 state.self_deleted.add(deleted_name)
                 state.self_deleted_groups.add(deleted_name)
                 self.global_deleted.add(deleted_name)
-                # Propagate to this and all other non-abandoned files so the
-                # downstream fixpoint catches references to this group — unless
-                # some other emitted file still defines the same name.
-                if deleted_name not in self._live_names():
-                    state.deleted_names.add(deleted_name)
-                    for other in self.files.values():
-                        if other is not state and not other.is_abandoned:
+                # Propagate to this and all other reachable files according to
+                # each file's visibility scope.
+                if deleted_name not in BUILTIN_POLICIES:
+                    if global_counts[deleted_name] <= 0:
+                        state.deleted_names.add(deleted_name)
+                    for other_abs, other_mode in modes.items():
+                        other = self.files[other_abs]
+                        if other is state or other.is_abandoned:
+                            continue
+                        other_counts = global_counts if other_mode == "full" else proxy_counts
+                        if other_counts[deleted_name] <= 0:
                             other.deleted_names.add(deleted_name)
                 basename = os.path.basename(state.abs_path)
                 self.stats.count_commented(basename)

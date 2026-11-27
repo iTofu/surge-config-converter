@@ -4580,3 +4580,63 @@ class TestRound4Fixes:
         assert (tmp_path / "v4" / "a,b-v4.dconf").exists()
         assert not (tmp_path / "v4" / "managed-v4.conf").exists()
 
+
+class TestRound5Fixes:
+    def test_policy_path_proxy_does_not_shield_dead_global_proxy_or_group(self, tmp_path):
+        """A same-named node in a policy-path file is not visible to main.conf's
+        top-level underlying-proxy or [Rule], so deleting a global Dead / Route
+        must still cascade in main.conf while surviving inside the policy-path pool."""
+        (tmp_path / "sub.dconf").write_text(
+            "[Proxy]\n"
+            "Dead = trojan, 1.1.1.1, 443, password=p\n"
+            "Route = trojan, 1.1.1.2, 443, password=p\n"
+            "SubChain = http, 1.1.1.3, 80, underlying-proxy=Dead\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Dead = vless, 2.2.2.2, 443, username=u\n"
+            "Bridge = http, 3.3.3.3, 80, underlying-proxy=Dead\n"
+            "[Proxy Group]\n"
+            "Pool = select, policy-path=sub.dconf\n"
+            "Route = select, Dead\n"
+            "[Rule]\n"
+            "DOMAIN,bridge.example,Bridge\n"
+            "DOMAIN,route.example,Route\n"
+            "FINAL,DIRECT\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out_main = (tmp_path / "v4" / "main-v4.conf").read_text()
+        out_sub = (tmp_path / "v4" / "sub-v4.dconf").read_text()
+        assert "# [V5+ cascade] Bridge = http, 3.3.3.3, 80, underlying-proxy=Dead\n" in out_main
+        assert "# [V5+ cascade] DOMAIN,bridge.example,Bridge\n" in out_main
+        assert "# [V5+ cascade] DOMAIN,route.example,Route\n" in out_main
+        assert "SubChain = http, 1.1.1.3, 80, underlying-proxy=Dead\n" in out_sub
+
+    def test_abandoned_policy_path_managed_file_never_kills_ios_builtin_cellular(self, tmp_path):
+        """Abandoning a policy-path-only managed file must neither withdraw its
+        unloaded [Proxy Group] names nor cascade-comment Surge iOS built-in rules."""
+        (tmp_path / "airport.conf").write_text(
+            "#!MANAGED-CONFIG https://example.com/a.conf interval=3600\n"
+            "[Proxy]\n"
+            "Dead = vless, 1.1.1.1, 443, username=u\n"
+            "[Proxy Group]\n"
+            "CELLULAR = select, Dead\n"
+            "UnloadedShadow = select, Dead\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy Group]\n"
+            "Pool = select, DIRECT, policy-path=airport.conf\n"
+            "[Rule]\n"
+            "DOMAIN,cell.example,CELLULAR\n"
+            "DOMAIN,hybrid.example,HYBRID\n"
+            "FINAL,REJECT\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "DOMAIN,cell.example,CELLULAR\n" in out
+        assert "DOMAIN,hybrid.example,HYBRID\n" in out
+        assert "# [V5+ cascade] DOMAIN,cell.example,CELLULAR" not in out
