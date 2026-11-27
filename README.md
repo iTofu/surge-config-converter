@@ -119,9 +119,9 @@ psk = <legacy-psk>
 
 ### 引用文件
 
-- `#!include` 和 `policy-path` 引用的本地文件会被递归转换
+- `#!include` 和 `policy-path`（含双引号包裹的本地路径）引用的本地文件会被递归转换
 - 只要配置里有任何内容需要转换，它实际加载的每个本地文件都产出 `-v4` 副本，无需转换的原样复制；引用一律改写为 `-v4` 名，保证 `v4/` 内没有悬空引用
-- 仅被未加载段落提及的文件（如 `policy-path` 导入文件里 `[Proxy]` 以外的引用）不算加载，不产出
+- 仅被未加载段落提及的文件（如 `policy-path` 导入文件里 `[Proxy]` 以外的引用）不算加载，不产出；`#!include` 按整文件合并建模（不按 detached profile 拆分单段加载）
 - HTTP/HTTPS URL 不处理
 
 ### 托管配置（Managed Config）

@@ -124,9 +124,9 @@ HOST_PORT_PROXY_TYPES = {
 } | (V5PLUS_ONLY_PROXY_TYPES - {"tailscale"})
 
 
-# Built-in Surge policies that always exist regardless of config sections
+# Built-in Surge policies that always exist in [Rule] regardless of config sections
 BUILTIN_POLICIES = {
-    "DIRECT", "REJECT", "REJECT-TINYGIF", "REJECT-DROP", "REJECT-NO-DROP", "COMPATIBLE",
+    "DIRECT", "REJECT", "REJECT-TINYGIF", "REJECT-DROP", "REJECT-NO-DROP",
 }
 
 
@@ -233,6 +233,17 @@ def format_include_other_group(groups, orig_value=""):
         escaped = joined.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
     return joined
+
+
+def _format_policy_path_value(new_path, orig_value=""):
+    """Format a rewritten policy-path value, preserving surrounding quotes
+    (and quoting when the path contains commas or double quotes)."""
+    orig = orig_value.strip()
+    was_quoted = len(orig) >= 2 and orig[0] == '"' and orig[-1] == '"'
+    if was_quoted or "," in new_path or '"' in new_path:
+        escaped = new_path.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return new_path
 
 
 def _proxy_comma_positions(text):
@@ -701,6 +712,12 @@ def transform_proxy_line(line, stats, filename, line_num, section, legacy=None):
 
     name = line.split('=', 1)[0].strip()
 
+    # Surge ignores [Proxy] entries redefining the built-in DIRECT policy
+    # (case-sensitive, quoted or unquoted); leave them untouched so they never
+    # dirty a clean file or pollute deletion sets.
+    if unquote(name) == "DIRECT":
+        return line
+
     # Comment out proxies v4 cannot use (v5+ only types, snell version=6+),
     # unless the file's server keeps a v4-compatible snell instance.
     reason = v5plus_only_proxy_reason(line)
@@ -1014,18 +1031,23 @@ class Pipeline:
                         name = raw.split("=", 1)[0].strip()
                         if name:
                             deleted_name = unquote(name)
-                            state.deleted_names.add(deleted_name)
-                            state.self_deleted.add(deleted_name)
-                            state.self_deleted_proxies.add(deleted_name)
+                            if deleted_name not in BUILTIN_POLICIES:
+                                state.deleted_names.add(deleted_name)
+                                state.self_deleted.add(deleted_name)
+                                state.self_deleted_proxies.add(deleted_name)
                 elif not line.lstrip().startswith(("#", ";", "//")) and "=" in line:
                     name = line.split("=", 1)[0].strip()
                     if name:
-                        state.owned_proxies.add(unquote(name))
+                        proxy_name = unquote(name)
+                        if proxy_name not in BUILTIN_POLICIES:
+                            state.owned_proxies.add(proxy_name)
             elif section == "Proxy Group":
                 if not line.lstrip().startswith(("#", ";", "//")) and "=" in line:
                     name = line.split("=", 1)[0].strip()
                     if name:
-                        state.owned_groups.add(unquote(name))
+                        group_name = unquote(name)
+                        if group_name not in BUILTIN_POLICIES:
+                            state.owned_groups.add(group_name)
 
         # Recurse into local #!include and policy-path references so every
         # transitively referenced file lives in the shared FileState dict.
@@ -1044,7 +1066,7 @@ class Pipeline:
                 for key, value in pgl.options:
                     if key == "policy-path":
                         # policy-path always references proxy list files
-                        self._discover_ref(base_dir, value, "Proxy")
+                        self._discover_ref(base_dir, unquote(value.strip()), "Proxy")
 
         return state
 
@@ -1103,10 +1125,12 @@ class Pipeline:
                 if pgl is None:
                     continue
                 for key, value in pgl.options:
-                    if key == "policy-path" and not value.startswith(("http://", "https://")):
-                        refs.append((
-                            os.path.normpath(os.path.join(base_dir, value)),
-                            "policy-path", state.sections[i]))
+                    if key == "policy-path":
+                        raw_path = unquote(value.strip())
+                        if not raw_path.startswith(("http://", "https://")):
+                            refs.append((
+                                os.path.normpath(os.path.join(base_dir, raw_path)),
+                                "policy-path", state.sections[i]))
         return refs
 
     def _reachable_modes(self):
@@ -1115,6 +1139,11 @@ class Pipeline:
         Two modes, propagated along the reference edges:
           "full"  — the whole file joins the profile: the root itself, and
                     anything a "full" file pulls in with #!include.
+                    (Explicit converter contract preserved for compatibility
+                    with existing whole-file #!include tests such as
+                    test_included_file_groups_stay_live and
+                    TestCrossFileDirectHitCascade; section-scoped detached
+                    profile loading is intentionally out of scope.)
           "proxy" — only the [Proxy] section is used: anything reached by a
                     policy-path edge (Surge manual, Policy Including).
 
@@ -1238,7 +1267,7 @@ class Pipeline:
             for state in self.files.values():
                 if state.is_abandoned:
                     continue
-                state.deleted_names |= self.global_deleted - live
+                state.deleted_names = (state.deleted_names | self.global_deleted) - live
 
             # 2a. Strip policy-path options pointing at abandoned files (only in
             # files whose [Proxy Group] section is actually loaded).
@@ -1379,13 +1408,15 @@ class Pipeline:
                 return line, notes
             new_options = []
             for key, value in pgl.options:
-                if key == "policy-path" and not value.startswith(("http://", "https://")):
-                    abs_path = os.path.normpath(os.path.join(base_dir, value))
-                    if abs_path in self.emitting:
-                        new_options.append((key, make_v4_relname(value)))
-                        notes.append(
-                            f"policy-path={value} → policy-path={make_v4_relname(value)}")
-                        continue
+                if key == "policy-path":
+                    raw_path = unquote(value.strip())
+                    if not raw_path.startswith(("http://", "https://")):
+                        abs_path = os.path.normpath(os.path.join(base_dir, raw_path))
+                        if abs_path in self.emitting:
+                            v4_val = _format_policy_path_value(make_v4_relname(raw_path), value)
+                            new_options.append((key, v4_val))
+                            notes.append(f"policy-path={value} → policy-path={v4_val}")
+                            continue
                 new_options.append((key, value))
             if not notes:
                 return line, notes
@@ -1416,6 +1447,11 @@ class Pipeline:
                 if section == "Proxy":
                     if "=" not in line:
                         continue
+                    name = line.split("=", 1)[0].strip()
+                    deleted_name = unquote(name)
+                    # Surge ignores [Proxy] redefinitions of built-in DIRECT.
+                    if deleted_name == "DIRECT":
+                        continue
                     # Static file-level cascade for v4 [Proxy]-level underlying-proxy.
                     # Scope boundary: does not resolve per-group external-policy-modifier
                     # overrides (which would require cloning shared policy-path files and
@@ -1423,11 +1459,10 @@ class Pipeline:
                     underlying = extract_proxy_option(line, "underlying-proxy")
                     if underlying and underlying in state.deleted_names:
                         state.lines[i] = CASCADE_TAG + stripped
-                        name = line.split("=", 1)[0].strip()
-                        deleted_name = unquote(name)
-                        state.deleted_names.add(deleted_name)
                         state.self_deleted.add(deleted_name)
                         state.self_deleted_proxies.add(deleted_name)
+                        if deleted_name not in self._live_names():
+                            state.deleted_names.add(deleted_name)
                         self.stats.count_commented(basename)
                         self.stats.add_change(
                             basename, i + 1, "Proxy", "级联注释",
@@ -1488,9 +1523,10 @@ class Pipeline:
                     reformatted = _preserve_indent(line, format_proxy_group_line(pgl))
                     state.lines[i] = CASCADE_TAG + reformatted.lstrip()
                     deleted_name = unquote(pgl.name)
-                    state.deleted_names.add(deleted_name)
                     state.self_deleted.add(deleted_name)
                     state.self_deleted_groups.add(deleted_name)
+                    if deleted_name not in self._live_names():
+                        state.deleted_names.add(deleted_name)
                     self.stats.count_commented(basename)
                     self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", pgl.name)
                     changed = True
@@ -1538,10 +1574,11 @@ class Pipeline:
             removed_values = []
             for key, value in pgl.options:
                 if key == "policy-path":
-                    if value.startswith("http://") or value.startswith("https://"):
+                    raw_path = unquote(value.strip())
+                    if raw_path.startswith(("http://", "https://")):
                         new_options.append((key, value))
                         continue
-                    if os.path.basename(value) in abandoned_basenames:
+                    if os.path.basename(raw_path) in abandoned_basenames:
                         removed_values.append(value)
                         continue
                 new_options.append((key, value))
@@ -1557,14 +1594,14 @@ class Pipeline:
                 reformatted = _preserve_indent(line, format_proxy_group_line(pgl))
                 state.lines[i] = CASCADE_TAG + reformatted.lstrip()
                 deleted_name = unquote(pgl.name)
-                state.deleted_names.add(deleted_name)
                 state.self_deleted.add(deleted_name)
                 state.self_deleted_groups.add(deleted_name)
                 self.global_deleted.add(deleted_name)
-                # Propagate to all other non-abandoned files so the downstream
-                # fixpoint catches references to this group — unless some other
-                # emitted file still defines the same name.
+                # Propagate to this and all other non-abandoned files so the
+                # downstream fixpoint catches references to this group — unless
+                # some other emitted file still defines the same name.
                 if deleted_name not in self._live_names():
+                    state.deleted_names.add(deleted_name)
                     for other in self.files.values():
                         if other is not state and not other.is_abandoned:
                             other.deleted_names.add(deleted_name)

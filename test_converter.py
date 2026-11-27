@@ -4492,3 +4492,91 @@ class TestRound3Fixes:
         assert '# [V5+] Dead "Relay" = vless, 1.1.1.1, 443, username=u\n' in out
         assert r'# [V5+ cascade] Chained = http, 3.3.3.3, 80, underlying-proxy="Dead \"Relay\""' + "\n" in out
         assert "Main = select, Good\n" in out
+
+
+class TestRound4Fixes:
+    def test_live_group_in_main_shields_underlying_proxy_in_subfile(self, tmp_path):
+        """Deleting a same-named group in a subfile must not add the name to
+        that subfile's deleted_names while main.conf still defines it live."""
+        (tmp_path / "sub.dconf").write_text(
+            "[Proxy]\n"
+            "Dead = vless, 1.1.1.1, 443, username=u\n"
+            "Bridge = http, 2.2.2.2, 80, underlying-proxy=Relay\n"
+            "[Proxy Group]\n"
+            "Relay = select, Dead\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Good = trojan, 3.3.3.3, 443, password=p\n"
+            "#!include sub.dconf\n"
+            "[Proxy Group]\n"
+            "Relay = select, Good\n"
+            "[Rule]\n"
+            "DOMAIN,bridge.example,Bridge\n"
+            "FINAL,DIRECT\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out_sub = (tmp_path / "v4" / "sub-v4.dconf").read_text()
+        out_main = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "Bridge = http, 2.2.2.2, 80, underlying-proxy=Relay\n" in out_sub
+        assert "# [V5+ cascade] Bridge" not in out_sub
+        assert "DOMAIN,bridge.example,Bridge\n" in out_main
+
+    def test_builtin_direct_redefinition_never_cascades_direct_rules(self, tmp_path):
+        """Surge ignores [Proxy] DIRECT redefinitions; converter must leave
+        them untouched and never cascade-comment rules targeting DIRECT."""
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Dead = vless, 1.1.1.1, 443, username=u\n"
+            "Good = trojan, 2.2.2.2, 443, password=p\n"
+            "DIRECT = http, 3.3.3.3, 80, underlying-proxy=Dead\n"
+            "[Rule]\n"
+            "DOMAIN,protected.example,DIRECT\n"
+            "FINAL,REJECT\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "DIRECT = http, 3.3.3.3, 80, underlying-proxy=Dead\n" in out
+        assert "DOMAIN,protected.example,DIRECT\n" in out
+        assert "# [V5+ cascade] DOMAIN,protected.example,DIRECT" not in out
+
+    def test_quoted_local_policy_path_discovered_rewritten_and_abandoned_stripped(self, tmp_path):
+        """Quoted local policy-path values must be unquoted for discovery,
+        reachability, abandoned-file stripping, and -v4 rewriting."""
+        (tmp_path / "nodes.dconf").write_text(
+            "[Proxy]\n"
+            "N1 = trojan, 1.1.1.1, 443, password=p\n"
+        )
+        (tmp_path / "a,b.dconf").write_text(
+            "[Proxy]\n"
+            "N2 = vless, 2.2.2.2, 443, username=u\n"
+            "N3 = trojan, 3.3.3.3, 443, password=p\n"
+        )
+        (tmp_path / "managed.conf").write_text(
+            "#!MANAGED-CONFIG https://example.com/m.conf interval=3600\n"
+            "[Proxy]\n"
+            "M1 = vless, 4.4.4.4, 443, username=u\n"
+        )
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy Group]\n"
+            'G1 = select, policy-path="nodes.dconf"\n'
+            'G2 = select, policy-path="a,b.dconf"\n'
+            'G3 = select, DIRECT, policy-path="managed.conf"\n'
+            "[Rule]\n"
+            "FINAL,G1\n"
+        )
+        stats = ConversionStats()
+        assert convert_file(str(main), stats, {str(main): None}) is not None
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert 'G1 = select, policy-path="nodes-v4.dconf"\n' in out
+        assert 'G2 = select, policy-path="a,b-v4.dconf"\n' in out
+        assert "G3 = select, DIRECT\n" in out
+        assert (tmp_path / "v4" / "nodes-v4.dconf").exists()
+        assert (tmp_path / "v4" / "a,b-v4.dconf").exists()
+        assert not (tmp_path / "v4" / "managed-v4.conf").exists()
+
