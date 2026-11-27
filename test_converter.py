@@ -5120,3 +5120,120 @@ class TestRound2Regressions:
         assert "# [V5+ cascade] RULE-SET,example (pilot.list,Old" in out
         assert "\nRULE-SET,example (pilot-v4.list,Keep\n" in out
         assert (tmp_path / "v4" / "example (pilot-v4.list").read_text() == "DOMAIN,pilot.example\n"
+
+
+# --- T91: Round-3 Codex review regression suite (1 P0 + 3 P1 fixes) ---
+
+class TestRound3Regressions:
+    def test_existing_directory_at_output_or_backup_path_aborts_without_touching_dir(self, tmp_path):
+        """P0: existing directory at planned output or backup path must abort
+        pre-emit without renaming or trashing the directory."""
+        # Case A: directory occupies planned output path
+        d1 = tmp_path / "dir_out"
+        (d1 / "v4" / "main-v4.conf").mkdir(parents=True)
+        sentinel = d1 / "v4" / "main-v4.conf" / "important.txt"
+        sentinel.write_text("keep-me\n")
+        m1 = d1 / "main.conf"
+        m1.write_text("[General]\nudp-priority = true\n[Rule]\nFINAL,DIRECT\n")
+        s1 = ConversionStats()
+        assert convert_file(str(m1), s1, {str(m1): None}) is None
+        assert any("目录" in e for e in s1.errors)
+        assert sentinel.read_text() == "keep-me\n"
+        assert not (d1 / "v4" / "main-v4-deprecated.conf").exists()
+
+        # Case B: directory occupies planned -deprecated backup path
+        d2 = tmp_path / "dir_bak"
+        (d2 / "v4" / "main-v4-deprecated.conf").mkdir(parents=True)
+        sentinel2 = d2 / "v4" / "main-v4-deprecated.conf" / "important.txt"
+        sentinel2.write_text("keep-me-2\n")
+        (d2 / "v4" / "main-v4.conf").write_text("stale-output\n")
+        m2 = d2 / "main.conf"
+        m2.write_text("[General]\nudp-priority = true\n[Rule]\nFINAL,DIRECT\n")
+        s2 = ConversionStats()
+        assert convert_file(str(m2), s2, {str(m2): None}) is None
+        assert any("目录" in e for e in s2.errors)
+        assert sentinel2.read_text() == "keep-me-2\n"
+        assert (d2 / "v4" / "main-v4.conf").read_text() == "stale-output\n"
+
+    def test_include_other_group_and_explicit_plus_empty_dynamic_sources_evaluated_by_final_members(self, tmp_path):
+        """P1: (a) include-other-group filtered by policy-regex-filter cascades
+        when source group retains only non-matching members; (b) deleting the
+        only explicit member cascades when dynamic source already matched zero."""
+        # Case A: include-other-group + policy-regex-filter
+        d1 = tmp_path / "iog_re"
+        d1.mkdir()
+        m1 = d1 / "main.conf"
+        m1.write_text(
+            "[Proxy]\n"
+            "Fast = anytls, 1.1.1.1, 443, password=p\n"
+            "Slow = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            "Base = select, Fast, Slow\n"
+            "OnlyFast = select, include-other-group=Base, policy-regex-filter=^Fast$\n"
+            "[Rule]\n"
+            "FINAL,OnlyFast\n"
+        )
+        s1 = ConversionStats()
+        assert convert_file(str(m1), s1, {str(m1): None}) is None
+        assert any("FINAL" in e for e in s1.errors)
+
+        # Case B: explicit member deleted + pre-existing 0-match include-all-proxies
+        d2 = tmp_path / "exp_dyn"
+        d2.mkdir()
+        m2 = d2 / "main.conf"
+        m2.write_text(
+            "[Proxy]\n"
+            "Fast = anytls, 1.1.1.1, 443, password=p\n"
+            "Slow = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            "OnlyFast = select, Fast, include-all-proxies=1, policy-regex-filter=^Nope$\n"
+            "[Rule]\n"
+            "FINAL,OnlyFast\n"
+        )
+        s2 = ConversionStats()
+        assert convert_file(str(m2), s2, {str(m2): None}) is None
+        assert any("FINAL" in e for e in s2.errors)
+
+    def test_surge_icu_regex_unicode_property_matches_and_invalid_regex_fails_closed(self, tmp_path):
+        """P1: Surge ICU regex `\\p{Han}` matches Chinese proxy names accurately;
+        genuinely invalid regex on a shrinking pool fails closed with diagnostic."""
+        d1 = tmp_path / "icu_han"
+        d1.mkdir()
+        m1 = d1 / "main.conf"
+        m1.write_text(
+            "[Proxy]\n"
+            "中文节点 = anytls, 1.1.1.1, 443, password=p\n"
+            "SlowEN = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            r"HanOnly = select, include-all-proxies=1, policy-regex-filter=\p{Han}" + "\n"
+            "[Rule]\n"
+            "FINAL,HanOnly\n"
+        )
+        s1 = ConversionStats()
+        assert convert_file(str(m1), s1, {str(m1): None}) is None
+        assert s1.errors
+
+        # Uncompilable regex on a shrinking pool -> explicit diagnostic error
+        d2 = tmp_path / "bad_re"
+        d2.mkdir()
+        m2 = d2 / "main.conf"
+        m2.write_text(
+            "[Proxy]\n"
+            "Dead = anytls, 1.1.1.1, 443, password=p\n"
+            "Slow = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            "Broken = select, include-all-proxies=1, policy-regex-filter=[unclosed\n"
+            "[Rule]\n"
+            "FINAL,Broken\n"
+        )
+        s2 = ConversionStats()
+        assert convert_file(str(m2), s2, {str(m2): None}) is None
+        assert any("policy-regex-filter" in e for e in s2.errors)
+
+    def test_quoted_snell_version_5_and_shadow_tls_version_3_downgraded(self):
+        """P1: quoted version=\"5\" and shadow-tls-version=\"3\" downgrade consistently."""
+        result = convert("""
+            [Proxy]
+            S5 = snell, 1.2.3.4, 443, psk=abc, version="5", shadow-tls-version="3"
+        """)
+        assert result.splitlines()[1] == "S5 = snell, 1.2.3.4, 443, psk=abc, version=4, shadow-tls-version=2"

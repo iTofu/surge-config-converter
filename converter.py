@@ -31,6 +31,7 @@ import ctypes
 import errno
 import os
 import re
+import stat
 import sys
 import unicodedata
 from dataclasses import dataclass, field
@@ -396,6 +397,116 @@ class ProxyGroupLine:
     trailing_comment: str = ""
 
 
+class _ICURegex:
+    """Thin wrapper around macOS libicucore (the exact ICU regex engine used by
+    Surge / NSRegularExpression) so patterns like \\p{Han} match identically."""
+
+    _lib = None
+    _init_attempted = False
+
+    @classmethod
+    def _load_lib(cls):
+        if cls._init_attempted:
+            return cls._lib
+        cls._init_attempted = True
+        if sys.platform != "darwin":
+            return None
+        try:
+            lib = ctypes.CDLL("/usr/lib/libicucore.A.dylib")
+            lib.uregex_open.argtypes = [
+                ctypes.c_void_p, ctypes.c_int32, ctypes.c_uint32,
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+            ]
+            lib.uregex_open.restype = ctypes.c_void_p
+            lib.uregex_setText.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32,
+                ctypes.POINTER(ctypes.c_int32),
+            ]
+            lib.uregex_find.argtypes = [
+                ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_int32),
+            ]
+            lib.uregex_find.restype = ctypes.c_int8
+            lib.uregex_close.argtypes = [ctypes.c_void_p]
+            cls._lib = lib
+        except OSError:
+            cls._lib = None
+        return cls._lib
+
+    def __init__(self, pattern):
+        self._ptr = None
+        lib = self._load_lib()
+        if lib is None:
+            raise RuntimeError("libicucore unavailable")
+        p_u16 = pattern.encode("utf-16-le")
+        buf = ctypes.create_string_buffer(p_u16, len(p_u16))
+        err = ctypes.c_int32(0)
+        ptr = lib.uregex_open(ctypes.addressof(buf), len(p_u16) // 2, 0, None, ctypes.byref(err))
+        if err.value > 0 or not ptr:
+            if ptr:
+                lib.uregex_close(ptr)
+            raise ValueError(f"invalid ICU regex: {pattern}")
+        self._ptr = ptr
+
+    def search(self, text):
+        if not self._ptr:
+            return False
+        lib = self._lib
+        t_u16 = text.encode("utf-16-le")
+        buf = ctypes.create_string_buffer(t_u16, len(t_u16))
+        err = ctypes.c_int32(0)
+        lib.uregex_setText(self._ptr, ctypes.addressof(buf), len(t_u16) // 2, ctypes.byref(err))
+        if err.value > 0:
+            return False
+        found = lib.uregex_find(self._ptr, 0, ctypes.byref(err))
+        # Detach text pointer before buf is freed
+        err_reset = ctypes.c_int32(0)
+        lib.uregex_setText(self._ptr, None, 0, ctypes.byref(err_reset))
+        return bool(found) and err.value <= 0
+
+    def __del__(self):
+        ptr = getattr(self, "_ptr", None)
+        lib = getattr(self, "_lib", None)
+        if ptr and lib is not None:
+            self._ptr = None
+            try:
+                lib.uregex_close(ptr)
+            except Exception:
+                pass
+
+
+class _UnverifiableRegex:
+    """Sentinel for a policy-regex-filter pattern that could not be compiled."""
+
+    def __init__(self, pattern):
+        self.pattern = pattern
+
+
+def _compile_surge_regex(pattern):
+    """Compile a Surge policy-regex-filter using Surge's native ICU engine on
+    macOS (falling back to optional `regex` / stdlib `re` elsewhere).
+
+    Returns a matcher with `.search(text) -> bool`, or `_UnverifiableRegex` if
+    the pattern cannot be validated in the current environment.
+    """
+    if sys.platform == "darwin" and _ICURegex._load_lib() is not None:
+        try:
+            return _ICURegex(pattern)
+        except (ValueError, RuntimeError):
+            return _UnverifiableRegex(pattern)
+    try:
+        import regex as regex_mod
+        compiled = regex_mod.compile(pattern)
+        return compiled
+    except ImportError:
+        pass
+    except Exception:
+        return _UnverifiableRegex(pattern)
+    try:
+        return re.compile(pattern)
+    except re.error:
+        return _UnverifiableRegex(pattern)
+
+
 @dataclass
 class _GroupOptionIR:
     """In-memory structured option inside a [Proxy Group] record."""
@@ -403,6 +514,7 @@ class _GroupOptionIR:
     raw_value: str
     # Populated when key.lower() == "include-other-group"
     iog_groups: list = None
+    initial_iog_groups: list = None
     iog_was_quoted: bool = False
     iog_had_v5_escape: bool = False
     iog_dirty: bool = False
@@ -426,23 +538,30 @@ class _GroupRecordIR:
     options: list           # list[_GroupOptionIR]
     trailing_comment: str
     indent: str
+    initial_members: list = field(default_factory=list)
+    initial_options: list = field(default_factory=list)
     dirty: bool = False
     commented_out: bool = False
+    _regex_cached: bool = False
+    _regex_matcher: object = None
 
     def needs_v4_writeback(self):
         return self.dirty or any(opt.iog_had_v5_escape for opt in self.options)
 
     def compiled_regex_filter(self):
-        """Return compiled policy-regex-filter Pattern if present and valid, else None."""
-        for opt in self.options:
+        """Return matcher with .search(), _UnverifiableRegex, or None (no filter)."""
+        if self._regex_cached:
+            return self._regex_matcher
+        self._regex_cached = True
+        for opt in self.initial_options or self.options:
             if opt.key.lower() == "policy-regex-filter":
                 pattern = unquote(opt.raw_value.strip())
                 if not pattern:
+                    self._regex_matcher = None
                     return None
-                try:
-                    return re.compile(pattern)
-                except re.error:
-                    return None
+                self._regex_matcher = _compile_surge_regex(pattern)
+                return self._regex_matcher
+        self._regex_matcher = None
         return None
 
     def has_effective_members(self, deleted_names, abandoned_paths=None, base_dir=None,
@@ -557,10 +676,12 @@ def _build_group_record(line):
         sv = value.strip()
         is_quoted = len(sv) >= 2 and sv[0] == '"' and sv[-1] == '"'
         if kl == "include-other-group":
+            groups = parse_include_other_groups(sv)
             opts.append(_GroupOptionIR(
                 key=key,
                 raw_value=value,
-                iog_groups=parse_include_other_groups(sv),
+                iog_groups=list(groups),
+                initial_iog_groups=list(groups),
                 iog_was_quoted=is_quoted,
                 iog_had_v5_escape=_has_v5_quote_escape(sv),
             ))
@@ -580,6 +701,8 @@ def _build_group_record(line):
         options=opts,
         trailing_comment=pgl.trailing_comment,
         indent=indent,
+        initial_members=list(pgl.members),
+        initial_options=list(opts),
     )
 
 
@@ -1050,14 +1173,31 @@ def _filename_too_long(directory, filename):
     return False
 
 
+def _is_non_regular_target(path):
+    """Return True if path exists (via lstat/stat) as a directory or non-regular
+    filesystem entry (never safe to overwrite, rename as backup, or trash)."""
+    if not os.path.lexists(path):
+        return False
+    if os.path.isdir(path):
+        return True
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode))
+
+
 def backup_if_exists(filepath):
-    """If filepath exists (including a dangling symlink), rename it with a
-    -deprecated suffix (trashing any pre-existing backup first so we never
-    silently overwrite)."""
+    """If filepath exists (regular file or symlink — never a directory), rename
+    it with a -deprecated suffix (trashing any pre-existing regular backup first)."""
     if os.path.lexists(filepath):
+        if _is_non_regular_target(filepath):
+            raise IsADirectoryError(f"拒绝移动目录或非普通文件: {filepath}")
         p = Path(filepath)
         backup = str(p.with_stem(p.stem + "-deprecated"))
         if os.path.lexists(backup):
+            if _is_non_regular_target(backup):
+                raise IsADirectoryError(f"拒绝删除目录或非普通文件备份: {backup}")
             send2trash(backup)
             print(f"已将旧备份移至垃圾桶: {backup}")
         os.rename(filepath, backup)
@@ -1157,7 +1297,7 @@ def _replace_proxy_option_value(line, option_name, old_value, new_value):
         key = seg[:eq_rel].strip().lower()
         val_part = seg[eq_rel + 1:]
         val_stripped = val_part.strip()
-        if key == target and val_stripped == old_value:
+        if key == target and unquote(val_stripped) == old_value:
             val_lead = len(val_part) - len(val_part.lstrip())
             v_start = start + eq_rel + 1 + val_lead
             v_end = v_start + len(val_stripped)
@@ -1785,6 +1925,138 @@ class Pipeline:
                     return True
         return False
 
+    def _build_group_index(self, loaded_map, include_abandoned=False):
+        """Map unquoted group name -> [(FileState, line_idx, _GroupRecordIR)]
+        for all [Proxy Group] definitions in loaded_map."""
+        index = {}
+        for abs_path, loaded_set in loaded_map.items():
+            if not _section_is_loaded(loaded_set, "Proxy Group"):
+                continue
+            st = self.files.get(abs_path)
+            if st is None or (st.is_abandoned and not include_abandoned):
+                continue
+            for idx, rec in st.group_records.items():
+                if not include_abandoned and rec.commented_out:
+                    continue
+                index.setdefault(unquote(rec.name), []).append((st, idx, rec))
+        return index
+
+    def _group_member_supply(self, state, rec, group_index, global_deleted,
+                             global_proxies, use_initial, visited=None):
+        """Recursively compute (known_members, has_unknown_supply, unverifiable_patterns)
+        for a [Proxy Group] either BEFORE conversion (use_initial=True) or AFTER
+        current deletions (use_initial=False).
+
+        Per Surge semantics, explicit static members are unfiltered while
+        dynamically imported members (include-all-proxies, policy-path,
+        include-other-group) are filtered by the group's policy-regex-filter.
+        """
+        if visited is None:
+            visited = set()
+        visit_key = (state.abs_path, id(rec))
+        if visit_key in visited:
+            return set(), False, []
+        visited = visited | {visit_key}
+
+        base_dir = os.path.dirname(state.abs_path)
+        matcher = rec.compiled_regex_filter()
+        unverifiable = []
+        is_unverifiable = isinstance(matcher, _UnverifiableRegex)
+
+        def _filter_names(names):
+            if matcher is None or is_unverifiable:
+                return set(names)
+            return {n for n in names if matcher.search(n)}
+
+        known = set()
+        has_unknown = False
+
+        # 1. Explicit static members (unfiltered by policy-regex-filter)
+        if use_initial:
+            known |= {unquote(m) for m in (rec.initial_members or rec.members)}
+        else:
+            known |= {unquote(m) for m in rec.members if unquote(m) not in global_deleted}
+
+        # 2. Dynamic imported sources (filtered by policy-regex-filter)
+        raw_dynamic = set()
+        opts = (rec.initial_options or rec.options) if use_initial else rec.options
+        for opt in opts:
+            kl = opt.key.lower()
+            if kl == "include-all-proxies" and opt.raw_value.strip() in {"1", "true"}:
+                if self._root_has_remote_proxy_include():
+                    has_unknown = True
+                else:
+                    raw_dynamic |= set(global_proxies)
+            elif kl == "policy-path" and opt.policy_path is not None:
+                if opt.policy_path.startswith(("http://", "https://")):
+                    has_unknown = True
+                else:
+                    ref_abs = self._resolve_local_path(opt.policy_path, base_dir, prefer_root=True)
+                    st = self.files.get(ref_abs)
+                    if st is None:
+                        if ref_abs not in self.abandoned_files:
+                            has_unknown = True
+                    elif use_initial:
+                        raw_dynamic |= st.initial_proxies
+                    elif not st.is_abandoned:
+                        raw_dynamic |= (st.owned_proxies - st.self_deleted_proxies)
+            elif kl == "include-other-group" and opt.iog_groups is not None:
+                groups = (opt.initial_iog_groups if opt.initial_iog_groups is not None else opt.iog_groups) if use_initial else opt.iog_groups
+                for g in groups:
+                    if not use_initial and g in global_deleted:
+                        continue
+                    targets = group_index.get(g)
+                    if not targets:
+                        has_unknown = True
+                        continue
+                    for sub_state, _, sub_rec in targets:
+                        if not use_initial and sub_rec.commented_out:
+                            continue
+                        sub_known, sub_unk, sub_unv = self._group_member_supply(
+                            sub_state, sub_rec, group_index, global_deleted,
+                            global_proxies, use_initial, visited=visited,
+                        )
+                        raw_dynamic |= sub_known
+                        has_unknown = has_unknown or sub_unk
+                        unverifiable.extend(sub_unv)
+
+        if is_unverifiable and raw_dynamic:
+            unverifiable.append((os.path.basename(state.abs_path), rec.name, matcher.pattern))
+
+        known |= _filter_names(raw_dynamic)
+        return known, has_unknown, unverifiable
+
+    def _group_lost_all_members(self, state, rec, initial_group_index, current_group_index,
+                                global_deleted, initial_global_proxies, current_global_proxies):
+        """Return (had_initial, has_current, unverifiable_error_list) for rec.
+
+        If a group's policy-regex-filter could not be compiled AND the group
+        has no surviving explicit member AND its unfiltered dynamic pool shrank
+        during conversion, returns a diagnostic error so conversion fails closed
+        instead of exporting a potentially empty group.
+        """
+        init_known, init_unk, _ = self._group_member_supply(
+            state, rec, initial_group_index, set(), initial_global_proxies, use_initial=True
+        )
+        cur_known, cur_unk, cur_unv = self._group_member_supply(
+            state, rec, current_group_index, global_deleted, current_global_proxies, use_initial=False
+        )
+        had_initial = init_unk or bool(init_known)
+        has_current = cur_unk or bool(cur_known)
+
+        unv_errors = []
+        if cur_unv:
+            # Only error when no surviving explicit member guarantees non-emptiness
+            # and the unfiltered dynamic pool actually lost members.
+            surviving_explicit = [m for m in rec.members if unquote(m) not in global_deleted]
+            if not surviving_explicit and not cur_unk and has_current and init_known != cur_known:
+                for fname, gname, pat in cur_unv:
+                    unv_errors.append(
+                        f"{fname} [{gname}] 无法验证 policy-regex-filter 正则 {pat!r}，"
+                        "动态代理池已删减且无法确认剩余匹配成员；已停止导出。"
+                    )
+        return had_initial, has_current, unv_errors
+
     def _current_global_proxies(self, global_proxy_files):
         live = set()
         for p in global_proxy_files:
@@ -1792,48 +2064,6 @@ class Pipeline:
             if st is not None and not st.is_abandoned:
                 live |= st.owned_proxies - st.self_deleted_proxies
         return live
-
-    def _dynamic_emptied_for_group(self, rec, base_dir, initial_global_proxies, current_global_proxies):
-        """Evaluate per-group dynamic member sources (policy-path &
-        include-all-proxies) WITH the group's policy-regex-filter applied.
-
-        Returns (any_source_emptied, emptied_policy_paths, global_proxies_emptied):
-        only reports a source as emptied when it matched >=1 proxy BEFORE
-        conversion and matches 0 surviving proxies AFTER conversion (preserving
-        D6 for pre-existing empty filters).
-        """
-        regex = rec.compiled_regex_filter()
-
-        def _matches_any(names):
-            if not names:
-                return False
-            if regex is None:
-                return True
-            return any(regex.search(n) is not None for n in names)
-
-        global_emptied = False
-        if not self._root_has_remote_proxy_include():
-            if _matches_any(initial_global_proxies) and not _matches_any(current_global_proxies):
-                global_emptied = True
-
-        emptied_pp = set()
-        any_emptied = False
-        for opt in rec.options:
-            kl = opt.key.lower()
-            if kl == "include-all-proxies" and opt.raw_value.strip() in {"1", "true"}:
-                if global_emptied:
-                    any_emptied = True
-            elif (kl == "policy-path" and opt.policy_path is not None
-                    and not opt.policy_path.startswith(("http://", "https://"))):
-                ref_abs = self._resolve_local_path(opt.policy_path, base_dir, prefer_root=True)
-                st = self.files.get(ref_abs)
-                if st is None or st.is_abandoned:
-                    continue
-                surviving = st.owned_proxies - st.self_deleted_proxies
-                if _matches_any(st.initial_proxies) and not _matches_any(surviving):
-                    emptied_pp.add(ref_abs)
-                    any_emptied = True
-        return any_emptied, emptied_pp, global_emptied
 
     def _emitting(self):
         """All-or-nothing over the loaded profile: emit every loaded file iff
@@ -2155,6 +2385,7 @@ class Pipeline:
             st = self.files.get(p)
             if st is not None:
                 initial_global_proxies |= st.initial_proxies
+        initial_group_index = self._build_group_index(initial_loaded, include_abandoned=True)
 
         def _record_loaded(loaded_map, global_proxy_files):
             ever_global_proxy.update(global_proxy_files)
@@ -2206,13 +2437,15 @@ class Pipeline:
             # 2a. Strip abandoned policy-path options & abandoned/remote root #!include entries
             global_del_now = self.global_deleted - self._live_names()
             cur_global_proxies = self._current_global_proxies(global_proxy_files)
+            cur_group_index = self._build_group_index(loaded_map, include_abandoned=False)
             for abs_path, loaded_set in loaded_map.items():
                 state = self.files[abs_path]
                 if state.is_abandoned:
                     continue
                 if _section_is_loaded(loaded_set, "Proxy Group"):
                     self._strip_abandoned_policy_paths(
-                        state, global_del_now, initial_global_proxies, cur_global_proxies
+                        state, global_del_now, initial_group_index, cur_group_index,
+                        initial_global_proxies, cur_global_proxies,
                     )
             if not root_state.is_abandoned:
                 self._strip_abandoned_includes(root_state)
@@ -2237,13 +2470,14 @@ class Pipeline:
                     eff_global = self.global_deleted - self._live_names()
                     is_global_proxy = abs_path in global_proxy_files
                     cur_global_proxies = self._current_global_proxies(global_proxy_files)
-                    before_p = set(state.self_deleted_proxies)
-                    before_g = set(state.self_deleted_groups)
-                    self._cascade_single_file(
+                    cur_group_index = self._build_group_index(loaded_map, include_abandoned=False)
+                    mutated = self._cascade_single_file(
                         state,
                         loaded_set=loaded_set,
                         is_global_proxy_file=is_global_proxy,
                         global_deleted_names=eff_global,
+                        initial_group_index=initial_group_index,
+                        current_group_index=cur_group_index,
                         initial_global_proxies=initial_global_proxies,
                         current_global_proxies=cur_global_proxies,
                         live_wg_sections=live_wg_sections,
@@ -2251,7 +2485,7 @@ class Pipeline:
                         dead_rulesets=dead_rulesets,
                         has_unexpanded_rs=has_unexpanded_rs,
                     )
-                    if (state.self_deleted_proxies - before_p) or (state.self_deleted_groups - before_g):
+                    if mutated:
                         changed = True
 
             # 3b. Withdraw names defined only in previously-loaded unreachable subtrees
@@ -2443,25 +2677,28 @@ class Pipeline:
                             self.stats.add_change(basename, i + 1, "Rule", "引用改写", note)
 
     def _cascade_single_file(self, state, loaded_set=None, is_global_proxy_file=True,
-                             global_deleted_names=None, initial_global_proxies=None,
+                             global_deleted_names=None, initial_group_index=None,
+                             current_group_index=None, initial_global_proxies=None,
                              current_global_proxies=None, live_wg_sections=None,
                              has_unexpanded_wg=False, dead_rulesets=None,
                              has_unexpanded_rs=False):
         """Fixpoint over loaded sections: cascade deleted proxies/groups through
-        underlying-proxy, dead WireGuard sections, structured ProxyGroup IR
-        (including per-group regex-filtered emptied dynamic sources), and Rule
-        AST policies & dead RULE-SET references.
+        underlying-proxy, dead WireGuard sections, unified effective-member
+        ProxyGroup evaluation (including recursive include-other-group and
+        Surge ICU regex filters), and Rule AST policies & dead RULE-SET refs.
 
-        Strictly separates global vs private [Proxy] namespaces so private
-        policy-path deletions never leak into global groups or rules in the same file.
+        Returns True if any proxy/group state mutated during this call.
         """
         global_deleted = set(global_deleted_names or ())
+        initial_group_index = initial_group_index if initial_group_index is not None else {}
+        current_group_index = current_group_index if current_group_index is not None else {}
         initial_global_proxies = initial_global_proxies if initial_global_proxies is not None else set()
         current_global_proxies = current_global_proxies if current_global_proxies is not None else set()
         live_wg_sections = live_wg_sections if live_wg_sections is not None else set()
         dead_rulesets = dead_rulesets if dead_rulesets is not None else set()
         base_dir = os.path.dirname(state.abs_path)
         basename = os.path.basename(state.abs_path)
+        mutated_any = False
 
         def _mark_deleted_proxy(deleted_name):
             state.self_deleted_proxies.add(deleted_name)
@@ -2505,6 +2742,7 @@ class Pipeline:
                             f"{name} (underlying-proxy={underlying})",
                         )
                         changed = True
+                        mutated_any = True
                         continue
                     if extract_proxy_type(line) == "wireguard":
                         wg_sec = extract_proxy_option(line, "section-name")
@@ -2518,6 +2756,7 @@ class Pipeline:
                                 f"{name} (WireGuard {wg_sec})",
                             )
                             changed = True
+                            mutated_any = True
                     continue
 
                 if section != "Proxy Group" or i not in state.group_records:
@@ -2544,6 +2783,7 @@ class Pipeline:
                         f"{rec.name} (underlying-proxy={dead_relay})",
                     )
                     changed = True
+                    mutated_any = True
                     continue
 
                 orig_members = list(rec.members)
@@ -2569,39 +2809,34 @@ class Pipeline:
                         new_opts.append(opt)
                 rec.options = new_opts
 
-                dynamic_emptied, emptied_pp, global_emptied = self._dynamic_emptied_for_group(
-                    rec, base_dir, initial_global_proxies, current_global_proxies
+                had_initial, has_current, unv_errors = self._group_lost_all_members(
+                    state, rec, initial_group_index, current_group_index,
+                    global_deleted, initial_global_proxies, current_global_proxies,
                 )
+                for err in unv_errors:
+                    if err not in self.stats.errors:
+                        self.stats.errors.append(err)
 
-                if not removed_tokens and not dynamic_emptied:
-                    continue  # D6: pre-existing empty groups left alone
-
-                still_alive = rec.has_effective_members(
-                    global_deleted,
-                    self.abandoned_files,
-                    emptied_policy_paths=emptied_pp,
-                    global_proxies_emptied=global_emptied,
-                    resolve_path_fn=lambda p: self._resolve_local_path(p, base_dir, prefer_root=True),
-                )
-                if still_alive:
-                    if removed_tokens:
-                        rec.dirty = True
-                        self.stats.add_change(
-                            basename, i + 1, "Proxy Group", "级联移除成员",
-                            f"{rec.name}: {', '.join(removed_tokens)}",
-                        )
-                        changed = True
-                else:
+                if had_initial and not has_current:
                     rec.dirty = True
                     rec.commented_out = True
                     _mark_deleted_group(unquote(rec.name))
                     self.stats.count_commented(basename)
                     self.stats.add_change(basename, i + 1, "Proxy Group", "级联注释", rec.name)
                     changed = True
+                    mutated_any = True
+                elif removed_tokens:
+                    rec.dirty = True
+                    self.stats.add_change(
+                        basename, i + 1, "Proxy Group", "级联移除成员",
+                        f"{rec.name}: {', '.join(removed_tokens)}",
+                    )
+                    changed = True
+                    mutated_any = True
 
         # Post-fixpoint: comment out loaded [Rule] lines whose policy or RULE-SET is dead
         if not _section_is_loaded(loaded_set, "Rule"):
-            return
+            return mutated_any
         for i, line in enumerate(state.lines):
             if state.sections[i] != "Rule":
                 continue
@@ -2632,8 +2867,11 @@ class Pipeline:
                 self.stats.add_change(
                     basename, i + 1, "Rule", "级联注释", f"{line.strip()} ({dead_rs})"
                 )
+        return mutated_any
 
-    def _strip_abandoned_policy_paths(self, state, global_deleted, initial_global_proxies, current_global_proxies):
+    def _strip_abandoned_policy_paths(self, state, global_deleted, initial_group_index,
+                                      current_group_index, initial_global_proxies,
+                                      current_global_proxies):
         if not self.abandoned_files:
             return
         base_dir = os.path.dirname(state.abs_path)
@@ -2655,16 +2893,14 @@ class Pipeline:
                 continue
             rec.options = new_opts
             rec.dirty = True
-            _, emptied_pp, global_emptied = self._dynamic_emptied_for_group(
-                rec, base_dir, initial_global_proxies, current_global_proxies
+            had_initial, has_current, unv_errors = self._group_lost_all_members(
+                state, rec, initial_group_index, current_group_index,
+                global_deleted, initial_global_proxies, current_global_proxies,
             )
-            if rec.has_effective_members(
-                global_deleted,
-                self.abandoned_files,
-                emptied_policy_paths=emptied_pp,
-                global_proxies_emptied=global_emptied,
-                resolve_path_fn=lambda p: self._resolve_local_path(p, base_dir, prefer_root=True),
-            ):
+            for err in unv_errors:
+                if err not in self.stats.errors:
+                    self.stats.errors.append(err)
+            if not (had_initial and not has_current):
                 self.stats.add_change(
                     basename, i + 1, "Proxy Group",
                     "移除 policy-path", f"{rec.name}: {', '.join(removed_values)}",
@@ -2749,6 +2985,21 @@ class Pipeline:
 
         for abs_path, planned_content, is_binary in planned_writes:
             out_path = self._output_path(abs_path)
+            out_dir = os.path.dirname(out_path)
+            out_name = os.path.basename(out_path)
+
+            if os.path.lexists(out_dir) and not os.path.isdir(out_dir):
+                self.stats.errors.append(
+                    f"输出目录路径被非目录条目占用，已中止导出: {out_dir}"
+                )
+                continue
+
+            if _is_non_regular_target(out_path):
+                self.stats.errors.append(
+                    f"输出路径是已存在的目录或非普通文件，已中止以防移动或覆盖: {out_path}"
+                )
+                continue
+
             out_lit_key = _volume_path_key(out_path, follow_symlinks=False)
             out_res_key = _volume_path_key(out_path, follow_symlinks=True)
             out_keys = tuple(dict.fromkeys((out_lit_key, out_res_key)))
@@ -2776,8 +3027,6 @@ class Pipeline:
             if out_inode is not None:
                 seen_outputs_by_inode[out_inode] = abs_path
 
-            out_dir = os.path.dirname(out_path)
-            out_name = os.path.basename(out_path)
             if _filename_too_long(out_dir, out_name):
                 self.stats.errors.append(f"输出文件名超出文件系统长度上限: {out_name}")
                 continue
@@ -2786,6 +3035,11 @@ class Pipeline:
                 p = Path(out_path)
                 backup_path = str(p.with_stem(p.stem + "-deprecated"))
                 backup_name = os.path.basename(backup_path)
+                if _is_non_regular_target(backup_path):
+                    self.stats.errors.append(
+                        f"备份路径是已存在的目录或非普通文件，已中止以防误删: {backup_path}"
+                    )
+                    continue
                 if _filename_too_long(out_dir, backup_name):
                     self.stats.errors.append(
                         f"备份文件名超出文件系统长度上限: {backup_name}"
