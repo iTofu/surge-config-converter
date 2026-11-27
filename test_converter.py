@@ -5325,7 +5325,7 @@ class TestRound4Fixes:
             [Rule]
             FINAL,OK
         """))
-        monkeypatch.setattr(converter, "_fs_name_max", lambda _d: 40)
+        monkeypatch.setattr(converter, "_filename_too_long", lambda _d, name: len(name) > 40)
         stats = ConversionStats()
         res = convert_file(str(root), stats)
         assert res is None
@@ -5333,7 +5333,7 @@ class TestRound4Fixes:
         assert not (tmp_path / "v4").exists()
 
     def test_pre_emit_backup_length_validation_aborts_cleanly(self, tmp_path, monkeypatch):
-        root = tmp_path / "profile-long-name.conf"  # profile-long-name-v4.conf = 25B, -deprecated = 36B
+        root = tmp_path / "profile-long-name.conf"  # profile-long-name-v4.conf = 25 chars, -deprecated = 36 chars
         root.write_text(textwrap.dedent("""\
             [Proxy]
             Dead = anytls, 2.2.2.2, 443, password=pwd
@@ -5346,7 +5346,7 @@ class TestRound4Fixes:
         v4_dir.mkdir()
         existing = v4_dir / "profile-long-name-v4.conf"
         existing.write_text("old content\n")
-        monkeypatch.setattr(converter, "_fs_name_max", lambda _d: 30)
+        monkeypatch.setattr(converter, "_filename_too_long", lambda _d, name: len(name) > 30)
         stats = ConversionStats()
         res = convert_file(str(root), stats)
         assert res is None
@@ -5456,6 +5456,211 @@ class TestRound4Fixes:
         assert "# [V5+ cascade] NOT,((RULE-SET,LogicOffice)),REJECT" in out
         assert list((tmp_path / "v4").glob("profile-LogicOffice-*")) == []
         assert list((tmp_path / "v4").glob("profile-CleanOffice-*")) == []
+
+
+class TestRound5Fixes:
+    """Regression tests for Round 5 findings:
+    1. Two configs loading different sections of a shared subfile with local
+       references (policy-path / #!include) never overwrite each other's rewrites
+    2. Pre-emit filename validation respects real filesystem Unicode semantics
+       (e.g. >255 UTF-8 byte Chinese filenames allowed by APFS) and backup renames
+    3. Trailing extended-matching on nested compound (AND/OR/NOT) sub-rules and
+       on outer logical rules containing nested NOT
+    """
+
+    def test_shared_subfile_different_loaded_sections_preserve_policy_path_rewrite(self, tmp_path):
+        (tmp_path / "provider.dconf").write_text(
+            "[Proxy]\nSub = snell, 2.2.2.2, 8000, psk=b, version=4\n"
+        )
+        (tmp_path / "catalog.dconf").write_text(textwrap.dedent("""\
+            [Proxy]
+            DirectProxy = snell, 1.1.1.1, 8000, psk=a, version=4
+
+            [Proxy Group]
+            G = select, policy-path=provider.dconf
+        """))
+        cfg_a = tmp_path / "a.conf"
+        cfg_a.write_text(textwrap.dedent("""\
+            [Proxy]
+            DeadA = anytls, 9.9.9.9, 443, password=pwd
+
+            [Proxy Group]
+            #!include catalog.dconf
+
+            [Rule]
+            FINAL,G
+        """))
+        cfg_b = tmp_path / "b.conf"
+        cfg_b.write_text(textwrap.dedent("""\
+            [Proxy]
+            DeadB = anytls, 8.8.8.8, 443, password=pwd
+            #!include catalog.dconf
+
+            [Rule]
+            FINAL,DirectProxy
+        """))
+
+        # Order A -> B: B must NOT overwrite A's rewritten catalog-v4.dconf
+        convert_file(str(cfg_a))
+        convert_file(str(cfg_b))
+
+        a_out = (tmp_path / "v4" / "a-v4.conf").read_text()
+        b_out = (tmp_path / "v4" / "b-v4.conf").read_text()
+        assert "#!include catalog-v4.dconf" in a_out
+        assert "policy-path=provider-v4.dconf" in (tmp_path / "v4" / "catalog-v4.dconf").read_text()
+        assert (tmp_path / "v4" / "provider-v4.dconf").exists()
+
+        b_catalogs = list((tmp_path / "v4").glob("b-catalog-*-v4.dconf"))
+        assert len(b_catalogs) == 1
+        assert f"#!include {b_catalogs[0].name}" in b_out
+        assert "DirectProxy = snell" in b_catalogs[0].read_text()
+
+        # Reverse order B -> A must stay identical and intact
+        convert_file(str(cfg_a))
+        assert "policy-path=provider-v4.dconf" in (tmp_path / "v4" / "catalog-v4.dconf").read_text()
+        assert f"#!include {b_catalogs[0].name}" in (tmp_path / "v4" / "b-v4.conf").read_text()
+
+    def test_shared_subfile_both_roots_have_unloaded_refs_in_opposite_sections(self, tmp_path):
+        (tmp_path / "p1.dconf").write_text("[Proxy]\nP1 = snell, 1.1.1.1, 8000, psk=a, version=4\n")
+        (tmp_path / "p2.dconf").write_text("[Proxy]\nP2 = snell, 2.2.2.2, 8000, psk=b, version=4\n")
+        (tmp_path / "catalog.dconf").write_text(textwrap.dedent("""\
+            [Proxy]
+            #!include p1.dconf
+
+            [Proxy Group]
+            G = select, policy-path=p2.dconf
+        """))
+        cfg_a = tmp_path / "a.conf"
+        cfg_a.write_text("[Proxy]\nDeadA = anytls, 9.9.9.9, 443, password=pwd\n[Proxy Group]\n#!include catalog.dconf\n[Rule]\nFINAL,G\n")
+        cfg_b = tmp_path / "b.conf"
+        cfg_b.write_text("[Proxy]\nDeadB = anytls, 8.8.8.8, 443, password=pwd\n#!include catalog.dconf\n[Rule]\nFINAL,P1\n")
+
+        convert_file(str(cfg_a))
+        convert_file(str(cfg_b))
+
+        a_cats = list((tmp_path / "v4").glob("a-catalog-*-v4.dconf"))
+        b_cats = list((tmp_path / "v4").glob("b-catalog-*-v4.dconf"))
+        assert len(a_cats) == 1 and len(b_cats) == 1
+        assert "policy-path=p2-v4.dconf" in a_cats[0].read_text()
+        assert "#!include p1-v4.dconf" in b_cats[0].read_text()
+
+    def test_multibyte_unicode_filename_allowed_by_filesystem_converts_and_backs_up(self, tmp_path):
+        # 97 Chinese chars + ".conf" = 102 chars, 296 UTF-8 bytes (>255 bytes)
+        cjk_name = ("配" * 97) + ".conf"
+        root = tmp_path / cjk_name
+        try:
+            root.write_text(textwrap.dedent("""\
+                [Proxy]
+                Dead = anytls, 1.1.1.1, 443, password=pwd
+                OK = snell, 2.2.2.2, 8000, psk=a, version=4
+
+                [Rule]
+                FINAL,OK
+            """))
+        except OSError:
+            pytest.skip("Filesystem does not support >255 UTF-8 byte filenames")
+
+        stats1 = ConversionStats()
+        out1 = convert_file(str(root), stats1)
+        assert out1 is not None
+        assert stats1.errors == []
+        assert Path(out1).exists()
+        assert "# [V5+] Dead = anytls" in Path(out1).read_text()
+
+        # Second run with changed content must back up cleanly to -deprecated
+        root.write_text(textwrap.dedent("""\
+            [Proxy]
+            Dead = anytls, 1.1.1.1, 443, password=pwd
+            OK = snell, 3.3.3.3, 8000, psk=a, version=4
+
+            [Rule]
+            FINAL,OK
+        """))
+        stats2 = ConversionStats()
+        out2 = convert_file(str(root), stats2)
+        assert out2 is not None
+        assert stats2.errors == []
+        assert len(stats2.deprecated_files) == 1
+        assert Path(stats2.deprecated_files[0]).exists()
+
+    def test_real_enametoolong_aborts_before_writing_anything(self, tmp_path):
+        # 253 ASCII chars + ".conf" -> source is 258? Use 249 + ".conf" = 254B (legal source),
+        # so "-v4.conf" = 257B (>255 on both APFS and ext4).
+        src_name = ("a" * 249) + ".conf"
+        root = tmp_path / src_name
+        try:
+            root.write_text(textwrap.dedent("""\
+                [Proxy]
+                Dead = anytls, 1.1.1.1, 443, password=pwd
+                OK = snell, 2.2.2.2, 8000, psk=a, version=4
+
+                [Rule]
+                FINAL,OK
+            """))
+        except OSError:
+            pytest.skip("Filesystem rejected 254-char source file")
+        stats = ConversionStats()
+        res = convert_file(str(root), stats)
+        assert res is None
+        assert any("长度上限" in e for e in stats.errors)
+        assert not (tmp_path / "v4").exists()
+
+    def test_nested_compound_subrule_extended_matching_and_polarity(self, tmp_path):
+        # Standalone file containing ONLY a negated nested compound rule with extended-matching
+        # must be detected as needing conversion and commented out.
+        solo = tmp_path / "solo.conf"
+        solo.write_text(textwrap.dedent("""\
+            [Rule]
+            NOT,((AND,((DOMAIN,office.example.test),(DOMAIN-SUFFIX,example.test)),extended-matching)),REJECT
+            FINAL,DIRECT
+        """))
+        solo_out = convert_file(str(solo))
+        assert solo_out is not None
+        assert (
+            "# [V5+] NOT,((AND,((DOMAIN,office.example.test),(DOMAIN-SUFFIX,example.test)),extended-matching)),REJECT"
+            in Path(solo_out).read_text()
+        )
+
+        # Full polarity matrix across nested AND/OR/NOT and [Ruleset ...]
+        root = tmp_path / "matrix.conf"
+        root.write_text(textwrap.dedent("""\
+            [Ruleset CompoundNarrowed]
+            AND,((OR,((DOMAIN,x.test),(DOMAIN,y.test)),extended-matching),(PROTOCOL,TCP))
+
+            [Rule]
+            AND,((OR,((DOMAIN,a.test),(DOMAIN,b.test)),extended-matching),(PROTOCOL,TCP)),REJECT
+            AND,((OR,((DOMAIN,a.test,extended-matching),(DOMAIN,b.test)),extended-matching),(PROTOCOL,TCP)),REJECT
+            NOT,((AND,((DOMAIN,c.test),(DOMAIN-SUFFIX,d.test)),extended-matching)),REJECT
+            AND,((NOT,((DOMAIN,e.test)),extended-matching),(PROTOCOL,TCP)),REJECT
+            AND,((OR,((DOMAIN,f.test),(NOT,((DOMAIN,g.test)))),extended-matching),(PROTOCOL,TCP)),REJECT
+            NOT,((NOT,((DOMAIN,h.test)),extended-matching)),REJECT
+            AND,((PROTOCOL,TCP),(NOT,((DOMAIN,i.test)))),REJECT,extended-matching
+            RULE-SET,CompoundNarrowed,DIRECT
+            NOT,((RULE-SET,CompoundNarrowed)),REJECT
+            FINAL,DIRECT
+        """))
+        out_path = convert_file(str(root))
+        assert out_path is not None
+        out = Path(out_path).read_text()
+        # Positive nested compound -> extended-matching stripped cleanly
+        # Both inner leaf and compound extended-matching stripped cleanly
+        assert out.splitlines().count("AND,((OR,((DOMAIN,a.test),(DOMAIN,b.test))),(PROTOCOL,TCP)),REJECT") == 2
+        # Negated compound sub-rules / compound containing NOT -> commented out
+        assert "# [V5+] NOT,((AND,((DOMAIN,c.test),(DOMAIN-SUFFIX,d.test)),extended-matching)),REJECT" in out
+        assert "# [V5+] AND,((NOT,((DOMAIN,e.test)),extended-matching),(PROTOCOL,TCP)),REJECT" in out
+        assert "# [V5+] AND,((OR,((DOMAIN,f.test),(NOT,((DOMAIN,g.test)))),extended-matching),(PROTOCOL,TCP)),REJECT" in out
+        assert "# [V5+] AND,((PROTOCOL,TCP),(NOT,((DOMAIN,i.test)))),REJECT,extended-matching" in out
+        # Double negation -> positive polarity -> stripped safely
+        assert "\nNOT,((NOT,((DOMAIN,h.test)))),REJECT\n" in out
+        # Ruleset with nested compound extended-matching: stripped in .list, narrowed under NOT
+        rs_files = list((tmp_path / "v4").glob("matrix-CompoundNarrowed-*-ruleset-v4.list"))
+        assert len(rs_files) == 1
+        rs_text = rs_files[0].read_text()
+        assert "AND,((OR,((DOMAIN,x.test),(DOMAIN,y.test))),(PROTOCOL,TCP))" in rs_text
+        assert "extended-matching" not in rs_text
+        assert f"\nRULE-SET,{rs_files[0].name},DIRECT\n" in out
+        assert "# [V5+ cascade] NOT,((RULE-SET,CompoundNarrowed)),REJECT" in out
+
 
 
 
