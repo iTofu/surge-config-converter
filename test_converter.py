@@ -5592,3 +5592,76 @@ class TestRound7Regressions:
         assert res is None
         assert any("ICU" in e and "policy-regex-filter" in e for e in stats.errors)
         assert elapsed < 1.0, f"expected O(V+E) under 1s, took {elapsed:.2f}s"
+
+
+# --- T96: Round-8 Codex review regression suite (per-name derivation Merkle DAG) ---
+
+class TestRound8Regressions:
+    def test_deleted_member_rejected_by_upper_filter_does_not_taint_surviving_candidate(self, tmp_path, monkeypatch):
+        """P1 (3rd recurrence root fix): when Source contains Stable (kept),
+        Old (deleted), and private policy-path 香港 behind unverifiable
+        ^\\p{Han}+$, deleting Old must NOT change Pool's per-name derivation
+        digest for 香港 under Pool's exact ^香港$ filter."""
+        import converter as conv_mod
+        monkeypatch.setattr(conv_mod.sys, "platform", "linux")
+
+        priv = tmp_path / "priv.dconf"
+        priv.write_text("[Proxy]\n香港 = trojan, 3.3.3.3, 443, password=p\n")
+        main = tmp_path / "main.conf"
+        main.write_text(
+            "[Proxy]\n"
+            "Old = anytls, 1.1.1.1, 443, password=p\n"
+            "Stable = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            r"Source = select, Stable, Old, policy-path=priv.dconf, policy-regex-filter=^\p{Han}+$" + "\n"
+            "Pool = select, include-other-group=Source, policy-regex-filter=^香港$\n"
+            "[Rule]\n"
+            "FINAL,Pool\n"
+        )
+        stats = ConversionStats()
+        res = convert_file(str(main), stats, {str(main): None})
+        assert res is not None, f"unexpected failure: {stats.errors}"
+        assert not stats.errors
+        out = (tmp_path / "v4" / "main-v4.conf").read_text()
+        assert "Pool = select, include-other-group=Source, policy-regex-filter=^香港$" in out
+        assert "FINAL,Pool" in out
+        assert "# [V5+ cascade] Old" not in out  # Old is in [Proxy] as # [V5+]
+        assert "# [V5+] Old = anytls" in out
+
+        # Same scenario via include-all-proxies (Old is uncertain in Source, still rejected by ^香港$)
+        d2 = tmp_path / "via_all"
+        d2.mkdir()
+        (d2 / "priv.dconf").write_text("[Proxy]\n香港 = trojan, 3.3.3.3, 443, password=p\n")
+        m2 = d2 / "main.conf"
+        m2.write_text(
+            "[Proxy]\n"
+            "Old = anytls, 1.1.1.1, 443, password=p\n"
+            "Stable = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            r"Source = select, Stable, include-all-proxies=1, policy-path=priv.dconf, policy-regex-filter=^\p{Han}+$" + "\n"
+            "Pool = select, include-other-group=Source, policy-regex-filter=^香港$\n"
+            "[Rule]\n"
+            "FINAL,Pool\n"
+        )
+        s2 = ConversionStats()
+        assert convert_file(str(m2), s2, {str(m2): None}) is not None
+        assert not s2.errors
+
+        # Counter-case: if a SECOND source of 香港 itself is deleted, Pool MUST fail closed!
+        d3 = tmp_path / "same_hk_deleted"
+        d3.mkdir()
+        (d3 / "priv.dconf").write_text("[Proxy]\n香港 = trojan, 3.3.3.3, 443, password=p\n")
+        m3 = d3 / "main.conf"
+        m3.write_text(
+            "[Proxy]\n"
+            "香港 = anytls, 1.1.1.1, 443, password=p\n"
+            "Stable = trojan, 2.2.2.2, 443, password=p\n"
+            "[Proxy Group]\n"
+            r"Source = select, Stable, include-all-proxies=1, policy-path=priv.dconf, policy-regex-filter=^\p{Han}+$" + "\n"
+            "Pool = select, include-other-group=Source, policy-regex-filter=^香港$\n"
+            "[Rule]\n"
+            "FINAL,Pool\n"
+        )
+        s3 = ConversionStats()
+        assert convert_file(str(m3), s3, {str(m3): None}) is None
+        assert any("ICU" in e and "policy-regex-filter" in e for e in s3.errors)

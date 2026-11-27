@@ -2214,19 +2214,26 @@ class Pipeline:
     def _group_member_supply(self, state, rec, group_index, global_deleted,
                              global_proxies, use_initial, visited=None, memo=None):
         """Recursively compute:
-          (definite_names, uncertain_names, has_unknown_supply,
-           unverifiable_patterns, supply_sig, hit_cycle)
+          (def_sigs, unc_sigs, has_unknown_supply, unc_unv_by_name, hit_cycle)
         for a [Proxy Group] either BEFORE conversion (use_initial=True) or
         AFTER current deletions (use_initial=False).
 
-        - `definite_names` / `uncertain_names` are pure `frozenset[str]` using
-          Kleene 3-valued propagation across nested `policy-regex-filter`s.
-        - `supply_sig` is a 16-byte BLAKE2b Merkle DAG digest over every
-          post-filter contributing source feeding this group (explicit members,
-          contributing `include-all-proxies` / `policy-path` proxies, and each
-          contributing `include-other-group` child's key, kept names, and own
-          `supply_sig`). Any removal or mutation of a contributing path at any
-          nesting depth changes `supply_sig` while keeping diamond DAGs O(V+E).
+        Data structure (per-name derivation Merkle DAG):
+          - `def_sigs`: `dict[name, bytes]` — 16-byte BLAKE2b Merkle digest of
+            all definite derivation paths producing `name`.
+          - `unc_sigs`: `dict[name, bytes]` — 16-byte BLAKE2b Merkle digest of
+            all uncertain derivation paths producing `name`.
+          - `unc_unv_by_name`: `dict[name, tuple[(fname, gname, pat), ...]]` —
+            unverifiable filters responsible for `name` being uncertain.
+
+        Per-name hashing guarantees simultaneously:
+          1. Certainty separation: definite and uncertain derivations of the
+             same `name` never collide.
+          2. Full multi-hop path fidelity: removing any contributing subgroup
+             path for `name` at any nesting depth changes `unc_sigs[name]`.
+          3. Filter isolation: a deleted proxy/member definitively rejected by
+             an upper filter never enters any surviving name's digest.
+          4. O((V + E) * |names|) memoized runtime on diamond DAGs.
 
         Per Surge semantics:
           - Explicit static members are unfiltered.
@@ -2240,18 +2247,19 @@ class Pipeline:
             visited = set()
         visit_key = (state.abs_path, id(rec))
         if memo is not None and visit_key in memo:
-            m_def, m_unc, m_unk, m_unv, m_sig = memo[visit_key]
-            return m_def, m_unc, m_unk, m_unv, m_sig, False
+            m_def, m_unc, m_unk, m_unv = memo[visit_key]
+            return m_def, m_unc, m_unk, m_unv, False
         if visit_key in visited:
-            cyc_sig = hashlib.blake2b(
-                f"CYCLE:{state.abs_path}:{id(rec)}".encode("utf-8"), digest_size=16
-            ).digest()
-            return frozenset(), frozenset(), False, (), cyc_sig, True
+            return {}, {}, False, {}, True
         visited = visited | {visit_key}
 
         base_dir = os.path.dirname(state.abs_path)
         matcher = rec.compiled_regex_filter()
         prefix = rec.external_policy_name_prefix()
+        self_tag = (
+            (os.path.basename(state.abs_path), rec.name, matcher.pattern)
+            if matcher is not None else None
+        )
 
         def _eval_names(names):
             if not names:
@@ -2260,13 +2268,19 @@ class Pipeline:
                 return set(names), set()
             return matcher.match_set(names)
 
-        definite = set()
-        uncertain = set()
+        def_contribs = {}
+        unc_contribs = {}
+        unc_unv_sets = {}
         has_unknown = False
         hit_cycle = False
-        unverifiable = []
-        self_unv = False
-        sig_parts = []
+
+        def _add_def(nm, contrib):
+            def_contribs.setdefault(nm, []).append(contrib)
+
+        def _add_unc(nm, contrib, tags):
+            unc_contribs.setdefault(nm, []).append(contrib)
+            if tags:
+                unc_unv_sets.setdefault(nm, []).extend(tags)
 
         # 1. Explicit static members (definite, unfiltered by policy-regex-filter)
         if use_initial:
@@ -2275,17 +2289,13 @@ class Pipeline:
             explicit_names = {
                 unquote(m) for m in rec.members if unquote(m) not in global_deleted
             }
-        definite |= explicit_names
-        for nm in sorted(explicit_names):
-            sig_parts.append(("E", nm))
+        for nm in explicit_names:
+            _add_def(nm, ("E", state.abs_path, id(rec)))
 
         # 2. Dynamic imported sources
         opts = (rec.initial_options or rec.options) if use_initial else rec.options
         has_include_all = False
-        pp_remote_urls = set()
-        pp_missing_paths = set()
         pp_local_pools = {}
-        iog_missing_groups = set()
         iog_targets = {}
 
         for opt in opts:
@@ -2295,14 +2305,12 @@ class Pipeline:
             elif kl == "policy-path" and opt.policy_path is not None:
                 if opt.policy_path.startswith(("http://", "https://")):
                     has_unknown = True
-                    pp_remote_urls.add(opt.policy_path)
                 else:
                     ref_abs = self._resolve_local_path(opt.policy_path, base_dir, prefer_root=True)
                     st = self.files.get(ref_abs)
                     if st is None:
                         if ref_abs not in self.abandoned_files:
                             has_unknown = True
-                            pp_missing_paths.add(ref_abs)
                     elif use_initial:
                         pp_local_pools.setdefault(ref_abs, set()).update(st.initial_proxies)
                     elif not st.is_abandoned:
@@ -2320,7 +2328,6 @@ class Pipeline:
                     targets = group_index.get(g)
                     if not targets:
                         has_unknown = True
-                        iog_missing_groups.add(g)
                         continue
                     for sub_state, _, sub_rec in targets:
                         if not use_initial and sub_rec.commented_out:
@@ -2333,129 +2340,143 @@ class Pipeline:
         if has_include_all:
             if self._root_has_remote_proxy_include():
                 has_unknown = True
-                sig_parts.append(("AR",))
             else:
                 all_def, all_unc = _eval_names(global_proxies)
-                if all_unc:
-                    self_unv = True
-                definite |= all_def
-                uncertain |= all_unc
-                if all_def or all_unc:
-                    sig_parts.append(("A", tuple(sorted(all_def)), tuple(sorted(all_unc))))
+                for nm in all_def:
+                    _add_def(nm, ("AD", state.abs_path, id(rec)))
+                for nm in all_unc:
+                    _add_unc(nm, ("AU", state.abs_path, id(rec)), (self_tag,) if self_tag else ())
 
         # 2b. policy-path (filter first, then apply external-policy-name-prefix)
-        for url in sorted(pp_remote_urls):
-            sig_parts.append(("PR", url))
-        for ref_abs in sorted(pp_missing_paths):
-            sig_parts.append(("PM", ref_abs))
         for ref_abs in sorted(pp_local_pools):
             pp_def, pp_unc = _eval_names(pp_local_pools[ref_abs])
-            if pp_unc:
-                self_unv = True
-            if prefix:
-                definite |= {prefix + n for n in pp_def}
-                uncertain |= {prefix + n for n in pp_unc}
-            else:
-                definite |= pp_def
-                uncertain |= pp_unc
-            if pp_def or pp_unc:
-                sig_parts.append(("P", ref_abs, tuple(sorted(pp_def)), tuple(sorted(pp_unc))))
+            for raw_nm in pp_def:
+                exposed = (prefix + raw_nm) if prefix else raw_nm
+                _add_def(exposed, ("PD", state.abs_path, id(rec), ref_abs, raw_nm))
+            for raw_nm in pp_unc:
+                exposed = (prefix + raw_nm) if prefix else raw_nm
+                _add_unc(
+                    exposed,
+                    ("PU", state.abs_path, id(rec), ref_abs, raw_nm),
+                    (self_tag,) if self_tag else (),
+                )
 
-        # 2c. include-other-group (preserve every contributing child's Merkle digest)
-        for g in sorted(iog_missing_groups):
-            sig_parts.append(("GM", g))
+        # 2c. include-other-group (hash ONLY the child's per-name derivation digest!)
         for sub_key in sorted(iog_targets):
             g, sub_path, sub_id = sub_key
             sub_state, sub_rec = iog_targets[sub_key]
-            sub_def, sub_unc, sub_unk, sub_unv, sub_sig, sub_cycle = self._group_member_supply(
+            sub_def_sigs, sub_unc_sigs, sub_unk, sub_unc_unv, sub_cycle = self._group_member_supply(
                 sub_state, sub_rec, group_index, global_deleted,
                 global_proxies, use_initial, visited=visited, memo=memo,
             )
             has_unknown = has_unknown or sub_unk
             hit_cycle = hit_cycle or sub_cycle
 
-            kept_def, unc_from_def = _eval_names(sub_def)
-            unc_def_match, unc_from_unc = _eval_names(sub_unc)
-            kept_unc_from_unc = unc_def_match | unc_from_unc
-            if unc_from_def or unc_from_unc:
-                self_unv = True
-            definite |= kept_def
-            uncertain |= unc_from_def | kept_unc_from_unc
-            if kept_unc_from_unc and sub_unv:
-                unverifiable.extend(sub_unv)
-            if sub_unk or kept_def or unc_from_def or kept_unc_from_unc:
-                sig_parts.append((
-                    "G", g, sub_path, sub_id, sub_unk,
-                    tuple(sorted(kept_def)),
-                    tuple(sorted(unc_from_def)),
-                    tuple(sorted(kept_unc_from_unc)),
-                    sub_sig,
-                ))
+            kept_def, unc_from_def = _eval_names(sub_def_sigs.keys())
+            for nm in kept_def:
+                _add_def(nm, ("GD", g, sub_path, sub_id, sub_def_sigs[nm]))
+            for nm in unc_from_def:
+                _add_unc(
+                    nm,
+                    ("GU_D", g, sub_path, sub_id, sub_def_sigs[nm]),
+                    (self_tag,) if self_tag else (),
+                )
 
-        if self_unv and matcher is not None:
-            unverifiable.append((os.path.basename(state.abs_path), rec.name, matcher.pattern))
+            unc_def_match, unc_from_unc = _eval_names(sub_unc_sigs.keys())
+            for nm in unc_def_match:
+                _add_unc(
+                    nm,
+                    ("GU_UD", g, sub_path, sub_id, sub_unc_sigs[nm]),
+                    sub_unc_unv.get(nm, ()),
+                )
+            for nm in unc_from_unc:
+                tags = list(sub_unc_unv.get(nm, ()))
+                if self_tag:
+                    tags.append(self_tag)
+                _add_unc(
+                    nm,
+                    ("GU_UU", g, sub_path, sub_id, sub_unc_sigs[nm]),
+                    tags,
+                )
 
-        h = hashlib.blake2b(digest_size=16)
-        for part in sig_parts:
-            h.update(repr(part).encode("utf-8"))
-            h.update(b"\0")
-        supply_sig = h.digest()
+        def _digest_contribs(contribs_by_name):
+            out = {}
+            for nm, parts in contribs_by_name.items():
+                h = hashlib.blake2b(digest_size=16)
+                for part in sorted(parts):
+                    h.update(repr(part).encode("utf-8"))
+                    h.update(b"\0")
+                out[nm] = h.digest()
+            return out
 
-        res = (
-            frozenset(definite),
-            frozenset(uncertain),
-            has_unknown,
-            tuple(dict.fromkeys(unverifiable)),
-            supply_sig,
-        )
+        def_sigs = _digest_contribs(def_contribs)
+        unc_sigs = _digest_contribs(unc_contribs)
+        unc_unv_by_name = {
+            nm: tuple(dict.fromkeys(tags))
+            for nm, tags in unc_unv_sets.items()
+        }
+
+        res = (def_sigs, unc_sigs, has_unknown, unc_unv_by_name)
         if memo is not None and not hit_cycle:
             memo[visit_key] = res
-        return res[0], res[1], res[2], res[3], res[4], hit_cycle
+        return res[0], res[1], res[2], res[3], hit_cycle
 
     def _group_lost_all_members(self, state, rec, initial_group_index, current_group_index,
                                 global_deleted, initial_global_proxies, current_global_proxies,
                                 initial_memo=None, current_memo=None):
         """Return (had_initial, has_current, unverifiable_error_list) using
-        3-valued member certainty (definite vs uncertain) + Merkle DAG supply digest:
+        per-name 3-valued member certainty + per-name Merkle derivation digests:
 
           - Cascade (`had_initial and not has_current`) ONLY when the group is
-            PROVEN non-empty before conversion (`init_def` or `init_unk`) AND
-            PROVEN empty after conversion (empty `cur_def`, `cur_unc`, `not cur_unk`).
+            PROVEN non-empty before conversion (`init_def_sigs` or `init_unk`)
+            AND PROVEN empty after conversion (`cur_def_sigs` and `cur_unc_sigs`
+            both empty and `not cur_unk`).
           - Fail closed (report `unv_errors`) when the group has NO definite
-            surviving member (`not cur_def and not cur_unk`) AND either:
-              1. `cur_unc` is non-empty and the group's post-filter Merkle
-                 dependency DAG changed during conversion (`init_sig != cur_sig`), OR
-              2. `cur_unc` is empty, `init_def` was empty (`not init_unk`), and
-                 `init_unc` was non-empty (all uncertain initial candidates were
-                 removed, so we cannot prove whether the group was originally
-                 non-empty and must cascade or originally empty and must stay).
+            surviving member (`not cur_def_sigs and not cur_unk`) AND either:
+              1. `cur_unc_sigs` is non-empty and the group's per-name supply or
+                 per-name derivation DAG changed (`init_unk != cur_unk` or
+                 `init_def_sigs != cur_def_sigs` or `init_unc_sigs != cur_unc_sigs`), OR
+              2. `cur_unc_sigs` is empty, `init_def_sigs` was empty (`not init_unk`),
+                 and `init_unc_sigs` was non-empty (all uncertain initial
+                 candidates were removed, so we cannot verify whether the group
+                 was originally non-empty and must cascade or originally empty).
         """
-        init_def, init_unc, init_unk, init_unv, init_sig, _ = self._group_member_supply(
+        init_def_sigs, init_unc_sigs, init_unk, init_unc_unv, _ = self._group_member_supply(
             state, rec, initial_group_index, set(), initial_global_proxies,
             use_initial=True, memo=initial_memo,
         )
-        cur_def, cur_unc, cur_unk, cur_unv, cur_sig, _ = self._group_member_supply(
+        cur_def_sigs, cur_unc_sigs, cur_unk, cur_unc_unv, _ = self._group_member_supply(
             state, rec, current_group_index, global_deleted, current_global_proxies,
             use_initial=False, memo=current_memo,
         )
-        init_definitely_nonempty = init_unk or bool(init_def)
-        cur_definitely_nonempty = cur_unk or bool(cur_def)
-        cur_might_be_nonempty = cur_definitely_nonempty or bool(cur_unc)
+        init_definitely_nonempty = init_unk or bool(init_def_sigs)
+        cur_definitely_nonempty = cur_unk or bool(cur_def_sigs)
+        cur_might_be_nonempty = cur_definitely_nonempty or bool(cur_unc_sigs)
 
         had_initial = init_definitely_nonempty
         has_current = cur_might_be_nonempty
 
         unv_errors = []
         if not cur_definitely_nonempty:
-            supply_changed = (init_sig != cur_sig)
-            if cur_unc and supply_changed:
-                for fname, gname, pat in cur_unv:
+            supply_changed = (
+                (init_unk != cur_unk)
+                or (init_def_sigs != cur_def_sigs)
+                or (init_unc_sigs != cur_unc_sigs)
+            )
+            if cur_unc_sigs and supply_changed:
+                seen_tags = []
+                for nm in sorted(cur_unc_sigs):
+                    seen_tags.extend(cur_unc_unv.get(nm, ()))
+                for fname, gname, pat in dict.fromkeys(seen_tags):
                     unv_errors.append(
                         f"{fname} [{gname}] 无法按 Surge ICU 正则语义验证 policy-regex-filter={pat!r}，"
                         "动态代理池已删减且无法确认剩余匹配成员；已停止导出。"
                     )
-            elif not cur_unc and not init_definitely_nonempty and init_unc:
-                for fname, gname, pat in init_unv:
+            elif not cur_unc_sigs and not init_definitely_nonempty and init_unc_sigs:
+                seen_tags = []
+                for nm in sorted(init_unc_sigs):
+                    seen_tags.extend(init_unc_unv.get(nm, ()))
+                for fname, gname, pat in dict.fromkeys(seen_tags):
                     unv_errors.append(
                         f"{fname} [{gname}] 无法按 Surge ICU 正则语义验证 policy-regex-filter={pat!r}，"
                         "动态代理池已删减且无法确认原策略组是否非空；已停止导出。"
